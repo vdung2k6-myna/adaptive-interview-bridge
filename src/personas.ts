@@ -1,4 +1,5 @@
 import type { BridgeConfig } from "./config.js";
+import { normalizeDeviceId } from "./credentials.js";
 import { platformAuthHeaders } from "./platform.js";
 
 /**
@@ -229,4 +230,108 @@ export function unresolvedBindings(
   personas: readonly Persona[]
 ): Array<[string, string]> {
   return [...devicePersonas].filter(([, personaId]) => boundPersona(personaId, personas) === undefined);
+}
+
+/**
+ * Why a device's turn could not be answered as anyone. Three ways, and the
+ * distinction is the point: they are different faults with different causes, and
+ * an operator reading one line has to be able to tell which they have.
+ */
+export type PersonaMissReason =
+  /** Configuration names a device with no persona. The loader refuses this at
+   * start (see `requireBindings`), so reaching it means a config assembled
+   * elsewhere — and it is still a refusal rather than a default. */
+  | "no-binding"
+  /** The catalog was re-read and still does not report the identifier. */
+  | "not-in-catalog"
+  /** The catalog could not be read, so the miss is unproven: the identifier may
+   * well be there. Reported as its own reason rather than as "not in catalog",
+   * because the operator's next move is different — fix the platform, not the
+   * binding. */
+  | "catalog-unreachable";
+
+export type PersonaResolution =
+  | {
+      ok: true;
+      persona: Persona;
+      /** True when the cache did not report it and a fresh read supplied it. */
+      reRead: boolean;
+    }
+  | { ok: false; reason: PersonaMissReason; detail: string };
+
+/**
+ * The persona a device's turn is answered as — from the cache, and from a fresh
+ * read if the cache does not report it (3.3).
+ *
+ * The re-read is the requirement, not an optimisation: a persona added or renamed
+ * on the platform after the bridge last read would otherwise be a device that
+ * cannot speak until someone restarts the service. So a miss costs one catalog
+ * read before it is treated as a miss, and only a read that still does not report
+ * the identifier declines the turn (3.4).
+ *
+ * A miss is re-read every time it happens, rather than once and then remembered.
+ * A device bound to an identifier that is gone is therefore one platform request
+ * per turn it takes — which is the price of the other case, a persona added
+ * mid-session, resolving without a restart. Turns are seconds apart and devices
+ * are few; a cache of misses would trade that price for a delay nobody can
+ * explain later.
+ *
+ * A failed re-read is reported as itself and never as "not in catalog": the
+ * identifier may well be there, and the operator should be sent to the platform
+ * rather than to the binding. It also leaves the cache as the last good read —
+ * `refresh` replaces only on success — so the personas the bridge did know are
+ * still there for every other device.
+ */
+export async function resolveBoundPersona(
+  catalog: PersonaCatalog,
+  config: BridgeConfig,
+  deviceId: string
+): Promise<PersonaResolution> {
+  // Normalized here as well as in the loader, for the reason `isAllowedDevice`
+  // normalizes both sides: the comparison the binding means is between normalized
+  // identifiers, and a caller holding the raw header would otherwise get a miss
+  // for a device that is named — which reads as a configuration fault and is not.
+  const personaId = config.devicePersonas.get(normalizeDeviceId(deviceId));
+  if (personaId === undefined) {
+    return {
+      ok: false,
+      reason: "no-binding",
+      detail: `device ${deviceId} is not bound to a persona in BRIDGE_DEVICE_PERSONAS`,
+    };
+  }
+
+  const cached = boundPersona(personaId, catalog.all());
+  if (cached !== undefined) return { ok: true, persona: cached, reRead: false };
+
+  let fresh: readonly Persona[];
+  try {
+    fresh = await catalog.refresh();
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "catalog-unreachable",
+      detail: `device ${deviceId} is bound to ${personaId}, the cache does not report it, and the ` +
+        `catalog could not be re-read: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const found = boundPersona(personaId, fresh);
+  if (found !== undefined) return { ok: true, persona: found, reRead: true };
+
+  return {
+    ok: false,
+    reason: "not-in-catalog",
+    detail: `device ${deviceId} is bound to ${personaId}, which the catalog does not report even ` +
+      `after a fresh read (${fresh.length} persona(s) read)`,
+  };
+}
+
+/**
+ * The refusal as one line an operator can act on, naming the device and the
+ * identifier so it can be found in configuration without reading the code (3.4).
+ * The detail already carries both; this is the shape the log uses, kept here so
+ * the wording is owned in one place rather than assembled at a call site.
+ */
+export function describePersonaMiss(deviceId: string, resolution: Extract<PersonaResolution, { ok: false }>): string {
+  return `no persona for ${deviceId} (${resolution.reason}): ${resolution.detail}`;
 }

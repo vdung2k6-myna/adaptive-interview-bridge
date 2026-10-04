@@ -7,8 +7,10 @@ import type { BridgeConfig } from "../src/config.js";
 import {
   boundPersona,
   createPersonaCatalog,
+  describePersonaMiss,
   fetchCatalog,
   parseCatalog,
+  resolveBoundPersona,
   turnFieldsFor,
   unresolvedBindings,
 } from "../src/personas.js";
@@ -318,5 +320,153 @@ describe("resolving a device's binding against the catalog", () => {
     // rather than smoothed over.
     const bindings = new Map([["b81f3f4a9b01", "interview-coach"]]);
     assert.deepEqual(unresolvedBindings(bindings, []), [["b81f3f4a9b01", "interview-coach"]]);
+  });
+});
+
+/**
+ * Resolving a device's turn against a catalog that is live (3.3) and declining
+ * when it still cannot be resolved (3.4).
+ *
+ * The catalog is the platform's and it moves: a persona may be added, renamed or
+ * removed while the bridge is running. So a miss in the cache is not yet an
+ * answer, and the tests here pin the two halves of that — a read is attempted
+ * before a device is declined, and a read that fails is not the same fact as a
+ * read that reports absence. What is asserted throughout is that the only
+ * personas ever returned are the ones the catalog reports for that identifier:
+ * every other entry is a wrong answer the requirement forbids.
+ */
+describe("resolving a turn against a live catalog", () => {
+  const BOARD = "b81f3f4a9b01";
+
+  /** A config whose one allowed device is bound to `personaId`. */
+  const boundTo = (platformUrl: string, personaId: string): BridgeConfig => ({
+    ...configFor(platformUrl),
+    devicePersonas: new Map([[BOARD, personaId]]),
+  });
+
+  it("answers from the cache without asking the platform again", async () => {
+    const stub = await stubPlatform(() => ({ status: 200, body: CATALOG }));
+    try {
+      const config = boundTo(stub.url, "language-partner");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+
+      const resolution = await resolveBoundPersona(catalog, config, BOARD);
+      assert.ok(resolution.ok);
+      assert.equal(resolution.persona.id, "language-partner");
+      assert.equal(resolution.reRead, false, "a hit is a hit: a turn must not cost a catalog read");
+      assert.equal(stub.seen.length, 1, "the platform was asked once, at start");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("re-reads on a miss, so a persona added since the cache was filled is served", async () => {
+    // The whole of 3.3: the bridge started when the platform did not yet report
+    // this persona, and the device must not be stuck until someone restarts it.
+    let body: unknown = [CATALOG[1]];
+    const stub = await stubPlatform(() => ({ status: 200, body }));
+    try {
+      const config = boundTo(stub.url, "language-partner");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+      assert.equal(catalog.all().length, 1);
+
+      body = CATALOG; // the platform gains the persona while the bridge runs
+      const resolution = await resolveBoundPersona(catalog, config, BOARD);
+
+      assert.ok(resolution.ok, "a fresh read is what turns a miss into an answer");
+      assert.equal(resolution.persona.id, "language-partner");
+      assert.equal(resolution.reRead, true);
+      assert.equal(stub.seen.length, 2, "exactly one re-read, and it happens before the turn is served");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("resolves the raw Device-Id the header carried, not only a normalized one", async () => {
+    // The session's identity is normalized at the upgrade, but a caller holding
+    // the raw header must not get a binding miss for a device that is named —
+    // that reads as a configuration fault and is not one.
+    const stub = await stubPlatform(() => ({ status: 200, body: CATALOG }));
+    try {
+      const config = boundTo(stub.url, "language-partner");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+      const resolution = await resolveBoundPersona(catalog, config, "B8-1F-3F-4A-9B-01");
+      assert.ok(resolution.ok);
+      assert.equal(resolution.persona.id, "language-partner");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("declines after a fresh read that still does not report the identifier, and takes no other persona", async () => {
+    const stub = await stubPlatform(() => ({ status: 200, body: CATALOG }));
+    try {
+      const config = boundTo(stub.url, "gone-from-the-catalog");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+
+      const resolution = await resolveBoundPersona(catalog, config, BOARD);
+      if (resolution.ok) assert.fail("a persona the catalog does not report must not be answered under");
+      assert.equal(resolution.reason, "not-in-catalog");
+      // A fallback was available and was not taken: the catalog reports two
+      // personas, and the requirement is that neither answers for this device.
+      assert.equal(catalog.all().length, 2);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("reports an unreadable catalog as itself, and keeps the personas it did know", async () => {
+    // A failed read is not proof of absence. Conflating the two would send an
+    // operator to the binding when the fault is the platform — and would let a
+    // blip take down every other device's persona along with this one's.
+    let status = 200;
+    const stub = await stubPlatform(() => ({ status, body: status === 200 ? CATALOG : { error: "down" } }));
+    try {
+      const config = boundTo(stub.url, "gone-from-the-catalog");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+
+      status = 500;
+      const resolution = await resolveBoundPersona(catalog, config, BOARD);
+
+      if (resolution.ok) assert.fail("an unreachable catalog cannot resolve a binding");
+      assert.equal(resolution.reason, "catalog-unreachable");
+      assert.equal(catalog.all().length, 2, "the cache is the last good read, not emptied by a failed one");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("refuses a device the bindings do not name, rather than choosing for it", async () => {
+    const stub = await stubPlatform(() => ({ status: 200, body: CATALOG }));
+    try {
+      const config = boundTo(stub.url, "language-partner");
+      const catalog = createPersonaCatalog(config);
+      await catalog.refresh();
+
+      const unbound: BridgeConfig = { ...config, devicePersonas: new Map() };
+      const resolution = await resolveBoundPersona(catalog, unbound, BOARD);
+
+      if (resolution.ok) assert.fail("no binding is not a licence to pick one");
+      assert.equal(resolution.reason, "no-binding");
+      assert.equal(stub.seen.length, 1, "and it is not worth a catalog read to find that out");
+    } finally {
+      stub.stop();
+    }
+  });
+
+  it("names the device and the identifier in the line an operator acts on", () => {
+    const line = describePersonaMiss(BOARD, {
+      ok: false,
+      reason: "not-in-catalog",
+      detail: `device ${BOARD} is bound to gone-from-the-catalog, which the catalog does not report`,
+    });
+    assert.match(line, /b81f3f4a9b01/, "the device, so it can be found in the allowlist");
+    assert.match(line, /gone-from-the-catalog/, "the identifier, so it can be found in the bindings");
+    assert.match(line, /not-in-catalog/, "and which of the three faults this is");
   });
 });
