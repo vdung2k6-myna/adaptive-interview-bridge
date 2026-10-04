@@ -1,0 +1,14 @@
+# Auto-detect text files and normalize line endings to LF, as the platform does.
+* text=auto eol=lf
+
+# Windows batch files should keep CRLF
+*.bat text eol=crlf
+
+# Binary files — this service moves audio around, so the codecs are named here
+# rather than left to the auto-detection, which has been known to guess wrong on
+# a short capture.
+*.wav binary
+*.opus binary
+*.pcm binary
+*.png binary
+*.jpg binary
