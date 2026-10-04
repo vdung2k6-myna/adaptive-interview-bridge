@@ -126,14 +126,47 @@ a new binding raises:
 | --- | --- | --- |
 | `systemPrompt`, `enabledTopics`, `answerMode` | the persona | the platform's catalog, selected by `BRIDGE_DEVICE_PERSONAS` |
 | the device's identity (`Device-Id`) | the device | `BRIDGE_ALLOWED_DEVICES`, and the binding above |
-| `audio`, and the `language` the turn declares | the device, per turn | the device itself — 4.x |
-| `history` | the conversation so far | the bridge, per device — 4.x |
+| `audio`, and the `language` the turn declares | the device, per turn | the device itself — the language at 4.1, the audio at 6.1 |
+| `history` | the conversation so far | the bridge, per device — 4.2 |
 
 A device contributes its identity and never its character: it selects which
 persona answers, and nothing about what that persona says. The bridge holds no
 prompt, topic list or mode of its own. `label` and `emoji` are deliberately not
 carried — the bridge renders nothing (D8), and a label exists to be drawn on a
 screen this service does not paint.
+
+### The turn
+
+A turn goes to `POST /api/voice-agent/stream` on the platform, as multipart form
+data — the same request the browser makes, field for field (D2). The endpoint looks
+no persona up, so everything it needs to answer as this gadget's persona is in the
+request: the persona's three fields above, the conversation so far, and the
+person's input as an audio file or as text. It is sent with `speak=1`; a turn sent
+unspoken comes back with no audio on any sentence, and the gadget then sits silent
+with nothing in a log to say why.
+
+**`language` is required on every turn, and it is the full word, not a code.** The
+endpoint reads an absent or unrecognized value as `english` — not as "detect", as
+`english` — so a turn that drops the field does not lose a hint, it pins the
+transcriber, and it fails silently. A code (`vi`) is unrecognized in the same way.
+This is a correctness requirement rather than a preference: left to detect, the
+transcriber decodes short Vietnamese as Chinese, and the persona then answers
+someone who never spoke it (D12). Measured on one utterance taken from the device
+by the rig, the same bytes came back as `"ao"` with `language=vietnamese`, as
+`"Oh."` with `language=english`, and as `"哦。"` with the language left to detection.
+
+`engine` is derived from that language rather than configured — Piper for English,
+Kokoro for Vietnamese — which is the platform's own answer for a caller with no
+voice preference of its own. A persona carries no voice field (D3), and the bridge
+does not name one; leaving the field out would *not* express "no preference",
+because the endpoint folds an absent engine to Kokoro before it consults the
+language. See [Status](#status) for what that means for how a gadget sounds.
+
+The reply is a stream of server-sent events — `user`, `sentence`, `text`, `notice`,
+`error`, `done` — and it is read as one. The endpoint emits each sentence's audio as
+that sentence is finished, so speech begins before the reply is complete (D4); a
+client that waited for the body would have thrown the property away, which is why
+the bridge hands each event to its caller as it arrives.
 
 ### Adding a device
 
@@ -249,8 +282,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). |
-| Does not work yet | Nothing *calls* the resolution yet: no turn carries the three fields (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). And the turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. |
+| Does not work yet | Nothing *calls* the turn. There is no device path to it: conversation history is not held (4.2), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -261,6 +294,7 @@ src/
   credentials.ts      who may connect, and with what token
   platform.ts         the platform's credential, turned into a request in one place
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
+  turn.ts             the turn: the platform's voice-agent request, and the reply's stream
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -274,6 +308,7 @@ test/
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
   platform.test.ts    the platform header's shape, and that the two credentials never cross
   personas.test.ts    the strict read, the cached copy, the credentialed request, the mapping onto a turn, and the resolution that re-reads on a miss
+  turn.test.ts        the request the browser would have sent, and a reply's events consumed as they arrive
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket
