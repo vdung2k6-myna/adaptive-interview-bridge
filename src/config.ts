@@ -1,6 +1,7 @@
 import { normalizeDeviceId } from "./credentials.js";
 import { localIp } from "./net/local-ip.js";
 import type { FramingVersion } from "./protocol/framing.js";
+import type { TurnLanguage } from "./turn.js";
 
 /**
  * Everything the bridge reads from its environment, read once at start.
@@ -69,6 +70,36 @@ export interface BridgeConfig {
    * turn's history is one exchange shorter than this on the wire.
    */
   historyTurns: number;
+  /**
+   * The language this deployment's gadget is set to, declared on every turn it
+   * takes (D12). The platform decodes the utterance in the language the turn
+   * names rather than detecting one, and reads an absent value as English, so
+   * this is a property of the deployment and not of the audio: a Vietnamese
+   * gadget whose turns omitted it would transcribe clean Vietnamese into a
+   * foreign script while looking, from the bridge's side, exactly like one that
+   * was told to.
+   *
+   * Read from `BRIDGE_LANGUAGE`; anything that is not the two words the endpoint
+   * accepts throws, because a typo here fails silently in exactly the way above.
+   */
+  language: TurnLanguage;
+  /**
+   * The text of a turn the bridge takes by itself, on `listen start`, instead of
+   * waiting for the person to speak (5.x verification).
+   *
+   * **This is scaffolding, and shaped to be deleted.** Section 5 can only be
+   * verified on a device by making the device speak, and speaking requires a
+   * turn — but the device protocol has no text input path, and the one that
+   * produces a turn from speech is §6, which is not built. So this stands in for
+   * the person: with it set, the bridge sends one turn carrying this text, and
+   * the reply comes back through the ordinary speech path.
+   *
+   * It is configuration rather than code so that the bridge is unchanged when it
+   * goes: absent — which is what a deployment sets — no turn is ever taken by
+   * itself, and the task that makes 6.4 close a turn from speech removes the
+   * branch and this field together. Nothing else reads it.
+   */
+  verifyText?: string;
 }
 
 const PORT_MAX = 65535;
@@ -90,6 +121,21 @@ function readFraming(env: NodeJS.ProcessEnv): FramingVersion {
     throw new Error(`BRIDGE_FRAMING must be 3, 2 or 1, got ${JSON.stringify(raw)}`);
   }
   return Number(raw) as FramingVersion;
+}
+
+/**
+ * The gadget's language, as the endpoint's own two-word vocabulary. Not folded to
+ * English the way the platform folds an unknown value, because that folding is the
+ * failure D12 describes: an operator who typed `vi` would get a bridge that
+ * transcribes Vietnamese as English and says nothing about it.
+ */
+function readLanguage(env: NodeJS.ProcessEnv): TurnLanguage {
+  const raw = env.BRIDGE_LANGUAGE;
+  if (raw === undefined || raw === "") return "english";
+  if (raw !== "english" && raw !== "vietnamese") {
+    throw new Error(`BRIDGE_LANGUAGE must be english or vietnamese, got ${JSON.stringify(raw)}`);
+  }
+  return raw;
 }
 
 /**
@@ -275,5 +321,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     serverRate: readInt(env, "BRIDGE_SERVER_RATE", 24000),
     frameMs: readInt(env, "BRIDGE_FRAME_MS", 60),
     historyTurns: readInt(env, "BRIDGE_HISTORY_TURNS", 20),
+    language: readLanguage(env),
+    // The one value with no default, because it has no sensible one: absent means
+    // the bridge never takes a turn by itself, which is what a deployment wants.
+    verifyText: readVerifyText(env),
   };
+}
+
+/** The scaffolding turn's text, or nothing at all. An empty string is the same
+ *  as absent — a turn that says nothing would be a turn taken for no reason. */
+function readVerifyText(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.BRIDGE_VERIFY_TEXT;
+  return raw === undefined || raw === "" ? undefined : raw;
 }

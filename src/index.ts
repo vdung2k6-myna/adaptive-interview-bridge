@@ -1,4 +1,5 @@
 import { loadConfig } from "./config.js";
+import { createConversations } from "./conversation.js";
 import { allowedDeviceCount } from "./credentials.js";
 import { err, log, warn } from "./log.js";
 import { boundPersona, createPersonaCatalog, turnFieldsFor, unresolvedBindings } from "./personas.js";
@@ -26,8 +27,17 @@ try {
 
 const config = loadConfig();
 
+// Built before the socket rather than beside the read below, because the socket
+// needs to hold them both and neither is ready only later: the catalog object
+// exists empty and fills in when it is refreshed, so a session that arrives
+// during the read resolves no binding and is declined by 3.3's re-read rather
+// than by a socket that has not started listening. The conversation holds nothing
+// at start by definition.
+const catalog = createPersonaCatalog(config);
+const conversations = createConversations(config);
+
 createOtaServer(config);
-createWsServer(config);
+createWsServer(config, { catalog, conversations });
 
 const wsUrl = `ws://${config.publicHost}:${config.wsPort}/xiaozhi/v1/`;
 
@@ -37,6 +47,7 @@ console.log(
     `  ws       ${wsUrl}\n` +
     `  framing  v${config.framing}\n` +
     `  downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
+    `  language ${config.language}\n` +
     `  devices  ${allowedDeviceCount(config)} allowed, ${config.devicePersonas.size} bound\n` +
     `  platform token held, never sent to a device\n`
 );
@@ -67,7 +78,6 @@ warn(
 // empty cache resolves no binding, and 3.3 re-reads before a device is declined.
 // What must not happen is silence, so the failure is said out loud and names
 // where the read was aimed.
-const catalog = createPersonaCatalog(config);
 try {
   await catalog.refresh();
   log(`NOTE persona catalog: ${catalog.all().length} personas read from ${config.platformUrl}`);
@@ -113,7 +123,20 @@ for (const [device, personaId] of unresolvedBindings(config.devicePersonas, pers
   );
 }
 
-log(
-  `NOTE a device that connects will handshake and then hear nothing: its persona is bound and resolved ` +
-    `(3.2), but the turn (4.x), the speech (5.x) and the endpointer (6.x) are not implemented yet.`
-);
+// What the device will and will not get, said plainly, because both halves are
+// surprising from the outside. The bridge can speak but cannot yet listen, so an
+// operator who talks to a gadget and gets no turn should know that is the state
+// of the service and not a broken device, a bad allowlist or a fault in §5.
+if (config.verifyText === undefined) {
+  log(
+    `NOTE a device that connects will handshake and hear nothing: the bridge speaks only what a turn ` +
+      `gives it, and nothing yet turns speech into a turn (6.1, 6.4). Set BRIDGE_VERIFY_TEXT to have ` +
+      `a listen start take a turn of the bridge's own text instead — scaffolding for verifying §5.`
+  );
+} else {
+  warn(
+    `NOTE BRIDGE_VERIFY_TEXT is set, so every listen start takes a turn from the bridge's own text ` +
+      `(${JSON.stringify(config.verifyText)}) rather than from a person. This is scaffolding for ` +
+      `verifying §5 on a device and must not be left on.`
+  );
+}

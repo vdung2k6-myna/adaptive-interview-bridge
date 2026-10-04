@@ -316,8 +316,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. And the conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. |
-| Does not work yet | Nothing *calls* the turn. There is no device path to it: a turn is taken by a function nobody invokes yet, because speech is not synthesized (5.x) and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence. |
+| Does not work yet | Nothing the *person* says reaches a turn. A turn can be spoken, but only from text the bridge supplies itself: with `BRIDGE_VERIFY_TEXT` set, a `listen start` takes one turn from that text, which is enough to hear a gadget talk and to measure time-to-first-audio, and is scaffolding rather than a feature. Nothing yet turns speech into a turn — the audio a device streams is counted and discarded (6.1) and the endpointer that decides a turn is over does not exist (6.4) — so a gadget still cannot be *used* by speaking, and a deployment that leaves the verify text unset will handshake and then hear nothing. |
 
 ## Layout
 
@@ -330,14 +330,17 @@ src/
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   turn.ts             the turn: the platform's voice-agent request, and the reply's stream
   conversation.ts     a device's conversation: per device, sent as history, bounded
+  speech.ts           the device's voice: each sentence as Opus frames, inside the tts bracket
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
     framing.ts        the 4-byte (v3) and 16-byte (v2) headers around Opus
     messages.ts       the text messages, and the reply to a hello
+    opus.ts           one sentence's WAV, re-encoded as the device's Opus frames
+    wav.ts            the platform's sentence audio, unwrapped from its WAV container
   server/
     ota.ts            the OTA endpoint — issues the token, or refuses
-    ws.ts             the device socket, the refusal, and the session
+    ws.ts             the device socket, the refusal, the session, and the speech to it
 test/
   config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default, unbound devices
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
@@ -345,7 +348,11 @@ test/
   personas.test.ts    the strict read, the cached copy, the credentialed request, the mapping onto a turn, and the resolution that re-reads on a miss
   turn.test.ts        the request the browser would have sent, and a reply's events consumed as they arrive
   conversation.test.ts a device's conversation: what a turn carries in, and what it leaves behind
+  speech.test.ts      the bracket around a reply, and what it carries
+  verify-turn.test.ts the whole speech path, against a stub platform and no device
   framing.test.ts     round trips, and short packets
+  opus.test.ts        a sentence's frames, checked against a real decoder
+  wav.test.ts         the container: what the format chunk says, and where the samples start
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket
 ```

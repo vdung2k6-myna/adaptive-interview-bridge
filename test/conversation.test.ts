@@ -62,6 +62,7 @@ function configFor(
     serverRate: 24000,
     frameMs: 60,
     historyTurns: options.historyTurns ?? 20,
+    language: "english",
   };
 }
 

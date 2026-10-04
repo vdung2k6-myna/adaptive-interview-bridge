@@ -34,6 +34,7 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     serverRate: 24000,
     frameMs: 60,
     historyTurns: 20,
+    language: "english",
   };
 }
 

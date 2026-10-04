@@ -4,7 +4,9 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import type { BridgeConfig } from "../src/config.js";
+import { createConversations } from "../src/conversation.js";
 import { deriveToken } from "../src/credentials.js";
+import { createPersonaCatalog } from "../src/personas.js";
 import { createWsServer } from "../src/server/ws.js";
 
 /**
@@ -41,6 +43,7 @@ const config: BridgeConfig = {
   serverRate: 24000,
   frameMs: 60,
   historyTurns: 20,
+  language: "english",
 };
 
 /** The device's own hello, as the board sends it: 16000 Hz up, 60 ms frames. */
@@ -52,8 +55,13 @@ const deviceHello = {
   features: { mcp: false },
 };
 
+// A catalog that was never refreshed, and a conversation nobody has spoken into.
+// Neither is reached here: these tests assert the handshake, and a turn needs a
+// `BRIDGE_VERIFY_TEXT` this config does not set.
+const services = { catalog: createPersonaCatalog(config), conversations: createConversations(config) };
+
 async function startedServer() {
-  const wss = createWsServer(config);
+  const wss = createWsServer(config, services);
   if (!wss.address()) await once(wss, "listening");
   return {
     wss,

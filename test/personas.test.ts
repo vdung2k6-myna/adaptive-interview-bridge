@@ -44,6 +44,7 @@ function configFor(platformUrl: string): BridgeConfig {
     serverRate: 24000,
     frameMs: 60,
     historyTurns: 20,
+    language: "english",
   };
 }
 

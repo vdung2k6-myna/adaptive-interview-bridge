@@ -1,9 +1,12 @@
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
+import { takeTurn, type Conversations } from "../conversation.js";
 import { authorizeDevice, describeDenial } from "../credentials.js";
 import { err, info, log, section, warn } from "../log.js";
+import type { PersonaCatalog } from "../personas.js";
 import { isAbort, isHello, isListen, parseClientMessage, serverHello } from "../protocol/messages.js";
+import { createSpeaker } from "../speech.js";
 
 /**
  * The device's socket.
@@ -19,18 +22,37 @@ import { isAbort, isHello, isListen, parseClientMessage, serverHello } from "../
  * happened. Accepting first would let a device believe it was connected, and
  * would leave the audio it then sends looking like a bridge fault.
  *
- * Everything after the handshake — the persona (3.x), the turn (4.x), speech in
- * both directions (5.x, 6.x) — is deliberately absent rather than half-present,
- * and says so when it happens. A bridge that silently accepts audio it cannot
- * turn into anything looks, from a log, exactly like one whose endpointer is
- * broken.
+ * Speech to the device lives here rather than in a module of its own because it
+ * is not separable from the socket: the `tts` bracket that decides whether the
+ * device plays anything at all is a property of one connection's speaking state,
+ * and `speech.ts` is where that state is kept, next to the frames it qualifies.
+ * Speech *from* the device is still absent, and still says so — its frames are
+ * counted and named as 6.1's rather than quietly accepted, because a bridge that
+ * takes audio it cannot turn into anything looks, from a log, exactly like one
+ * whose endpointer is broken.
+ *
+ * With `BRIDGE_VERIFY_TEXT` set, a `listen start` makes the bridge take a turn of
+ * its own text instead of waiting for speech that nothing can yet turn into a
+ * turn. That is scaffolding, documented as such where it is configured, and a
+ * deployment leaves it unset.
  */
 interface DeviceRequest extends IncomingMessage {
   /** Set by the upgrade check, read by the session. The authenticated identity. */
   bridgeDeviceId?: string;
 }
 
-export function createWsServer(config: BridgeConfig): WebSocketServer {
+/**
+ * The rest of the service a session needs: who answers this device (3.x), and what
+ * it has already been told (4.2). Passed in rather than built here, because both
+ * outlive a connection — a persona catalog is read once at start, and a conversation
+ * is kept per device precisely so that a reconnecting device is not a stranger.
+ */
+export interface WsServices {
+  catalog: PersonaCatalog;
+  conversations: Conversations;
+}
+
+export function createWsServer(config: BridgeConfig, services: WsServices): WebSocketServer {
   const wss = new WebSocketServer({
     port: config.wsPort,
     verifyClient: (info, done) => {
@@ -70,6 +92,14 @@ export function createWsServer(config: BridgeConfig): WebSocketServer {
       bytes: 0,
       listening: false,
     };
+    // The device's voice, for the life of the socket: the speaking state the
+    // bracket controls belongs to this connection and to no other.
+    const speaker = createSpeaker(ws, config);
+    // One turn at a time per device. A `listen start` arriving while a reply is
+    // still playing is either a person talking over it or the echo of a wake word
+    // (6.5); neither is a second turn, and starting one would talk over a reply
+    // that is still being heard.
+    let turning = false;
 
     section("device connected");
     log(`session ${session.id} device ${deviceId} path ${req.url}`);
@@ -80,6 +110,61 @@ export function createWsServer(config: BridgeConfig): WebSocketServer {
     for (const [k, v] of Object.entries(req.headers)) {
       if (k === "authorization") continue;
       info(`  ${k}: ${v}`);
+    }
+
+    /**
+     * The scaffolding turn (§5). Sends the configured text as a turn and speaks
+     * whatever comes back through the ordinary path, so 5.1–5.5 are exercised
+     * against a real device before any of §6 exists. With no `verifyText` it does
+     * nothing at all, and `listen start` is only logged.
+     */
+    async function verifyTurn(): Promise<void> {
+      const text = config.verifyText;
+      if (text === undefined || turning) return;
+      turning = true;
+      log(
+        `verify turn: taking a turn from BRIDGE_VERIFY_TEXT, not from a person — scaffolding for §5`
+      );
+      try {
+        const result = await takeTurn(
+          config,
+          services.catalog,
+          services.conversations,
+          deviceId,
+          { language: config.language, text },
+          {
+            onUser: (said) => info(`platform transcribed the turn as ${JSON.stringify(said)}`),
+            onSentence: (sentence) => speaker.speak(sentence),
+            // The platform's own remarks are surfaced but not yet relayed to the
+            // device: what to tell it, and how it recovers, is 4.4, and this
+            // scaffolding is not the place to decide it.
+            onNotice: (notice) =>
+              warn(
+                `platform notice${notice.code ? ` ${notice.code}` : ""}: ${notice.message} ` +
+                  `(relaying it is 4.4)`
+              ),
+            onError: (message) => err(`platform refused the turn: ${message} (relaying it is 4.4)`),
+          }
+        );
+
+        if (!result.served) {
+          err(`verify turn not served: ${result.message}`);
+        } else {
+          log(
+            `verify turn ended ${result.outcome.settled ? "settled" : "unsettled"}, ` +
+              `${result.outcome.replyText.length} char(s) of reply, ` +
+              `${(speaker.sentMs() / 1000).toFixed(2)}s of audio sent`
+          );
+        }
+      } catch (error) {
+        err(`verify turn failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        // Always, whether the turn spoke or not: the bracket belongs to the turn,
+        // and one left open parks the device in `speaking`, where it discards
+        // whatever the person says next.
+        speaker.finish();
+        turning = false;
+      }
     }
 
     ws.on("message", (data, isBinary) => {
@@ -125,11 +210,15 @@ export function createWsServer(config: BridgeConfig): WebSocketServer {
           `listen ${msg.state} (mode=${msg.mode ?? "?"}) — ` +
             `${msg.state === "start" ? "the bridge must decide when the turn ends (6.4)" : "the device does not normally send this (D9)"}`
         );
+        // The device has opened its microphone. With a verify text configured
+        // that is the trigger to take a turn from it rather than from a person;
+        // otherwise there is nothing yet that a `listen start` could start.
+        if (msg.state === "start") void verifyTurn();
         return;
       }
 
       if (isAbort(msg)) {
-        log(`abort (reason=${msg.reason ?? "none"}) — nothing is speaking yet, so nothing to cancel (6.5)`);
+        log(`abort (reason=${msg.reason ?? "none"}) — nothing to cancel yet (6.5)`);
         return;
       }
 
