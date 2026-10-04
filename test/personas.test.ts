@@ -4,7 +4,14 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { BridgeConfig } from "../src/config.js";
-import { createPersonaCatalog, fetchCatalog, parseCatalog } from "../src/personas.js";
+import {
+  boundPersona,
+  createPersonaCatalog,
+  fetchCatalog,
+  parseCatalog,
+  turnFieldsFor,
+  unresolvedBindings,
+} from "../src/personas.js";
 
 /**
  * The catalog is the platform's, and the bridge is strict about reading it.
@@ -28,6 +35,7 @@ function configFor(platformUrl: string): BridgeConfig {
     publicHost: "127.0.0.1",
     deviceSecret: "s".repeat(43),
     allowedDevices: ["b81f3f4a9b01"],
+    devicePersonas: new Map([["b81f3f4a9b01", "interview-coach"]]),
     platformUrl,
     apiAuthToken: PLATFORM,
     framing: 3,
@@ -215,5 +223,100 @@ describe("the cache", () => {
     } finally {
       stub.stop();
     }
+  });
+});
+
+/**
+ * The binding, and the three fields a persona contributes to a turn (3.2).
+ *
+ * Two things are being pinned. The mapping itself — which persona field becomes
+ * which request field, renamed here and nowhere else — and the miss. The miss
+ * matters more than the mapping: the requirement is that a device bound to an
+ * identifier the catalog does not report SHALL NOT be answered as a different
+ * persona, so a lookup that fell back to anything at all would be the exact
+ * behaviour being forbidden, and the tests say so by making every other persona
+ * a wrong answer.
+ */
+describe("the persona-to-turn mapping", () => {
+  const personas = parseCatalog(CATALOG);
+  const [languagePartner, interviewCoach] = personas;
+
+  it("carries the persona's own prompt, topics and mode, under the platform's names", () => {
+    assert.deepEqual(turnFieldsFor(languagePartner), {
+      systemPrompt: "You are a patient language partner.",
+      enabledTopics: ["Truyện cười"],
+      answerMode: "generate",
+    });
+    assert.deepEqual(Object.keys(turnFieldsFor(languagePartner)).sort(), [
+      "answerMode",
+      "enabledTopics",
+      "systemPrompt",
+    ]);
+  });
+
+  it("gives two personas two different turns, with no field of one leaking into the other", () => {
+    const first = turnFieldsFor(languagePartner);
+    const second = turnFieldsFor(interviewCoach);
+    assert.notDeepEqual(first, second);
+    assert.notEqual(first.systemPrompt, second.systemPrompt);
+    assert.notDeepEqual(first.enabledTopics, second.enabledTopics);
+    assert.notEqual(first.answerMode, second.answerMode);
+  });
+
+  it("copies the topics, so a turn cannot edit the persona in the cache", () => {
+    const fields = turnFieldsFor(languagePartner);
+    fields.enabledTopics.push("invented");
+    fields.systemPrompt = "replaced";
+    assert.deepEqual(languagePartner.knowledgeTopics, ["Truyện cười"]);
+    assert.equal(languagePartner.defaultPrompt, "You are a patient language partner.");
+  });
+
+  it("carries a persona with no prompt or topics through unchanged, inventing nothing", () => {
+    // The platform refuses such a turn, and 4.4 relays that refusal. Filling the
+    // blanks here would answer under a character the platform never configured.
+    assert.deepEqual(turnFieldsFor(interviewCoach), {
+      systemPrompt: "",
+      enabledTopics: [],
+      answerMode: "material",
+    });
+  });
+});
+
+describe("resolving a device's binding against the catalog", () => {
+  const personas = parseCatalog(CATALOG);
+
+  it("resolves a bound identifier to that persona and no other", () => {
+    assert.equal(boundPersona("language-partner", personas)?.id, "language-partner");
+    assert.equal(boundPersona("interview-coach", personas)?.id, "interview-coach");
+  });
+
+  it("misses rather than falling back, so a device is never answered as another persona", () => {
+    // The whole of the requirement is here: the miss is the answer, because every
+    // alternative — the first persona, a default, the nearest name — would be a
+    // gadget speaking as someone it is not.
+    assert.equal(boundPersona("no-such-persona", personas), undefined);
+    assert.equal(boundPersona("", personas), undefined);
+    assert.equal(boundPersona("language", personas), undefined, "no prefix matching");
+    assert.equal(boundPersona("Language-Partner", personas), undefined, "no case folding: catalog ids are exact");
+  });
+
+  it("reports exactly the bindings the catalog does not report", () => {
+    const bindings = new Map([
+      ["b81f3f4a9b01", "language-partner"],
+      ["b81f3f4a9b02", "gone-from-the-catalog"],
+    ]);
+    assert.deepEqual(unresolvedBindings(bindings, personas), [["b81f3f4a9b02", "gone-from-the-catalog"]]);
+  });
+
+  it("reports nothing when the cache is empty and there is nothing bound", () => {
+    assert.deepEqual(unresolvedBindings(new Map(), personas), []);
+  });
+
+  it("reports every binding as unresolved against an empty cache, which is the unread state", () => {
+    // A bridge whose start-up read failed holds no personas, so every binding
+    // misses. That is the state 3.3's re-read exists for, and it is reported
+    // rather than smoothed over.
+    const bindings = new Map([["b81f3f4a9b01", "interview-coach"]]);
+    assert.deepEqual(unresolvedBindings(bindings, []), [["b81f3f4a9b01", "interview-coach"]]);
   });
 });

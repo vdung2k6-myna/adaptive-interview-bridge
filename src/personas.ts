@@ -40,6 +40,48 @@ export interface Persona {
   answerMode: AnswerMode;
 }
 
+/**
+ * The three fields a persona contributes to a turn, named as the platform names
+ * them on the request (`POST /api/voice-agent/stream`).
+ *
+ * The renaming happens here and nowhere else: `defaultPrompt` becomes
+ * `systemPrompt`, `knowledgeTopics` becomes `enabledTopics`, and `answerMode` is
+ * carried under its own name. Which of them come from the persona and which from
+ * the device is the whole of 3.5, and the short version is that all three come
+ * from the persona — a device contributes its identity, never its character.
+ *
+ * `enabledTopics` is not "topics this persona may discuss" in some abstract
+ * sense. The platform folds each label to the collections that scope the turn's
+ * search, so the catalog's `knowledgeTopics` labels are exactly what the turn
+ * wants, under the platform's other name for them — and a label that folds to no
+ * collection is a search the turn does not make, which is the platform's
+ * behaviour and not something to fix by guessing a name here.
+ */
+export interface TurnPersonaFields {
+  systemPrompt: string;
+  enabledTopics: string[];
+  answerMode: AnswerMode;
+}
+
+/**
+ * A persona as the fields a turn carries. A copy, never the cached object: the
+ * cache is shared by every device, and a turn that mutated the persona it was
+ * handed would change what the next device's turn says.
+ *
+ * An empty `defaultPrompt` is carried through as empty rather than filled with
+ * something. The platform refuses such a turn ("systemPrompt is required"), and
+ * a persona without a prompt is a refusal the bridge has to relay as one (4.4);
+ * inventing a prompt here would answer as a character the platform never
+ * configured.
+ */
+export function turnFieldsFor(persona: Persona): TurnPersonaFields {
+  return {
+    systemPrompt: persona.defaultPrompt,
+    enabledTopics: [...persona.knowledgeTopics],
+    answerMode: persona.answerMode,
+  };
+}
+
 /** The catalog route, relative to the platform base URL. */
 const CATALOG_PATH = "/api/personas";
 
@@ -134,10 +176,10 @@ export interface PersonaCatalog {
 }
 
 /**
- * A cache, and for now nothing more: 3.1 reads the catalog once at start, and
- * the lookup a device's binding needs is 3.2, with the re-read on a missed
- * identifier in 3.3. Both belong here rather than at a call site, because this
- * is what owns the cached copy.
+ * A cache, and for now nothing more: 3.1 reads the catalog once at start and
+ * every lookup goes through it, and the re-read on a binding it does not hold is
+ * 3.3. The lookup itself lives here too (`boundPersona`), rather than at a call
+ * site, because this is what owns the cached copy.
  */
 export function createPersonaCatalog(config: BridgeConfig): PersonaCatalog {
   let cached: Persona[] = [];
@@ -150,4 +192,41 @@ export function createPersonaCatalog(config: BridgeConfig): PersonaCatalog {
       return cached;
     },
   };
+}
+
+/**
+ * The persona a device is bound to, as the catalog reports it — or nothing.
+ *
+ * Nothing is a real answer, not an error, and it is deliberately not a fallback.
+ * The requirement is that a gadget bound to an identifier the catalog does not
+ * report SHALL NOT be answered as a different persona, so a lookup that picked a
+ * default, or the first entry, would be the exact behaviour the requirement
+ * forbids; the miss is the whole point of returning `undefined`. The caller
+ * decides what a miss means, and 3.3 makes it "re-read the catalog, then decline
+ * if it still does not report it".
+ *
+ * A miss is ordinary, not exceptional: the binding is configuration and the
+ * catalog is live, so a persona added on the platform while the bridge is
+ * running is a miss until the next read, and one deleted is a binding that will
+ * never resolve again.
+ */
+export function boundPersona(personaId: string, personas: readonly Persona[]): Persona | undefined {
+  return personas.find((persona) => persona.id === personaId);
+}
+
+/**
+ * Every binding the catalog does not currently report, as [device, persona id].
+ *
+ * Read at start so that a deployment hears about a binding that resolves to
+ * nothing where the operator is, rather than at a turn. It is a warning and not a
+ * refusal, because the catalog is live and the bridge's read is one moment of it:
+ * refusing to start would make a momentarily stale read — or a persona being
+ * added right after the bridge — a reason for the service to be down. The
+ * devices are normalized identifiers, as the config stores them.
+ */
+export function unresolvedBindings(
+  devicePersonas: ReadonlyMap<string, string>,
+  personas: readonly Persona[]
+): Array<[string, string]> {
+  return [...devicePersonas].filter(([, personaId]) => boundPersona(personaId, personas) === undefined);
 }

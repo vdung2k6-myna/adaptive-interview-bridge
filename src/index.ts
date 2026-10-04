@@ -1,7 +1,7 @@
 import { loadConfig } from "./config.js";
 import { allowedDeviceCount } from "./credentials.js";
 import { err, log, warn } from "./log.js";
-import { createPersonaCatalog } from "./personas.js";
+import { boundPersona, createPersonaCatalog, turnFieldsFor, unresolvedBindings } from "./personas.js";
 import { createOtaServer } from "./server/ota.js";
 import { createWsServer } from "./server/ws.js";
 
@@ -37,7 +37,7 @@ console.log(
     `  ws       ${wsUrl}\n` +
     `  framing  v${config.framing}\n` +
     `  downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
-    `  devices  ${allowedDeviceCount(config)} allowed\n` +
+    `  devices  ${allowedDeviceCount(config)} allowed, ${config.devicePersonas.size} bound\n` +
     `  platform token held, never sent to a device\n`
 );
 
@@ -82,8 +82,38 @@ try {
   );
 }
 
+// The bindings, resolved against the catalog just read (3.2). One line per
+// device, because this is the whole of what a gadget's character is: which
+// persona it speaks as, and therefore which three turn fields it will carry. The
+// count of topics is printed rather than the topics themselves — the interesting
+// fact at start is whether the persona resolved and whether it scopes any search
+// at all, and a persona with no topics is a valid one that never reads material.
+//
+// A binding the catalog does not report is a warning, not a refusal: the catalog
+// is live and this read is one moment of it, so a persona added on the platform
+// minutes after the bridge came up would otherwise be a reason not to run. It is
+// said out loud all the same, because until 3.3 re-reads and the miss resolves,
+// the device it names would be answered as nobody — which is the requirement's
+// own behaviour ("SHALL NOT be answered as a different persona") and not
+// something to paper over with a default here.
+const personas = catalog.all();
+for (const [device, personaId] of config.devicePersonas) {
+  const persona = boundPersona(personaId, personas);
+  if (persona === undefined) continue;
+  const fields = turnFieldsFor(persona);
+  log(
+    `NOTE device ${device} speaks as ${persona.id} (${persona.label}): ${fields.enabledTopics.length} ` +
+      `topic(s), answer mode ${fields.answerMode}`
+  );
+}
+for (const [device, personaId] of unresolvedBindings(config.devicePersonas, personas)) {
+  warn(
+    `NOTE device ${device} is bound to persona ${personaId}, which the catalog does not report. The ` +
+      `catalog is re-read before this device is declined (3.3); as this read stands, it would answer as nobody.`
+  );
+}
+
 log(
-  `NOTE a device that connects will handshake and then hear nothing: the catalog is read but no ` +
-    `device is bound to a persona (3.2+), and the turn (4.x), the speech (5.x) and the endpointer ` +
-    `(6.x) are not implemented yet.`
+  `NOTE a device that connects will handshake and then hear nothing: its persona is bound and resolved ` +
+    `(3.2), but the turn (4.x), the speech (5.x) and the endpointer (6.x) are not implemented yet.`
 );

@@ -12,7 +12,8 @@ import { loadConfig } from "../src/config.js";
  * that reads an empty allowlist as "no restriction" would refuse nothing; and one
  * that starts without the platform's credential or address only fails later, at
  * its first platform call, where the cause is far from the symptom. All four are
- * pinned here, along with the parsing an operator cannot see.
+ * pinned here, along with the parsing an operator cannot see — and, from 3.2, the
+ * rule that the allowlist and the persona bindings must name the same devices.
  */
 const BOARD = "b8:1f:3f:4a:9b:01";
 const SECRET = "s".repeat(43);
@@ -129,6 +130,7 @@ describe("the allowlist", () => {
     const config = loadConfig({
       ...minimal,
       BRIDGE_ALLOWED_DEVICES: " B8-1F-3F-4A-9B-01 , b8:1f:3f:4a:9b:02 ",
+      BRIDGE_DEVICE_PERSONAS: "B8-1F-3F-4A-9B-01=friendly-tutor,b8:1f:3f:4a:9b:02=debate-partner",
     } as NodeJS.ProcessEnv);
     assert.deepEqual(config.allowedDevices, ["b81f3f4a9b01", "b81f3f4a9b02"]);
   });
@@ -137,6 +139,7 @@ describe("the allowlist", () => {
     const config = loadConfig({
       ...minimal,
       BRIDGE_ALLOWED_DEVICES: `${BOARD},b81f3f4a9b01,B8:1F:3F:4A:9B:01`,
+      BRIDGE_DEVICE_PERSONAS: "b81f3f4a9b01=interview-coach",
     } as NodeJS.ProcessEnv);
     assert.equal(config.allowedDevices.length, 1);
   });
@@ -148,6 +151,79 @@ describe("the allowlist", () => {
       loadConfig({ ...minimal, BRIDGE_ALLOWED_DEVICES: "  ,  ," } as NodeJS.ProcessEnv).allowedDevices,
       []
     );
+  });
+});
+
+/**
+ * The bindings, and the cross-check between them and the allowlist. The two
+ * lists have to describe the same devices: a device that may connect and has no
+ * persona could never be answered, and a binding for a device the allowlist does
+ * not name is configuration for something that can never connect. Both are
+ * refused at start, where the operator is.
+ */
+describe("the persona bindings", () => {
+  const board = (personas: string) =>
+    ({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD, BRIDGE_DEVICE_PERSONAS: personas }) as NodeJS.ProcessEnv;
+
+  it("reads DEVICE=PERSONA, normalizing the device as the allowlist does", () => {
+    // Normalized the same way means the two lists can be pasted from the same
+    // place and still agree — which is the only reason the cross-check can be
+    // exact rather than fuzzy.
+    const config = loadConfig(board("B8-1F-3F-4A-9B-01=interview-coach"));
+    assert.deepEqual([...config.devicePersonas], [["b81f3f4a9b01", "interview-coach"]]);
+  });
+
+  it("splits on the first =, because a Device-Id is full of colons", () => {
+    // The device here is written with its separators, so a separator-based parse
+    // would still work; the `=` is what a persona id may not contain and a
+    // Device-Id may.
+    const config = loadConfig(board("b8:1f:3f:4a:9b:01=custom-2"));
+    assert.equal(config.devicePersonas.get("b81f3f4a9b01"), "custom-2");
+  });
+
+  it("carries the persona identifier exactly, since the catalog's are exact", () => {
+    // No case folding and no normalization: an identifier the platform does not
+    // report is meant to be a miss (3.3), not a near-miss this service guesses at.
+    assert.equal(loadConfig(board("b81f3f4a9b01=Custom-2")).devicePersonas.get("b81f3f4a9b01"), "Custom-2");
+  });
+
+  it("accepts the same separators between bindings that the allowlist accepts", () => {
+    const config = loadConfig({
+      ...minimal,
+      BRIDGE_ALLOWED_DEVICES: `${BOARD},b81f3f4a9b02`,
+      BRIDGE_DEVICE_PERSONAS: `${BOARD}=interview-coach;b81f3f4a9b02=debate-partner`,
+    } as NodeJS.ProcessEnv);
+    assert.equal(config.devicePersonas.size, 2);
+  });
+
+  it("refuses an allowed device with no binding, since it could never be answered", () => {
+    assert.throws(() => loadConfig({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD } as NodeJS.ProcessEnv), /no binding/);
+    // And says which device, so the operator does not have to diff two lists.
+    assert.throws(() => loadConfig({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD } as NodeJS.ProcessEnv), /b81f3f4a9b01/);
+  });
+
+  it("refuses a binding for a device the allowlist does not name", () => {
+    // Nearly always a typo in one of the two identifiers, and one that would
+    // otherwise sit in configuration forever serving nobody.
+    assert.throws(() => loadConfig(board(`${BOARD}=interview-coach,b81f3f4a9b02=debate-partner`)), /b81f3f4a9b02/);
+  });
+
+  it("refuses a device bound twice, because a device speaks as one persona", () => {
+    assert.throws(
+      () => loadConfig(board(`${BOARD}=interview-coach,B8-1F-3F-4A-9B-01=debate-partner`)),
+      /binds b81f3f4a9b01 twice/
+    );
+  });
+
+  it("refuses an entry that is not DEVICE=PERSONA, or has a side missing", () => {
+    const at = (personas: string) => () => loadConfig(board(personas));
+    assert.throws(at(BOARD), /DEVICE=PERSONA/);
+    assert.throws(at(`${BOARD}=`), /names no persona/);
+    assert.throws(at(`=interview-coach`), /DEVICE=PERSONA|names no device/);
+  });
+
+  it("is empty when unset, which is only consistent with an empty allowlist", () => {
+    assert.equal(loadConfig(minimal).devicePersonas.size, 0);
   });
 });
 

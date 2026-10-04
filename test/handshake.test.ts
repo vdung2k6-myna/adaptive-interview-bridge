@@ -30,6 +30,11 @@ const config: BridgeConfig = {
   publicHost: "127.0.0.1",
   deviceSecret: SECRET,
   allowedDevices: ["b81f3f4a9b01", "b81f3f4a9b02"],
+  // Both allowed devices are bound, one persona each (3.2).
+  devicePersonas: new Map([
+    ["b81f3f4a9b01", "language-partner"],
+    ["b81f3f4a9b02", "debate-partner"],
+  ]),
   platformUrl: "http://127.0.0.1:4000",
   apiAuthToken: PLATFORM,
   framing: 3,

@@ -8,8 +8,9 @@ to connect, then open a WebSocket and say hello. The platform
 between them — it answers the device's OTA request, holds the device's socket,
 and will translate every spoken turn into the platform's turn API.
 
-This repository is being built task by task, and **today it is a skeleton**: the
-handshake works, and nothing after it does. See [Status](#status).
+This repository is being built task by task, and **today it does not speak yet**:
+the handshake works, each device is bound to a persona, and nothing after that
+does. See [Status](#status).
 
 ## Running it
 
@@ -37,7 +38,7 @@ adaptive-interview-bridge
   ws       ws://192.168.1.100:8000/xiaozhi/v1/
   framing  v3
   downlink 24000 Hz / 60 ms
-  devices  1 allowed
+  devices  1 allowed, 1 bound
   platform token held, never sent to a device
 ```
 
@@ -90,6 +91,39 @@ declined (3.3). It is the first platform call the bridge makes, and it goes
 through the one place the platform's credential becomes a request
 (`src/platform.ts`).
 
+### Which persona a device speaks as
+
+`BRIDGE_DEVICE_PERSONAS` binds each device to one persona, as `DEVICE=PERSONA` —
+for example `b8:1f:3f:4a:9b:01=interview-coach`. The device half is read exactly
+the way `BRIDGE_ALLOWED_DEVICES` reads its own, so the two lists can be pasted
+from the same place; the persona half is the catalog's own identifier and is
+carried exactly as written, because an identifier the catalog does not report is
+meant to be a miss rather than a near-miss this service guesses at.
+
+The two lists must describe the same devices, in both directions, and the bridge
+refuses to start otherwise. An allowed device with no persona could connect and
+never be answered; a binding for a device the allowlist does not name is
+configuration for something that can never connect, and is nearly always a typo
+in one of the two identifiers. One persona per device, because a gadget speaks as
+exactly one — and a device bound to an identifier the catalog does not report is
+never answered as a different persona (the bridge says so at start rather than
+quietly picking one).
+
+A persona contributes three fields to a turn. They are the platform's own request
+fields, renamed in `src/personas.ts` and nowhere else:
+
+| Turn field (`POST /api/voice-agent/stream`) | Persona field (`GET /api/personas`) |
+| --- | --- |
+| `systemPrompt` | `defaultPrompt` |
+| `enabledTopics` | `knowledgeTopics` |
+| `answerMode` | `answerMode` |
+
+Those three are the whole of what the bridge takes from a persona: the rest of a
+turn comes from the device and the conversation, and the bridge holds no prompt,
+topic list or mode of its own. `label` and `emoji` are deliberately not carried —
+the bridge renders nothing (D8), and a label exists to be drawn on a screen this
+service does not paint.
+
 ## Credentials
 
 Two values, and the boundary between them is the point of the service. (The
@@ -135,7 +169,10 @@ Separators and case do not distinguish devices, so `b8:1f:3f:4a:9b:01`,
 `B8-1F-3F-4A-9B-01` and `b81f3f4a9b01` are one entry. **Empty means nobody**: a
 device is allowed because it is named, and a bridge with nothing named refuses
 every device, at the OTA endpoint and at the socket alike. The service says so at
-startup when the list is empty.
+startup when the list is empty. Every device named here must also be bound to a
+persona in `BRIDGE_DEVICE_PERSONAS` — see
+[Which persona a device speaks as](#which-persona-a-device-speaks-as) — and the
+bridge refuses to start if the two lists do not name the same devices.
 
 **For an operator: where each secret lives.** The device holds one opaque token,
 per device, written into its NVS by the OTA answer — and it is worthless to the
@@ -185,8 +222,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — as the first thing that uses it — the persona catalog read from the platform at start and cached. |
-| Does not work yet | The catalog is read but unused: no device is bound to a persona and no turn carries one (3.2–3.4). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the two things that use it — the persona catalog read from the platform at start and cached, and the binding that maps each device onto one persona's prompt, topics and answer mode. |
+| Does not work yet | Nothing consumes a binding yet: no turn carries the three fields (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -196,7 +233,7 @@ src/
   config.ts           everything read from the environment, read once
   credentials.ts      who may connect, and with what token
   platform.ts         the platform's credential, turned into a request in one place
-  personas.ts         the persona catalog: fetched, validated field by field, cached
+  personas.ts         the persona catalog: fetched, validated, cached, and mapped onto a turn's three fields
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -206,10 +243,10 @@ src/
     ota.ts            the OTA endpoint — issues the token, or refuses
     ws.ts             the device socket, the refusal, and the session
 test/
-  config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default
+  config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default, unbound devices
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
   platform.test.ts    the platform header's shape, and that the two credentials never cross
-  personas.test.ts    the strict read, the cached copy, and the request that carries the credential
+  personas.test.ts    the strict read, the cached copy, the credentialed request, and the mapping onto a turn
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket

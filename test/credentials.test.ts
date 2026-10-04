@@ -24,6 +24,10 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     publicHost: "127.0.0.1",
     deviceSecret: secret,
     allowedDevices,
+    // Every allowed device is bound, because the config requires the two lists to
+    // name the same devices (3.2) and a builder that skipped this would describe a
+    // config that cannot load.
+    devicePersonas: new Map(allowedDevices.map((device) => [device, "language-partner"])),
     platformUrl: "http://127.0.0.1:4000",
     apiAuthToken: PLATFORM,
     framing: 3,
