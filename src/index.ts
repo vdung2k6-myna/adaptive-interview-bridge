@@ -35,12 +35,14 @@ console.log(
     `  ws       ${wsUrl}\n` +
     `  framing  v${config.framing}\n` +
     `  downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
-    `  devices  ${allowedDeviceCount(config)} allowed\n`
+    `  devices  ${allowedDeviceCount(config)} allowed\n` +
+    `  platform token held, never sent to a device\n`
 );
 
-// Three things an operator must not have to infer, said out loud at every start.
-// The secret itself is never printed — it is the one value whose absence from
-// this output is the point.
+// The things an operator must not have to infer, said out loud at every start.
+// Neither secret is ever printed. The platform's is named as held and not shown:
+// that the bridge has it while a device does not is the whole of 2.3, and it is
+// the one fact about this service a reader of the output should take away.
 if (allowedDeviceCount(config) === 0) {
   warn(
     `NOTE no devices are allowed: BRIDGE_ALLOWED_DEVICES is empty, and an empty allowlist allows ` +

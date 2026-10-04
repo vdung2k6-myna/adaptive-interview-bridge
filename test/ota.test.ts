@@ -15,6 +15,7 @@ import { createOtaServer } from "../src/server/ota.js";
  */
 const BOARD = "b8:1f:3f:4a:9b:01";
 const SECRET = "s".repeat(43);
+const PLATFORM = "platform-token-abcdefgh";
 
 function configFor(otaPort: number): BridgeConfig {
   return {
@@ -23,6 +24,7 @@ function configFor(otaPort: number): BridgeConfig {
     publicHost: "127.0.0.1",
     deviceSecret: SECRET,
     allowedDevices: ["b81f3f4a9b01"],
+    apiAuthToken: PLATFORM,
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
@@ -77,6 +79,24 @@ describe("the OTA endpoint", () => {
         return ((await res.json()) as { websocket: { token: string } }).websocket.token;
       };
       assert.equal(await ask(), await ask());
+    } finally {
+      stop();
+    }
+  });
+
+  it("hands the device its own token and nothing of the platform's", async () => {
+    // 2.3's boundary, asserted where a device is actually answered. The reply
+    // carries a token derived from the device secret, so neither the platform's
+    // credential nor the secret behind the device's may appear anywhere in it.
+    const { port, stop } = await startedServer();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/xiaozhi/ota/`, {
+        headers: { "device-id": BOARD, "client-id": "test" },
+      });
+      const text = await res.text();
+      assert.equal(res.status, 200);
+      assert.ok(!text.includes(PLATFORM), "the platform's credential must never be in what a device receives");
+      assert.ok(!text.includes(SECRET), "nor the secret every device token is derived from");
     } finally {
       stop();
     }
@@ -138,6 +158,7 @@ describe("the OTA endpoint", () => {
       const text = await root.text();
       assert.match(text, /xiaozhi\/ota/);
       assert.ok(!text.includes(SECRET), "the human page must not leak the device secret");
+      assert.ok(!text.includes(PLATFORM), "nor the platform's credential");
 
       const missing = await fetch(`http://127.0.0.1:${port}/xiaozhi/ota/firmware`);
       assert.equal(missing.status, 404, "a path we do not serve is logged, not answered with the address");

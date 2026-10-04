@@ -22,6 +22,7 @@ import { createWsServer } from "../src/server/ws.js";
 const BOARD = "b8:1f:3f:4a:9b:01";
 const SECOND = "b8:1f:3f:4a:9b:02";
 const SECRET = "s".repeat(43);
+const PLATFORM = "platform-token-abcdefgh";
 
 const config: BridgeConfig = {
   otaPort: 0,
@@ -29,6 +30,7 @@ const config: BridgeConfig = {
   publicHost: "127.0.0.1",
   deviceSecret: SECRET,
   allowedDevices: ["b81f3f4a9b01", "b81f3f4a9b02"],
+  apiAuthToken: PLATFORM,
   framing: 3,
   serverRate: 24000,
   frameMs: 60,
@@ -189,6 +191,23 @@ describe("the device handshake", () => {
       assert.equal(hello.audio_params.channels, 1);
       assert.equal(hello.audio_params.sample_rate, 24000, "the reply describes the server's output");
       assert.equal(hello.audio_params.frame_duration, 60);
+    } finally {
+      stop();
+    }
+  });
+
+  it("carries no platform credential in the one reply every device receives", async () => {
+    // The hello reply is the single message a connecting device is guaranteed to
+    // get, which makes it the place a leaked platform credential would be handed
+    // out to every device at once. It must carry neither the platform's token nor
+    // the secret the device's own token is derived from.
+    const { ws, next, stop } = await connectedDevice();
+    try {
+      const reply = next();
+      ws.send(JSON.stringify(deviceHello));
+      const raw = await reply;
+      assert.ok(!raw.includes(PLATFORM), "the platform's credential must never reach a device");
+      assert.ok(!raw.includes(SECRET));
     } finally {
       stop();
     }

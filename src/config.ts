@@ -7,8 +7,10 @@ import type { FramingVersion } from "./protocol/framing.js";
  *
  * Deliberately only what the service uses. A skeleton that accepts configuration
  * for features it does not have is a skeleton whose operator believes those
- * features are on; the platform's URL and credential are added by the task that
- * first needs them (4.1), with the code that consumes them.
+ * features are on; the platform's URL is added by the task that first needs it
+ * (4.1), with the code that consumes it. The platform *credential* is held from
+ * 2.3 rather than alongside it, because keeping that secret on the bridge and off
+ * the device is what 2.3 is about, not a later task's business.
  *
  * A malformed value throws rather than falling back: a bridge quietly listening
  * on a different port than the device was told is a bridge nobody can find.
@@ -28,6 +30,13 @@ export interface BridgeConfig {
   deviceSecret: string;
   /** The devices this bridge will issue a token to, normalized for comparison. */
   allowedDevices: string[];
+  /**
+   * The platform's own credential (`API_AUTH_TOKEN`), held so the bridge can
+   * call the platform on a device's behalf. It is the other half of the boundary
+   * `deviceSecret` starts: that one must never be on the platform, this one must
+   * never be on a device, and nothing this service sends to a device reads it.
+   */
+  apiAuthToken: string;
   /** The binary framing version both directions use. */
   framing: FramingVersion;
   /** The sample rate the server declares it will send, in Hz. */
@@ -75,6 +84,31 @@ function readDeviceSecret(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * The platform's credential is required and has no default, for the reason the
+ * device secret has none: a bridge that cannot authenticate to the platform
+ * cannot serve a turn, and one that starts anyway only fails later, at the first
+ * turn, where the cause is far from the symptom.
+ *
+ * There is deliberately no length rule. Unlike the device secret — which this
+ * service generates, so it can insist on entropy — this token is issued by the
+ * platform, and a short one is the platform's business rather than a reason for
+ * this service to refuse to carry it. It is also returned exactly as read,
+ * because the platform compares it byte for byte and a helpful trim would be a
+ * credential that no longer works. Only a value that is nothing but whitespace
+ * is treated as absent, since that is a mistake rather than a token.
+ */
+function readApiAuthToken(env: NodeJS.ProcessEnv): string {
+  const token = env.API_AUTH_TOKEN ?? "";
+  if (token.trim() === "") {
+    throw new Error(
+      "API_AUTH_TOKEN must be set: it is the platform's own credential, and the bridge is what calls the platform. " +
+        "Copy it from adaptive-interview-api's .env — and never onto a device."
+    );
+  }
+  return token;
+}
+
+/**
  * The allowlist. Empty is empty: a device is allowed because it is named, and a
  * bridge with nothing named lets nothing connect. Separators and case do not
  * distinguish devices — see `normalizeDeviceId`.
@@ -95,6 +129,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     publicHost: localIp(env.BRIDGE_PUBLIC_HOST),
     deviceSecret: readDeviceSecret(env),
     allowedDevices: readAllowedDevices(env),
+    apiAuthToken: readApiAuthToken(env),
     framing: readFraming(env),
     // 24000 Hz is the platform's measured TTS output rate and a legal Opus rate;
     // it is also the firmware's own default, so neither side resamples.

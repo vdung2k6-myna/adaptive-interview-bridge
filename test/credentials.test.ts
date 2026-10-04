@@ -15,6 +15,8 @@ import {
  * identifier nobody named, a token for a different device, and — the one that is
  * easy to get wrong — a bridge whose allowlist is empty.
  */
+const PLATFORM = "platform-token-abcdefgh";
+
 function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeConfig {
   return {
     otaPort: 0,
@@ -22,6 +24,7 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     publicHost: "127.0.0.1",
     deviceSecret: secret,
     allowedDevices,
+    apiAuthToken: PLATFORM,
     framing: 3,
     serverRate: 24000,
     frameMs: 60,

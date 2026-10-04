@@ -25,7 +25,8 @@ npm start                 # tsx src/index.ts
 
 `.env` is read by Node itself, so `npm start`, `npm run dev` and a bare
 `node --import tsx src/index.ts` all behave the same. Every value has a default
-except the device secret, which has none on purpose.
+except the two credentials — the device secret and the platform's token — which
+have none on purpose; see [Credentials](#credentials).
 
 `npm start` starts **both** servers and prints the addresses:
 
@@ -36,6 +37,7 @@ adaptive-interview-bridge
   framing  v3
   downlink 24000 Hz / 60 ms
   devices  1 allowed
+  platform token held, never sent to a device
 ```
 
 | Command | What it does |
@@ -77,7 +79,7 @@ Two values, and the boundary between them is the point of the service.
 | --- | --- | --- |
 | The device | One opaque token, per device, written to its NVS by the OTA answer | Connect to this bridge, as itself |
 | The bridge (`.env`) | `BRIDGE_DEVICE_SECRET` — the secret every device token is derived from | Issue a token for any device on the allowlist, and verify any device's |
-| The bridge (`.env`) | The platform's `API_AUTH_TOKEN` (task 2.3) | Call the platform, on the device's behalf |
+| The bridge (`.env`) | `API_AUTH_TOKEN` — the platform's own credential | Call the platform, on the device's behalf |
 | The platform | Nothing about devices at all | — |
 
 **The device's token** is `HMAC-SHA256(BRIDGE_DEVICE_SECRET, "device:" + its
@@ -96,6 +98,16 @@ one with:
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 ```
+
+**`API_AUTH_TOKEN` is the platform's credential, and it is required too.** It is
+the other half of the same boundary: a gadget authenticates to *this* service, and
+this service authenticates to the platform. Copy it from `adaptive-interview-api`'s
+`.env` and never onto hardware. It is carried unchanged — the platform compares it
+byte for byte, so there is deliberately no length rule here and no trim, since a
+tidied token is one that no longer authenticates. It becomes a request in exactly
+one place (`src/platform.ts`), and no code path that answers a device reads it; the
+OTA answer and the hello reply are both asserted not to carry it. The bridge holds
+it from task 2.3 and first *uses* it in 3.1, when it reads the persona catalog.
 
 **`BRIDGE_ALLOWED_DEVICES` names the devices**, by Device-Id (the board's MAC).
 Separators and case do not distinguish devices, so `b8:1f:3f:4a:9b:01`,
@@ -129,8 +141,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id. |
-| Does not work yet | The platform credential is not held yet (2.3), and the boundary is not fully documented for an operator (2.4). The persona is not injected (3.x). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, and the platform credential held on this side of the boundary. |
+| Does not work yet | The platform credential is held but not yet *used* — the persona catalog that first calls the platform is 3.1 — and the boundary is not yet written up for an operator (2.4). The persona is not injected (3.x). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -139,6 +151,7 @@ src/
   index.ts            starts both servers, prints the banner
   config.ts           everything read from the environment, read once
   credentials.ts      who may connect, and with what token
+  platform.ts         the platform's credential, turned into a request in one place
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -148,8 +161,9 @@ src/
     ota.ts            the OTA endpoint — issues the token, or refuses
     ws.ts             the device socket, the refusal, and the session
 test/
-  config.test.ts      the fail-closed rules: empty allowlist, no default secret
+  config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
+  platform.test.ts    the platform header's shape, and that the two credentials never cross
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket
