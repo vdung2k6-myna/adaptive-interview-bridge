@@ -4,20 +4,31 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import type { BridgeConfig } from "../src/config.js";
+import { deriveToken } from "../src/credentials.js";
 import { createWsServer } from "../src/server/ws.js";
 
 /**
- * The handshake is the whole of task 2.1's acceptance on the server side: a
- * device connects, says hello, and gets an answer it accepts. The firmware's
- * acceptance is unforgiving in one specific way — `transport` missing from the
- * reply means the connect fails ten seconds later with nothing logged here — so
- * these tests assert the reply's fields individually rather than its shape.
+ * The handshake is task 2.1's acceptance on the server side; the refusal above
+ * it is 2.2's. The firmware distinguishes the two cleanly — anything that is not
+ * a 101 upgrade leaves it reporting "server not connected" — so a refused
+ * connection is asserted at the HTTP status, and an accepted one by the hello
+ * the device actually waits for.
+ *
+ * The firmware's acceptance is unforgiving in one specific way: `transport`
+ * missing from the reply means the connect fails ten seconds later with nothing
+ * logged here, so these tests assert the reply's fields individually rather than
+ * its shape.
  */
+const BOARD = "b8:1f:3f:4a:9b:01";
+const SECOND = "b8:1f:3f:4a:9b:02";
+const SECRET = "s".repeat(43);
+
 const config: BridgeConfig = {
   otaPort: 0,
   wsPort: 0,
   publicHost: "127.0.0.1",
-  token: "test-token",
+  deviceSecret: SECRET,
+  allowedDevices: ["b81f3f4a9b01", "b81f3f4a9b02"],
   framing: 3,
   serverRate: 24000,
   frameMs: 60,
@@ -32,15 +43,41 @@ const deviceHello = {
   features: { mcp: false },
 };
 
-async function connectedDevice() {
+async function startedServer() {
   const wss = createWsServer(config);
   if (!wss.address()) await once(wss, "listening");
-  const port = (wss.address() as AddressInfo).port;
+  return {
+    wss,
+    port: (wss.address() as AddressInfo).port,
+    stop() {
+      wss.clients.forEach((client) => client.terminate());
+      wss.close();
+    },
+  };
+}
 
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/xiaozhi/v1/`, {
-    headers: { authorization: `Bearer ${config.token}`, "device-id": "aa:bb:cc:dd:ee:ff" },
+/** Connect and report the outcome the firmware would see: a status code. */
+async function attempt(port: number, headers: Record<string, string>) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/xiaozhi/v1/`, { headers });
+  const status = await new Promise<number>((resolve, reject) => {
+    ws.on("open", () => resolve(101));
+    // With a listener here, ws reports a refused upgrade as this rather than as
+    // an error, which is what lets the status be read.
+    ws.on("unexpected-response", (_req, res) => resolve(res.statusCode ?? 0));
+    ws.on("error", reject);
+    setTimeout(() => reject(new Error("no upgrade outcome within 5 s")), 5_000).unref();
   });
-  await once(ws, "open");
+  return { ws, status };
+}
+
+async function connectedDevice() {
+  const { port, stop } = await startedServer();
+  const { ws, status } = await attempt(port, {
+    authorization: `Bearer ${deriveToken(SECRET, BOARD)}`,
+    "device-id": BOARD,
+    "client-id": "test",
+  });
+  assert.equal(status, 101, "the provisioned device is accepted");
 
   return {
     ws,
@@ -48,10 +85,89 @@ async function connectedDevice() {
     next: () => new Promise<string>((resolve) => ws.once("message", (d) => resolve(d.toString()))),
     stop() {
       ws.terminate();
-      wss.close();
+      stop();
     },
   };
 }
+
+describe("the device credential", () => {
+  it("refuses a device that presents no credential", async () => {
+    const { port, stop } = await startedServer();
+    try {
+      const { ws, status } = await attempt(port, { "device-id": BOARD });
+      assert.equal(status, 401, "no Authorization header is a refusal, not a default device");
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+
+  it("refuses a device that declares no identifier", async () => {
+    const { port, stop } = await startedServer();
+    try {
+      const { ws, status } = await attempt(port, { authorization: `Bearer ${deriveToken(SECRET, BOARD)}` });
+      assert.equal(status, 401);
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+
+  it("refuses a device the allowlist does not name", async () => {
+    const { port, stop } = await startedServer();
+    try {
+      const stranger = "aa:bb:cc:dd:ee:ff";
+      const { ws, status } = await attempt(port, {
+        authorization: `Bearer ${deriveToken(SECRET, stranger)}`,
+        "device-id": stranger,
+      });
+      assert.equal(status, 401);
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+
+  it("refuses the skeleton's shared token, which this bridge did not issue", async () => {
+    // The device in the field holds this in NVS from before the allowlist
+    // existed. It must stop working, and stop working visibly.
+    const { port, stop } = await startedServer();
+    try {
+      const { ws, status } = await attempt(port, { authorization: "Bearer spike", "device-id": BOARD });
+      assert.equal(status, 401);
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+
+  it("refuses one allowed device's token presented by another", async () => {
+    const { port, stop } = await startedServer();
+    try {
+      const { ws, status } = await attempt(port, {
+        authorization: `Bearer ${deriveToken(SECRET, SECOND)}`,
+        "device-id": BOARD,
+      });
+      assert.equal(status, 401, "a token is a statement about one device, not a shared secret");
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+
+  it("sends any path, since the firmware appends its own", async () => {
+    const { port, stop } = await startedServer();
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/xiaozhi/v1/anything`, {
+        headers: { authorization: `Bearer ${deriveToken(SECRET, BOARD)}`, "device-id": BOARD },
+      });
+      assert.equal(await once(ws, "open").then(() => 101), 101);
+      ws.terminate();
+    } finally {
+      stop();
+    }
+  });
+});
 
 describe("the device handshake", () => {
   it("answers a client hello with what the firmware waits for", async () => {

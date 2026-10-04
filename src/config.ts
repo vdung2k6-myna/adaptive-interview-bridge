@@ -1,3 +1,4 @@
+import { normalizeDeviceId } from "./credentials.js";
 import { localIp } from "./net/local-ip.js";
 import type { FramingVersion } from "./protocol/framing.js";
 
@@ -19,8 +20,14 @@ export interface BridgeConfig {
   wsPort: number;
   /** The address named in the OTA response — one the device can route to. */
   publicHost: string;
-  /** The token the device presents, and learns from the OTA response. */
-  token: string;
+  /**
+   * The secret every device token is derived from (`credentials.ts`). It is the
+   * one secret in this service that must never be on a device, and the whole of
+   * what an attacker would need to connect as any device on the allowlist.
+   */
+  deviceSecret: string;
+  /** The devices this bridge will issue a token to, normalized for comparison. */
+  allowedDevices: string[];
   /** The binary framing version both directions use. */
   framing: FramingVersion;
   /** The sample rate the server declares it will send, in Hz. */
@@ -50,14 +57,44 @@ function readFraming(env: NodeJS.ProcessEnv): FramingVersion {
   return Number(raw) as FramingVersion;
 }
 
+/**
+ * The secret is the only value with no default. A default here would be a
+ * constant every deployment shares, which is exactly what the skeleton shipped
+ * and what D6 records a finished bridge must not do — so a bridge without one
+ * refuses to start, and says how to make one.
+ */
+function readDeviceSecret(env: NodeJS.ProcessEnv): string {
+  const secret = env.BRIDGE_DEVICE_SECRET?.trim() ?? "";
+  if (secret.length < 32) {
+    throw new Error(
+      `BRIDGE_DEVICE_SECRET must be set, at least 32 characters, and never reused between deployments. ` +
+        `Generate one with: node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`
+    );
+  }
+  return secret;
+}
+
+/**
+ * The allowlist. Empty is empty: a device is allowed because it is named, and a
+ * bridge with nothing named lets nothing connect. Separators and case do not
+ * distinguish devices — see `normalizeDeviceId`.
+ */
+function readAllowedDevices(env: NodeJS.ProcessEnv): string[] {
+  const raw = env.BRIDGE_ALLOWED_DEVICES ?? "";
+  const devices = raw
+    .split(/[\s,;]+/)
+    .map((entry) => normalizeDeviceId(entry))
+    .filter((entry) => entry !== "");
+  return [...new Set(devices)];
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   return {
     otaPort: readInt(env, "OTA_PORT", 8003, PORT_MAX),
     wsPort: readInt(env, "WS_PORT", 8000, PORT_MAX),
     publicHost: localIp(env.BRIDGE_PUBLIC_HOST),
-    // One shared token, the same one the rig used, so a device already pointed at
-    // this machine keeps working while 2.2 is built. See the README's warning.
-    token: env.BRIDGE_TOKEN || "spike",
+    deviceSecret: readDeviceSecret(env),
+    allowedDevices: readAllowedDevices(env),
     framing: readFraming(env),
     // 24000 Hz is the platform's measured TTS output rate and a legal Opus rate;
     // it is also the firmware's own default, so neither side resamples.

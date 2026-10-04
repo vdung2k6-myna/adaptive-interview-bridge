@@ -1,40 +1,58 @@
 import http from "node:http";
 import type { BridgeConfig } from "../config.js";
+import { deriveToken, isAllowedDevice } from "../credentials.js";
 import { info, log, warn } from "../log.js";
 
 /**
- * The OTA endpoint — where a device is told to connect.
+ * The OTA endpoint — where a device is told to connect, and where it is given
+ * the credential it will connect with.
  *
  * This is the only way a device learns the WebSocket address, and it is asked
  * before anything else can work: a bridge that does not answer here is
  * indistinguishable, from the device's side, from one that is not running, and
- * the device reports it as a network failure rather than as our absence. So the
- * endpoint answers even while the rest of the service is a skeleton.
+ * the device reports it as a network failure rather than as our absence.
  *
- * The response also carries the token the device presents on connect. Issuing a
- * token per device is task 2.2; until then this hands out the single configured
- * token, which is exactly what D6 says a finished bridge must not do. It is
- * stated here rather than left to be discovered, and the README repeats it.
+ * It is also the first gate. A device this bridge was not told about gets no
+ * token here, which means it never reaches the socket either — and unlike the
+ * socket, an unauthenticated endpoint that silently hands out credentials would
+ * make the allowlist worth nothing, so a refusal is a refusal here too.
+ *
+ * The token is derived rather than stored (`credentials.ts`), so the answer is
+ * the same on every boot and a restart does not rotate every device's credential.
  */
 export function createOtaServer(config: BridgeConfig): http.Server {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://bridge");
 
     if (url.pathname === "/xiaozhi/ota/" || url.pathname === "/xiaozhi/ota") {
+      const deviceId = req.headers["device-id"];
       log(
-        `OTA ${req.method} ${url.pathname} device=${req.headers["device-id"] ?? "?"} ` +
+        `OTA ${req.method} ${url.pathname} device=${deviceId ?? "?"} ` +
           `client=${req.headers["client-id"] ?? "?"} activation=${req.headers["activation-version"] ?? "?"}`
       );
-      // The device identifies itself on this request; a device that does not is
-      // either not the thing this bridge is for, or a firmware variant that needs
-      // its own handling. Either way it is worth a line now, not a diagnosis later.
-      if (!req.headers["device-id"]) warn("OTA request carried no Device-Id header");
+
+      if (typeof deviceId !== "string" || deviceId.trim() === "") {
+        // The identifier is now load-bearing: it is what the token is derived
+        // from, so a request without one cannot be answered with a credential.
+        warn("OTA refused: no Device-Id header, and a token is issued per device");
+        refuse(res, "Device-Id header is required");
+        return;
+      }
+
+      if (!isAllowedDevice(config, deviceId)) {
+        warn(
+          `OTA refused ${deviceId}: not in BRIDGE_ALLOWED_DEVICES — no token issued, so this device ` +
+            `cannot connect either. Add it to the allowlist to provision it.`
+        );
+        refuse(res, "device not registered with this bridge");
+        return;
+      }
 
       const now = new Date();
       const payload = {
         websocket: {
           url: `ws://${config.publicHost}:${config.wsPort}/xiaozhi/v1/`,
-          token: config.token,
+          token: deriveToken(config.deviceSecret, deviceId),
           version: config.framing,
         },
         server_time: {
@@ -42,7 +60,10 @@ export function createOtaServer(config: BridgeConfig): http.Server {
           timezone_offset: -now.getTimezoneOffset(),
         },
       };
-      info(`-> ${JSON.stringify(payload)}`);
+      // The token is not logged. It is recoverable from the secret and the
+      // identifier, so a log line is one more place a credential lives for no
+      // gain — the identifier is what an operator reads.
+      log(`-> 200 websocket ws://${config.publicHost}:${config.wsPort}/xiaozhi/v1/ (token issued to ${deviceId})`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(payload));
       return;
@@ -55,7 +76,8 @@ export function createOtaServer(config: BridgeConfig): http.Server {
           `ota      http://${config.publicHost}:${config.otaPort}/xiaozhi/ota/\n` +
           `ws       ws://${config.publicHost}:${config.wsPort}/xiaozhi/v1/\n` +
           `framing  v${config.framing}\n` +
-          `downlink ${config.serverRate} Hz / ${config.frameMs} ms\n`
+          `downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
+          `devices  ${config.allowedDevices.length} allowed\n`
       );
       return;
     }
@@ -73,4 +95,16 @@ export function createOtaServer(config: BridgeConfig): http.Server {
     log(`OTA  listening on http://${config.publicHost}:${config.otaPort}/xiaozhi/ota/`)
   );
   return server;
+}
+
+/**
+ * A refusal the device can only read as a failure, which is what it is: the
+ * firmware treats anything but 200 as an unreachable server and retries with a
+ * backoff, and its operator sees a device that will not come up. The body says
+ * what an operator needs and nothing a caller could act on — in particular it
+ * never says whether the identifier was close.
+ */
+function refuse(res: http.ServerResponse, reason: string): void {
+  res.writeHead(403, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: reason }));
 }
