@@ -160,13 +160,47 @@ Kokoro for Vietnamese — which is the platform's own answer for a caller with n
 voice preference of its own. A persona carries no voice field (D3), and the bridge
 does not name one; leaving the field out would *not* express "no preference",
 because the endpoint folds an absent engine to Kokoro before it consults the
-language. See [Status](#status) for what that means for how a gadget sounds.
+language. The bridge sends the value that branch would have produced, and names no
+voice beyond it — which voice that turns out to be is the platform's to resolve,
+and 4.5 is where the deployment's answer is recorded.
 
 The reply is a stream of server-sent events — `user`, `sentence`, `text`, `notice`,
 `error`, `done` — and it is read as one. The endpoint emits each sentence's audio as
 that sentence is finished, so speech begins before the reply is complete (D4); a
 client that waited for the body would have thrown the property away, which is why
 the bridge hands each event to its caller as it arrives.
+
+### The conversation
+
+The endpoint keeps no conversation (D2), so the bridge keeps one, per device, and
+sends it back with every turn. A gadget that was not sent its own history would be a
+gadget with no memory: the person repeats themselves, and the persona meets them as
+a stranger on every turn while the log shows nothing wrong.
+
+It is kept **per device**, not per socket. A device that drops its connection and
+reconnects is the same gadget, and starting it over is a thing the person
+experiences as the device forgetting. Nothing is written to disk, so restarting the
+bridge is a fresh conversation — which is the honest reading of a service that
+holds no database, and is worth knowing before you deploy it.
+
+Both sides of a turn are recorded, and neither is guessed. The person's side is the
+stream's own `user` event, which is the platform's transcription of what they said
+and the only place it exists — on an audio turn, nothing the bridge sent contains
+it. The gadget's side is the reply text, which the bridge already has because it is
+about to speak it.
+
+A turn's history is **bounded** to its most recent `BRIDGE_HISTORY_TURNS` turns
+(default 20), dropping the **oldest** first. Unbounded, it grows for as long as the
+conversation runs and the request is eventually refused — a failure that lands on
+some turn in the middle, with nothing in it to say the history was the cause. The
+default matches the platform's own `VOICE_AGENT_MAX_HISTORY`, so what the bridge
+sends is what the platform would have kept anyway; raising one without the other
+only grows a body that is about to be cut.
+
+Turns are dropped **whole**, so the history never opens on the gadget answering a
+question that is no longer in it. The current turn is not part of what is sent: the
+platform appends it to the history itself, so sending it as well would put the same
+question to the model twice.
 
 ### Adding a device
 
@@ -282,8 +316,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). And the turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. |
-| Does not work yet | Nothing *calls* the turn. There is no device path to it: conversation history is not held (4.2), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. And the conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. |
+| Does not work yet | Nothing *calls* the turn. There is no device path to it: a turn is taken by a function nobody invokes yet, because speech is not synthesized (5.x) and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -295,6 +329,7 @@ src/
   platform.ts         the platform's credential, turned into a request in one place
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   turn.ts             the turn: the platform's voice-agent request, and the reply's stream
+  conversation.ts     a device's conversation: per device, sent as history, bounded
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -309,6 +344,7 @@ test/
   platform.test.ts    the platform header's shape, and that the two credentials never cross
   personas.test.ts    the strict read, the cached copy, the credentialed request, the mapping onto a turn, and the resolution that re-reads on a miss
   turn.test.ts        the request the browser would have sent, and a reply's events consumed as they arrive
+  conversation.test.ts a device's conversation: what a turn carries in, and what it leaves behind
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket

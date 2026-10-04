@@ -56,6 +56,19 @@ export interface BridgeConfig {
   serverRate: number;
   /** The frame length the server declares it will send, in ms. */
   frameMs: number;
+  /**
+   * How many earlier turns of a device's conversation its next turn carries. The
+   * endpoint keeps no conversation of its own (D2), so the bridge holds one per
+   * gadget — and holds no more than this (4.3).
+   *
+   * The platform trims this same history a second time, to its own
+   * `VOICE_AGENT_MAX_HISTORY` exchanges, keeping the most recent. The default here
+   * matches that one, so what the bridge sends is what the platform would have kept
+   * anyway; raising one without the other only grows a request body that is about
+   * to be cut. The platform also appends the current turn to what it is sent, so a
+   * turn's history is one exchange shorter than this on the wire.
+   */
+  historyTurns: number;
 }
 
 const PORT_MAX = 65535;
@@ -261,5 +274,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     // it is also the firmware's own default, so neither side resamples.
     serverRate: readInt(env, "BRIDGE_SERVER_RATE", 24000),
     frameMs: readInt(env, "BRIDGE_FRAME_MS", 60),
+    historyTurns: readInt(env, "BRIDGE_HISTORY_TURNS", 20),
   };
 }

@@ -43,6 +43,7 @@ function configFor(platformUrl: string): BridgeConfig {
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    historyTurns: 20,
   };
 }
 

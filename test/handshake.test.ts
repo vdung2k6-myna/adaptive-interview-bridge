@@ -40,6 +40,7 @@ const config: BridgeConfig = {
   framing: 3,
   serverRate: 24000,
   frameMs: 60,
+  historyTurns: 20,
 };
 
 /** The device's own hello, as the board sends it: 16000 Hz up, 60 ms frames. */
