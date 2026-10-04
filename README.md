@@ -116,12 +116,35 @@ device is allowed because it is named, and a bridge with nothing named refuses
 every device, at the OTA endpoint and at the socket alike. The service says so at
 startup when the list is empty.
 
+**For an operator: where each secret lives.** The device holds one opaque token,
+per device, written into its NVS by the OTA answer — and it is worthless to the
+platform, which has never seen a value like it. The 16 KB NVS image read from the
+board we run holds neither the platform's token nor the secret every device token
+is derived from, and none of the 59 printable strings in it is accepted by the
+platform API. The bridge holds **both** secrets: `BRIDGE_DEVICE_SECRET`, which
+mints and verifies every device token, and `API_AUTH_TOKEN`, the platform's own
+shared credential, which is turned into a request in one place and read by no code
+path that answers a device. The platform holds nothing about devices at all — no
+device table, no per-device token, no allowlist — and sees the bridge as a single
+API client.
+
+**The bridge is internet-facing, and must not be run without its credential
+flow.** A device reaches the OTA endpoint and the socket over whatever network it
+is on, so the bridge needs a route from the device and a route to the platform;
+treat it as a public service, not a laptop convenience. Its own authentication is
+what stands between the internet and a process that holds the platform's shared
+credential, which is why both secrets are required with no default — there is
+deliberately no "run it without auth" path — and why an empty
+`BRIDGE_ALLOWED_DEVICES` answers nobody. What this does not do is fix the
+platform's shared-token model: `API_AUTH_TOKEN` is still one secret for every
+resource, and the bridge's job is to keep it off hardware, not to make it
+per-device.
+
 **What this does not protect against, stated plainly.** The Device-Id is a header
 the client sets, so the allowlist keeps out a device this bridge was not told
 about — it does not keep out someone who already knows the identifier of a device
-it was. Rotating `BRIDGE_DEVICE_SECRET` re-provisions every device at its next
-boot, and is the lever for a device believed compromised; 2.3 and 2.4 continue
-this boundary onto the platform side.
+it was. Rotating `BRIDGE_DEVICE_SECRET` is the lever for a device believed
+compromised: it re-provisions every device at its next boot.
 
 ## Dependencies
 
@@ -141,8 +164,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, and the platform credential held on this side of the boundary. |
-| Does not work yet | The platform credential is held but not yet *used* — the persona catalog that first calls the platform is 3.1 — and the boundary is not yet written up for an operator (2.4). The persona is not injected (3.x). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary, and the boundary written up for an operator. |
+| Does not work yet | The platform credential is held but not yet *used* — the persona catalog that first calls the platform is 3.1. The persona is not injected (3.x). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
