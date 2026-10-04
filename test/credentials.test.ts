@@ -24,6 +24,7 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     publicHost: "127.0.0.1",
     deviceSecret: secret,
     allowedDevices,
+    platformUrl: "http://127.0.0.1:4000",
     apiAuthToken: PLATFORM,
     framing: 3,
     serverRate: 24000,

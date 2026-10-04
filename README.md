@@ -25,8 +25,9 @@ npm start                 # tsx src/index.ts
 
 `.env` is read by Node itself, so `npm start`, `npm run dev` and a bare
 `node --import tsx src/index.ts` all behave the same. Every value has a default
-except the two credentials — the device secret and the platform's token — which
-have none on purpose; see [Credentials](#credentials).
+except three, which have none on purpose: the two credentials and the platform's
+address — see [Credentials](#credentials) and
+[The platform's address](#the-platforms-address).
 
 `npm start` starts **both** servers and prints the addresses:
 
@@ -71,9 +72,29 @@ one the device can route to. Unset, the bridge picks a LAN address itself and
 logs which one it chose; set it when that pick is wrong (a second adapter, a VPN,
 a machine whose device is on another subnet).
 
+### The platform's address
+
+`BRIDGE_PLATFORM_URL` is where `adaptive-interview-api` is — for example
+`http://127.0.0.1:4000`. It is required and has no default, unlike the ports
+above: those are addresses this machine serves on, and the flashed device expects
+them. This one is a property of one deployment, and the only obvious default is
+localhost, which is right on a developer's machine and silently wrong everywhere
+else — the bridge would come up looking healthy and reach nothing.
+
+The bridge reads `GET /api/personas` from it once at start and caches the result
+(3.1). The read is strict — every entry's five fields are checked, and a payload
+that does not match is an error rather than a best-effort persona — and a read
+that fails is logged without stopping the bridge: the deployment order is
+platform first, then the bridge, and the catalog is re-read before a device is
+declined (3.3). It is the first platform call the bridge makes, and it goes
+through the one place the platform's credential becomes a request
+(`src/platform.ts`).
+
 ## Credentials
 
-Two values, and the boundary between them is the point of the service.
+Two values, and the boundary between them is the point of the service. (The
+platform's address is the third required value, and it is not a secret — see
+[The platform's address](#the-platforms-address).)
 
 | Where | What it holds | What it can do with it |
 | --- | --- | --- |
@@ -164,8 +185,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary, and the boundary written up for an operator. |
-| Does not work yet | The platform credential is held but not yet *used* — the persona catalog that first calls the platform is 3.1. The persona is not injected (3.x). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — as the first thing that uses it — the persona catalog read from the platform at start and cached. |
+| Does not work yet | The catalog is read but unused: no device is bound to a persona and no turn carries one (3.2–3.4). Audio is not turned into a turn (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -175,6 +196,7 @@ src/
   config.ts           everything read from the environment, read once
   credentials.ts      who may connect, and with what token
   platform.ts         the platform's credential, turned into a request in one place
+  personas.ts         the persona catalog: fetched, validated field by field, cached
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -187,6 +209,7 @@ test/
   config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
   platform.test.ts    the platform header's shape, and that the two credentials never cross
+  personas.test.ts    the strict read, the cached copy, and the request that carries the credential
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket

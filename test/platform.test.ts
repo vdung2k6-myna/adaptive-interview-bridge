@@ -27,6 +27,7 @@ function configFor(apiAuthToken: string): BridgeConfig {
     publicHost: "127.0.0.1",
     deviceSecret: SECRET,
     allowedDevices: ["b81f3f4a9b01"],
+    platformUrl: "http://127.0.0.1:4000",
     apiAuthToken,
     framing: 3,
     serverRate: 24000,

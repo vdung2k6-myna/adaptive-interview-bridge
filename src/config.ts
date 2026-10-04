@@ -7,10 +7,11 @@ import type { FramingVersion } from "./protocol/framing.js";
  *
  * Deliberately only what the service uses. A skeleton that accepts configuration
  * for features it does not have is a skeleton whose operator believes those
- * features are on; the platform's URL is added by the task that first needs it
- * (4.1), with the code that consumes it. The platform *credential* is held from
- * 2.3 rather than alongside it, because keeping that secret on the bridge and off
- * the device is what 2.3 is about, not a later task's business.
+ * features are on; the platform's address is added by the task that first calls
+ * it (3.1, the persona catalog), with the code that consumes it, and every later
+ * platform call reuses it. The platform *credential* is held from 2.3 rather than
+ * alongside that address, because keeping that secret on the bridge and off the
+ * device is what 2.3 is about, not a later task's business.
  *
  * A malformed value throws rather than falling back: a bridge quietly listening
  * on a different port than the device was told is a bridge nobody can find.
@@ -30,6 +31,11 @@ export interface BridgeConfig {
   deviceSecret: string;
   /** The devices this bridge will issue a token to, normalized for comparison. */
   allowedDevices: string[];
+  /**
+   * Where the platform is, as a base URL with no trailing slash — the address
+   * every server-to-server call is joined onto. Read from `BRIDGE_PLATFORM_URL`.
+   */
+  platformUrl: string;
   /**
    * The platform's own credential (`API_AUTH_TOKEN`), held so the bridge can
    * call the platform on a device's behalf. It is the other half of the boundary
@@ -122,6 +128,49 @@ function readAllowedDevices(env: NodeJS.ProcessEnv): string[] {
   return [...new Set(devices)];
 }
 
+/**
+ * Where the platform is. Required, and with no default, for a reason the port
+ * defaults do not share: the ports are addresses *this* machine serves on, and
+ * the flashed device expects them, but the platform's address is a property of
+ * one deployment. A default would be localhost, which is right on a developer's
+ * machine and silently wrong everywhere else — the bridge would come up, report
+ * itself healthy, and reach nothing. A bridge that cannot reach the platform can
+ * serve no turn at all, so this fails at start, where the operator is, rather
+ * than at the first turn, where the symptom is far from the cause.
+ *
+ * Unlike the credential, trimming is harmless here: this is a URL this service
+ * parses rather than a byte string the platform compares. Any trailing slashes
+ * are dropped once, here, so joining a path is a plain concatenation and no call
+ * site has to remember which of them is the odd one out.
+ */
+function readPlatformUrl(env: NodeJS.ProcessEnv): string {
+  const raw = env.BRIDGE_PLATFORM_URL ?? "";
+  if (raw.trim() === "") {
+    throw new Error(
+      "BRIDGE_PLATFORM_URL must be set: it is where the bridge reaches adaptive-interview-api, " +
+        'for example BRIDGE_PLATFORM_URL=http://127.0.0.1:4000. There is no default, because a ' +
+        "default would point a deployment at whatever machine happened to be localhost."
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(
+      `BRIDGE_PLATFORM_URL must be an absolute URL like http://host:4000, got ${JSON.stringify(raw)}`
+    );
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`BRIDGE_PLATFORM_URL must be http or https, got ${JSON.stringify(raw)}`);
+  }
+  if (url.search !== "" || url.hash !== "") {
+    throw new Error(
+      `BRIDGE_PLATFORM_URL must be a base URL without a query or fragment, got ${JSON.stringify(raw)}`
+    );
+  }
+  return (url.origin + url.pathname).replace(/\/+$/, "");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   return {
     otaPort: readInt(env, "OTA_PORT", 8003, PORT_MAX),
@@ -129,6 +178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     publicHost: localIp(env.BRIDGE_PUBLIC_HOST),
     deviceSecret: readDeviceSecret(env),
     allowedDevices: readAllowedDevices(env),
+    platformUrl: readPlatformUrl(env),
     apiAuthToken: readApiAuthToken(env),
     framing: readFraming(env),
     // 24000 Hz is the platform's measured TTS output rate and a legal Opus rate;

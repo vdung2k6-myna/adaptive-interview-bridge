@@ -30,6 +30,7 @@ const config: BridgeConfig = {
   publicHost: "127.0.0.1",
   deviceSecret: SECRET,
   allowedDevices: ["b81f3f4a9b01", "b81f3f4a9b02"],
+  platformUrl: "http://127.0.0.1:4000",
   apiAuthToken: PLATFORM,
   framing: 3,
   serverRate: 24000,

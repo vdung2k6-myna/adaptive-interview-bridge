@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.js";
 import { allowedDeviceCount } from "./credentials.js";
-import { log, warn } from "./log.js";
+import { err, log, warn } from "./log.js";
+import { createPersonaCatalog } from "./personas.js";
 import { createOtaServer } from "./server/ota.js";
 import { createWsServer } from "./server/ws.js";
 
@@ -14,8 +15,9 @@ import { createWsServer } from "./server/ws.js";
 
 // Node 22 reads the file itself, so `npm start`, `npm run dev` and a bare
 // `node --import tsx src/index.ts` all behave the same and none of them needs a
-// shell flag. Absent, every value but the device secret has a default, and the
-// secret reports its own absence better than this could.
+// shell flag. Absent, every value has a default except the three that refuse to
+// have one on purpose — the two credentials and the platform's address — and each
+// of those reports its own absence better than this could.
 try {
   process.loadEnvFile();
 } catch {
@@ -54,7 +56,34 @@ warn(
     `It keeps out a device this bridge was not told about; it does not keep out someone who ` +
     `knows the identifier of a device it was.`
 );
+// The catalog, read once at start and cached (3.1). Printed after the banner
+// rather than before it, so a slow platform delays a log line and never the
+// statement that the service is listening.
+//
+// A failure here is logged and not fatal. The platform being briefly unavailable
+// when the bridge boots is an ordering problem, and one the deployment plan
+// already names — platform reachable, then the bridge — rather than a reason to
+// make a bridge restart the only recovery. Nothing is served either way: an
+// empty cache resolves no binding, and 3.3 re-reads before a device is declined.
+// What must not happen is silence, so the failure is said out loud and names
+// where the read was aimed.
+const catalog = createPersonaCatalog(config);
+try {
+  await catalog.refresh();
+  log(`NOTE persona catalog: ${catalog.all().length} personas read from ${config.platformUrl}`);
+} catch (error) {
+  err(
+    `persona catalog could not be read at start from ${config.platformUrl}: ` +
+      `${error instanceof Error ? error.message : String(error)}`
+  );
+  warn(
+    `NOTE no personas are cached, so no device can be bound to one. The catalog is re-read on a ` +
+      `binding the cache does not hold (3.3); until then the platform being unreachable is why.`
+  );
+}
+
 log(
-  `NOTE a device that connects will handshake and then hear nothing: the persona (3.x), the turn ` +
-    `(4.x), the speech (5.x) and the endpointer (6.x) are not implemented yet.`
+  `NOTE a device that connects will handshake and then hear nothing: the catalog is read but no ` +
+    `device is bound to a persona (3.2+), and the turn (4.x), the speech (5.x) and the endpointer ` +
+    `(6.x) are not implemented yet.`
 );

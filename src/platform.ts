@@ -18,8 +18,9 @@ import type { BridgeConfig } from "./config.js";
  * case folding, no normalization. Anything helpful here is a credential that no
  * longer authenticates.
  *
- * The bridge does not yet call the platform: the persona catalog is 3.1 and a
- * turn is 4.1, and both take their requests through this module.
+ * The bridge's first platform call is the persona catalog (3.1), and a turn is
+ * 4.1; both take their requests through this module, which is what keeps the
+ * claim above from being a promise instead of an invariant.
  */
 export function platformAuthHeaders(config: BridgeConfig): Record<string, string> {
   return { Authorization: `Bearer ${config.apiAuthToken}` };
