@@ -8,9 +8,10 @@ to connect, then open a WebSocket and say hello. The platform
 between them — it answers the device's OTA request, holds the device's socket,
 and will translate every spoken turn into the platform's turn API.
 
-This repository is being built task by task, and **today it does not speak yet**:
-the handshake works, each device is bound to a persona, and nothing after that
-does. See [Status](#status).
+This repository is being built task by task, and **today it speaks but does not
+listen**: the handshake works, each device is bound to a persona, and a turn's
+reply reaches the device's own speaker in Opus — but nothing the *person* says yet
+becomes a turn. See [Status](#status).
 
 ## Running it
 
@@ -316,7 +317,7 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence. |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2, 5.4, 5.5): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence — with each sentence announced as `tts sentence_start` ahead of its own frames so the device's display names what is being heard, and a sentence carrying no audio, or a reply with nothing speakable in it at all, completing the turn in silence rather than failing it. |
 | Does not work yet | Nothing the *person* says reaches a turn. A turn can be spoken, but only from text the bridge supplies itself: with `BRIDGE_VERIFY_TEXT` set, a `listen start` takes one turn from that text, which is enough to hear a gadget talk and to measure time-to-first-audio, and is scaffolding rather than a feature. Nothing yet turns speech into a turn — the audio a device streams is counted and discarded (6.1) and the endpointer that decides a turn is over does not exist (6.4) — so a gadget still cannot be *used* by speaking, and a deployment that leaves the verify text unset will handshake and then hear nothing. |
 
 ## Layout
@@ -330,7 +331,7 @@ src/
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   turn.ts             the turn: the platform's voice-agent request, and the reply's stream
   conversation.ts     a device's conversation: per device, sent as history, bounded
-  speech.ts           the device's voice: each sentence as Opus frames, inside the tts bracket
+  speech.ts           the device's voice: each sentence announced for the display, then as Opus frames, inside the tts bracket
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -348,7 +349,7 @@ test/
   personas.test.ts    the strict read, the cached copy, the credentialed request, the mapping onto a turn, and the resolution that re-reads on a miss
   turn.test.ts        the request the browser would have sent, and a reply's events consumed as they arrive
   conversation.test.ts a device's conversation: what a turn carries in, and what it leaves behind
-  speech.test.ts      the bracket around a reply, and what it carries
+  speech.test.ts      the bracket around a reply, what it carries, and what the display is told
   verify-turn.test.ts the whole speech path, against a stub platform and no device
   framing.test.ts     round trips, and short packets
   opus.test.ts        a sentence's frames, checked against a real decoder

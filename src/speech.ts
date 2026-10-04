@@ -92,6 +92,19 @@ export function createSpeaker(socket: SpeakerSocket, config: BridgeConfig): Spea
         speaking = true;
       }
 
+      // What the device's display shows while this sentence is heard (5.4). One
+      // per sentence and ahead of its frames, so the display names what is being
+      // said rather than what has just finished; the firmware turns it into its
+      // own `SetChatMessage("assistant", …)`, and text arriving here is the only
+      // thing that moves that display.
+      //
+      // It sits after the null-audio and transcode checks rather than before them
+      // because it is a claim about audio: a sentence the device will not speak
+      // must not be announced, or the display would show words nobody hears. That
+      // makes 5.5's silent sentences mute on the display too, which is the honest
+      // reading of a sentence with nothing to play.
+      if (!sendJson({ type: "tts", state: "sentence_start", text: sentence.text })) return;
+
       let sentHere = 0;
       for (const packet of frames) {
         if (socket.readyState !== OPEN) {

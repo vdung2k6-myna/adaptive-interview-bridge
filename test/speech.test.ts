@@ -87,6 +87,8 @@ function sentence(index: number, audio: Buffer | null): TurnSentence {
 
 const jsonOf = (sent: Sent) => JSON.parse(sent.data as string) as Record<string, unknown>;
 const framesOf = (sent: Sent[]) => sent.filter((s) => s.binary);
+/** What went out, as a sequence: a frame, or the JSON the device was sent. */
+const spoken = (sent: Sent[]) => sent.map((s) => (s.binary ? "frame" : jsonOf(s)));
 
 describe("the bracket around a reply", () => {
   it("opens before the first frame and closes at the end of the turn", () => {
@@ -94,13 +96,14 @@ describe("the bracket around a reply", () => {
     const speaker = createSpeaker(socket, config);
 
     speaker.speak(sentence(0, wav(1)));
-    assert.deepEqual(jsonOf(socket.sent[0]!), { type: "tts", state: "start" });
-    assert.equal(framesOf(socket.sent).length, 1, "the frame follows the start");
-    assert.equal(
-      socket.sent.filter((s) => !s.binary).length,
-      1,
-      "nothing but the start has been said so far — the stop belongs to the turn's end"
-    );
+    // The start, the sentence's own announcement, and its frame — in that order:
+    // the device discards frames outside `speaking`, and its display must name a
+    // sentence before that sentence is heard (5.4).
+    assert.deepEqual(spoken(socket.sent), [
+      { type: "tts", state: "start" },
+      { type: "tts", state: "sentence_start", text: "sentence 0" },
+      "frame",
+    ]);
 
     speaker.finish();
     assert.deepEqual(jsonOf(socket.sent.at(-1)!), { type: "tts", state: "stop" });
@@ -117,6 +120,8 @@ describe("the bracket around a reply", () => {
     const control = socket.sent.filter((s) => !s.binary).map(jsonOf);
     assert.deepEqual(control, [
       { type: "tts", state: "start" },
+      { type: "tts", state: "sentence_start", text: "sentence 0" },
+      { type: "tts", state: "sentence_start", text: "sentence 1" },
       { type: "tts", state: "stop" },
     ]);
   });
@@ -159,7 +164,11 @@ describe("the bracket around a reply", () => {
     speaker.finish();
     speaker.finish();
 
-    assert.equal(socket.sent.filter((s) => !s.binary).length, 2, "one start and one stop");
+    assert.equal(
+      socket.sent.filter((s) => !s.binary).length,
+      3,
+      "one start, one announcement and one stop"
+    );
   });
 
   it("does not speak to a device that has already gone", () => {
@@ -172,7 +181,10 @@ describe("the bracket around a reply", () => {
 
     assert.deepEqual(
       socket.sent.filter((s) => !s.binary).map(jsonOf),
-      [{ type: "tts", state: "start" }],
+      [
+        { type: "tts", state: "start" },
+        { type: "tts", state: "sentence_start", text: "sentence 0" },
+      ],
       "the stop is not sent into a closed socket, and the drop is logged where it happened"
     );
   });
@@ -218,6 +230,54 @@ describe("what the bracket carries", () => {
     speaker.finish();
 
     assert.equal(framesOf(socket.sent).length, 1, "the speakable sentence was still spoken");
-    assert.equal(socket.sent.filter((s) => !s.binary).length, 2, "and it was still bracketed");
+    assert.equal(socket.sent.filter((s) => !s.binary).length, 3, "and it was still bracketed");
+  });
+});
+
+describe("what the device is told to display (5.4)", () => {
+  it("announces each spoken sentence, in order, with its own text", () => {
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config);
+
+    speaker.speak(sentence(0, wav(1)));
+    speaker.speak(sentence(1, wav(1)));
+    speaker.finish();
+
+    // The announcement sits between the bracket's start and its own sentence's
+    // frames: the firmware shows what is being said, not what has just finished,
+    // and text arriving here is the only thing that moves that display.
+    assert.deepEqual(spoken(socket.sent), [
+      { type: "tts", state: "start" },
+      { type: "tts", state: "sentence_start", text: "sentence 0" },
+      "frame",
+      { type: "tts", state: "sentence_start", text: "sentence 1" },
+      "frame",
+      { type: "tts", state: "stop" },
+    ]);
+  });
+
+  it("announces nothing for a sentence the device will not speak (5.5)", () => {
+    // The announcement is a claim about audio, so it is made only where audio
+    // goes out. A display naming a sentence nobody hears is worse than a display
+    // that says nothing: it would leave words on the screen for a sentence the
+    // reply never spoke, and stay there through the silence.
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config);
+
+    speaker.speak(sentence(0, wav(1)));
+    speaker.speak(sentence(1, null));
+    speaker.speak(sentence(2, wav(1)));
+    speaker.finish();
+
+    assert.deepEqual(
+      socket.sent.filter((s) => !s.binary).map(jsonOf),
+      [
+        { type: "tts", state: "start" },
+        { type: "tts", state: "sentence_start", text: "sentence 0" },
+        { type: "tts", state: "sentence_start", text: "sentence 2" },
+        { type: "tts", state: "stop" },
+      ],
+      "sentence 1 is absent from the display as well as from the audio"
+    );
   });
 });

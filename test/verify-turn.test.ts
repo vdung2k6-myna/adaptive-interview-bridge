@@ -73,7 +73,24 @@ interface Stub {
   close(): Promise<void>;
 }
 
-async function stubPlatform(): Promise<Stub> {
+/** One `sentence` event as the endpoint sends it: base64 WAV, or null for none. */
+interface StubSentence {
+  index: number;
+  text: string;
+  audioData: string | null;
+}
+
+/**
+ * The default reply: one sentence with audio, and one the synthesiser produced
+ * nothing for — 5.5's shape arriving in the middle of a reply that is otherwise
+ * spoken, which is where it actually occurs.
+ */
+const DEFAULT_SENTENCES: StubSentence[] = [
+  { index: 0, text: "Hello.", audioData: sentenceWav(SAMPLES_PER_FRAME * 2) },
+  { index: 1, text: "Second.", audioData: null },
+];
+
+async function stubPlatform(sentences: StubSentence[] = DEFAULT_SENTENCES): Promise<Stub> {
   const turns: Stub["turns"] = [];
   const server: Server = createServer((req, res) => {
     if (req.url === "/api/personas") {
@@ -98,13 +115,14 @@ async function stubPlatform(): Promise<Stub> {
       req.on("end", () => {
         turns.push({ headers: req.headers, body: Buffer.concat(chunks).toString("utf8") });
         res.writeHead(200, { "content-type": "text/event-stream" });
-        // A person's side, the reply text, one sentence with audio and one the
-        // synthesiser produced nothing for (5.5), then the turn's own end.
+        // A person's side, the reply text, the sentences themselves, then the
+        // turn's own end. The transcript exists only in these events — the
+        // platform keeps no conversation (4.2) — so the stub has to send them.
+        const replyText = sentences.map((s) => s.text).join(" ");
         res.write(block("user", { text: "a person said this" }));
-        res.write(block("text", { text: "Hello. " }));
-        res.write(block("sentence", { index: 0, text: "Hello.", audioData: sentenceWav(SAMPLES_PER_FRAME * 2) }));
-        res.write(block("sentence", { index: 1, text: "Second.", audioData: null }));
-        res.write(block("done", { fullText: "Hello. Second." }));
+        res.write(block("text", { text: replyText }));
+        for (const sentence of sentences) res.write(block("sentence", sentence));
+        res.write(block("done", { fullText: replyText }));
         res.end();
       });
       return;
@@ -171,9 +189,25 @@ function untilStop(ws: WebSocket, ms = 5_000): Promise<Reply> {
   });
 }
 
+/**
+ * Wait for something the socket cannot report.
+ *
+ * A turn with nothing speakable in it sends the device nothing at all, so the
+ * only evidence that it finished is on the bridge's own side. Waiting on a
+ * condition rather than sleeping makes a turn that never starts fail as itself,
+ * with a sentence a reader can act on, instead of as a timeout somewhere else.
+ */
+async function until(what: string, ok: () => boolean, ms = 2_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 /** A connected, handshaken device, and a stub platform behind it. */
-async function rig() {
-  const platform = await stubPlatform();
+async function rig(sentences?: StubSentence[]) {
+  const platform = await stubPlatform(sentences);
   const config = configFor(platform.url);
   const catalog = createPersonaCatalog(config);
   await catalog.refresh();
@@ -229,9 +263,13 @@ describe("a listen start becomes a spoken reply", () => {
         control.filter((m) => m.type === "tts"),
         [
           { type: "tts", state: "start" },
+          // Only the sentence that carried audio is announced (5.4). The second
+          // sentence of this reply has none, and its absence here is the point:
+          // the display must not name words the device is not about to say.
+          { type: "tts", state: "sentence_start", text: "Hello." },
           { type: "tts", state: "stop" },
         ],
-        "one bracket for the turn, opened before the audio and closed after it"
+        "one bracket for the turn, opened before the audio and closed after it, announcing each spoken sentence"
       );
       assert.ok(frames.length > 0, "the sentence carrying audio was spoken");
       assert.equal(platform.turns.length, 1, "exactly one turn was sent");
@@ -345,6 +383,43 @@ describe("a listen start becomes a spoken reply", () => {
       wss.clients.forEach((c) => c.terminate());
       wss.close();
       await platform.close();
+    }
+  });
+
+  it("completes a reply with nothing speakable in it and takes a further turn (5.5)", async () => {
+    // A reply of only a code block. The platform's `stripMarkdown` keeps a code
+    // block's content, so this is not "empty" — but it holds no letter, which is
+    // what makes it unspeakable, and the synthesiser then produces nothing. The
+    // sentence arrives with `audioData: null` all the same.
+    const { ws, platform, conversations, stop } = await rig([
+      { index: 0, text: "```\n1234 +-\n```", audioData: null },
+    ]);
+    try {
+      const heard: string[] = [];
+      ws.on("message", (d) => heard.push(d.toString()));
+
+      ws.send(JSON.stringify({ type: "listen", state: "start", mode: "auto" }));
+      // The socket is told nothing, so the turn's completion has to be read off
+      // the bridge: a turn whose reply reached the conversation has been served.
+      await until("the silent turn to be served", () => conversations.history("b81f3f4a9b01").length > 0);
+
+      // Nothing was said and nothing was even bracketed: a `tts start` around no
+      // audio would leave the device in `speaking`, where the firmware discards
+      // whatever the person says next, and a `tts stop` would close a bracket
+      // that was never opened.
+      assert.deepEqual(heard, [], "a reply with nothing speakable sent the device no tts at all");
+      assert.equal(platform.turns.length, 1, "the turn itself still happened and was recorded");
+
+      // The half of 5.5 that a silent turn could quietly break: the turn is over,
+      // so the socket is still a session. A `listen start` arriving now must be
+      // served rather than dropped as talking over a reply that is not playing —
+      // "completing the turn" without this is a device that answers once and
+      // then never again.
+      ws.send(JSON.stringify({ type: "listen", state: "start", mode: "auto" }));
+      await until("a second turn on the same socket", () => platform.turns.length === 2);
+      assert.deepEqual(heard, [], "and the second turn had nothing to say either");
+    } finally {
+      await stop();
     }
   });
 });
