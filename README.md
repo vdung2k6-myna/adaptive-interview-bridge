@@ -118,11 +118,38 @@ fields, renamed in `src/personas.ts` and nowhere else:
 | `enabledTopics` | `knowledgeTopics` |
 | `answerMode` | `answerMode` |
 
-Those three are the whole of what the bridge takes from a persona: the rest of a
-turn comes from the device and the conversation, and the bridge holds no prompt,
-topic list or mode of its own. `label` and `emoji` are deliberately not carried —
-the bridge renders nothing (D8), and a label exists to be drawn on a screen this
-service does not paint.
+Those three are the whole of what the bridge takes from a persona, and the split
+is worth stating plainly, because "which fields come from where" is the question
+a new binding raises:
+
+| A turn's field | Comes from | Named in |
+| --- | --- | --- |
+| `systemPrompt`, `enabledTopics`, `answerMode` | the persona | the platform's catalog, selected by `BRIDGE_DEVICE_PERSONAS` |
+| the device's identity (`Device-Id`) | the device | `BRIDGE_ALLOWED_DEVICES`, and the binding above |
+| `audio`, and the `language` the turn declares | the device, per turn | the device itself — 4.x |
+| `history` | the conversation so far | the bridge, per device — 4.x |
+
+A device contributes its identity and never its character: it selects which
+persona answers, and nothing about what that persona says. The bridge holds no
+prompt, topic list or mode of its own. `label` and `emoji` are deliberately not
+carried — the bridge renders nothing (D8), and a label exists to be drawn on a
+screen this service does not paint.
+
+### Adding a device
+
+Two lines in `.env`, and no code:
+
+1. **`BRIDGE_ALLOWED_DEVICES`** — add the device's Device-Id, which is the board's
+   MAC in any spelling (`b8:1f:3f:4a:9b:01`, `B8-1F-3F-4A-9B-01` and
+   `b81f3f4a9b01` are one entry).
+2. **`BRIDGE_DEVICE_PERSONAS`** — add `DEVICE=PERSONA`, the same identifier and a
+   persona id the catalog reports. Read the ids from `GET /api/personas`, or the
+   list the bridge prints at start.
+
+The bridge refuses to start if the two lists do not name the same devices, so a
+half-finished pair is reported at start where you are, rather than at the device's
+first turn. Then restart it: the device is provisioned the next time it asks the
+OTA endpoint, needs no reflash, and can be revoked by removing either line.
 
 ## Credentials
 
@@ -222,8 +249,8 @@ against, and its task numbers are used below.
 
 | | |
 | --- | --- |
-| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the two things that use it — the persona catalog read from the platform at start and cached, and the binding that maps each device onto one persona's prompt, topics and answer mode. |
-| Does not work yet | Nothing consumes a binding yet: no turn carries the three fields (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
+| Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). |
+| Does not work yet | Nothing *calls* the resolution yet: no turn carries the three fields (4.x), speech is not synthesized (5.x), and the endpointer does not exist — an accepted device will handshake and then hear nothing (6.x). |
 
 ## Layout
 
@@ -233,7 +260,7 @@ src/
   config.ts           everything read from the environment, read once
   credentials.ts      who may connect, and with what token
   platform.ts         the platform's credential, turned into a request in one place
-  personas.ts         the persona catalog: fetched, validated, cached, and mapped onto a turn's three fields
+  personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
@@ -246,7 +273,7 @@ test/
   config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default, unbound devices
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
   platform.test.ts    the platform header's shape, and that the two credentials never cross
-  personas.test.ts    the strict read, the cached copy, the credentialed request, and the mapping onto a turn
+  personas.test.ts    the strict read, the cached copy, the credentialed request, the mapping onto a turn, and the resolution that re-reads on a miss
   framing.test.ts     round trips, and short packets
   ota.test.ts         the answer's fields, and who gets one
   handshake.test.ts   the refusal and the hello exchange, over a real socket
