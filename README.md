@@ -163,13 +163,51 @@ does not name one; leaving the field out would *not* express "no preference",
 because the endpoint folds an absent engine to Kokoro before it consults the
 language. The bridge sends the value that branch would have produced, and names no
 voice beyond it — which voice that turns out to be is the platform's to resolve,
-and 4.5 is where the deployment's answer is recorded.
+and "What a gadget sounds like" below is where the deployment's answer is recorded.
 
 The reply is a stream of server-sent events — `user`, `sentence`, `text`, `notice`,
 `error`, `done` — and it is read as one. The endpoint emits each sentence's audio as
 that sentence is finished, so speech begins before the reply is complete (D4); a
 client that waited for the body would have thrown the property away, which is why
 the bridge hands each event to its caller as it arrives.
+
+### What a gadget sounds like
+
+A persona decides *what* is said, never *who* says it. It carries no voice field
+(D3), and the platform resolves one from the engine and the language alone —
+`resolveVoice(engine, language)` in `adaptive-interview-api`'s
+`src/lib/audio/text-processing.ts`, which reads a configured name and falls back
+to `DEFAULT_VOICE` only when that name is empty. The bridge supplies the engine and
+nothing else, through `engineForLanguage`.
+
+So the voice is the **platform's** configuration, not this service's, and this
+deployment resolves to:
+
+| The gadget speaks | Engine | Voice | Set by |
+| --- | --- | --- | --- |
+| English | Piper | `bryce` | `PIPER_VOICE_ENGLISH` |
+| Vietnamese | Kokoro | `diem_trinh` | `KOKORO_VOICE_VIETNAMESE` |
+
+Read from `adaptive-interview-api`'s `.env` on 2026-10-06; the defaults in
+`src/lib/config/` are different values, so a deployment that sets none of these
+sounds like neither of the rows above. To change what a gadget sounds like, change
+that file — the bridge has no voice setting and does not want one, because a voice
+it could name would be a second place for the same decision to live.
+
+**Two gadgets in one language sound identical.** The binding distinguishes who
+answers and in what character; it does not distinguish voices, and nothing in
+either service can make it. Two personas in one language are one voice reading two
+different prompts. That is the platform's shape rather than a choice made here, and
+it is the gap `design.md` raises as an open question rather than a defect: whether
+a persona should carry a voice, or a device be allowed to choose an engine, is a
+platform decision this change does not make.
+
+One hazard worth knowing, because it fails quietly rather than loudly. An empty
+voice name does not error — `resolveVoice` returns `DEFAULT_VOICE` instead — and
+this deployment does not set `DEFAULT_VOICE`, so it falls to the code default
+`F1`. That is a *Supertonic* voice name, reached from a Kokoro or Piper turn.
+Clearing `KOKORO_VOICE_VIETNAMESE` does not silence the gadget or name it as
+misconfigured; it hands the wrong engine a voice from a different catalogue.
 
 ### The conversation
 
@@ -319,7 +357,7 @@ against, and its task numbers are used below.
 | --- | --- |
 | Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2, 5.4, 5.5): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence — with each sentence announced as `tts sentence_start` ahead of its own frames so the device's display names what is being heard, and a sentence carrying no audio, or a reply with nothing speakable in it at all, completing the turn in silence rather than failing it. |
 | Speech from the device (6.1–6.7) | The device streams Opus; the bridge decodes it at the device's own 16000 Hz, decides for itself when the person has stopped speaking, and uploads the utterance rather than the window it was spoken into. The endpointer counts speech over a sliding window, closes a turn on silence after speech, holds it open across a pause inside a sentence, gives up on a window nobody spoke into, and refuses at start a configuration in which a turn could never close. The frames it judged are the frames it uploads — one structure, one verdict per frame, no second decode — trimmed back from the last voiced frame so 38.4 s of window carrying 1.32 s of speech does not go to the transcriber as 38.4 s (D11). The transcription comes back to the device as `stt` before the reply does. A wake word mid-reply cancels the turn at its source, so the display stops naming sentences nobody is hearing, and the turn ends rather than failing — recorded, so the question the person was cut off asking survives into the next turn's history. And after a turn the microphone is distrusted for as long as this reply's own audio is still playing, plus a guard. |
-| Does not work yet | The platform's `notice` and `error` events are surfaced to the device and to the log but the recovery around them has not been exercised against a live platform (4.4). What a newly bound gadget will *sound* like is not written down anywhere yet, since a persona carries no voice field (4.5). The device protocol deltas are written down (`docs/device-protocol.md`), but from the firmware source rather than from a running device: the reading is done and the confirmation is not (1.5). Every claim about a real board — the build, the PSRAM, the vendor baseline, the device pointed at this server, time to first audio, and barge-in on AEC hardware — is unverified: no board has been attached. Section 6's behaviour is asserted against a real socket, real Opus and a stub platform, but never against a gadget whose microphone is live. |
+| Does not work yet | The platform's `notice` and `error` events are surfaced to the device and to the log, but the recovery around them has been exercised against a stub platform rather than the live one (4.4). The device protocol deltas are written down (`docs/device-protocol.md`), but from the firmware source rather than from a running device: the reading is done and the confirmation is not (1.5). Every claim about a real board — the build, the PSRAM, the vendor baseline, the device pointed at this server, time to first audio, and barge-in on AEC hardware — is unverified: no board has been attached. Section 6's behaviour is asserted against a real socket, real Opus and a stub platform, but never against a gadget whose microphone is live. |
 
 ## Layout
 
