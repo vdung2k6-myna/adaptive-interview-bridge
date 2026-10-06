@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { deriveToken } from "../src/credentials.js";
 import { platformAuthHeaders } from "../src/platform.js";
 
@@ -33,6 +33,7 @@ function configFor(apiAuthToken: string): BridgeConfig {
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
     language: "english",
   };

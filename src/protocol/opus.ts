@@ -1,5 +1,5 @@
 import OpusScript from "opusscript";
-import { parseWavAudio } from "./wav.js";
+import { buildWav, parseWavAudio } from "./wav.js";
 
 /**
  * The platform's speech, re-encoded as the device's.
@@ -24,6 +24,13 @@ import { parseWavAudio } from "./wav.js";
  * every run, which is the declared rate, so in practice neither the resample nor
  * the downmix does anything. They are here because the alternative to handling a
  * mismatch is a gadget that plays a whole conversation at the wrong pitch.
+ *
+ * It decodes too, since the bridge carries speech in both directions: the device's
+ * packets are the person's own voice (6.1), and this is where they are read back.
+ * The two directions are asymmetric in a way worth keeping in view — the encoder is
+ * built per sentence and thrown away, and the decoder is built per listening window
+ * and thrown away, because Opus carries state and a stateful decoder is a decoder
+ * whose answer depends on what it was handed before (D14).
  */
 
 /** The sample rates Opus accepts, which are therefore the only rates a
@@ -98,6 +105,86 @@ export function transcodeSentence(wav: Buffer, framing: OpusFraming): Buffer[] {
   }
 
   return encodeOpusFrames(samplesToBuffer(samples), 1, framing);
+}
+
+/**
+ * The other direction: the device's Opus, decoded back to samples (6.1).
+ *
+ * One decoder per listening window, not one per process. Opus is stateful across
+ * packets, and a decoder that has already run ahead of the window it is handed
+ * decodes the same bytes into a different signal — so the rig's module-level
+ * singleton is a defect rather than an optimisation, and two devices sharing one
+ * would decode each other's audio (D14). `close()` releases it with the window.
+ *
+ * The rate is the **device's** — `BRIDGE_DEVICE_RATE`, 16000 Hz — and not the
+ * 24000 the hello declares for the downlink. A decoder built at the wrong rate
+ * does not produce a wrong pitch; it produces a frame it cannot decode at all,
+ * because the sample count is part of what the packet is read as.
+ */
+export interface OpusDecoder {
+  /** One packet's samples, or null if the packet could not be decoded. */
+  decode(packet: Buffer): Int16Array | null;
+  /** Release the decoder's WASM memory. Idempotent. */
+  close(): void;
+}
+
+export function createOpusDecoder(sampleRate: number): OpusDecoder {
+  const decoder = new OpusScript(asOpusRate(sampleRate), 1, OpusScript.Application.AUDIO);
+  let open = true;
+
+  return {
+    decode(packet: Buffer): Int16Array | null {
+      if (!open || packet.length === 0) return null;
+      try {
+        return toSamples(decoder.decode(packet));
+      } catch {
+        // A packet the decoder refuses is one frame of a window, not a failed turn:
+        // the frames either side of it are still the person's voice, and the caller
+        // records the null and carries on.
+        return null;
+      }
+    },
+
+    close(): void {
+      if (!open) return;
+      open = false;
+      decoder.delete();
+    },
+  };
+}
+
+/**
+ * The utterance the endpointer captured, as the file the platform is handed (6.1).
+ *
+ * The samples are already decoded — one decode per frame, the one the endpointer's
+ * verdict was computed from (6.7) — so this concatenates and wraps, and never
+ * touches the decoder. That is the difference between this and the rig's
+ * `framesToWav`, which decodes the window a second time against a decoder whose
+ * state has run ahead in between, so that the audio it judges and the audio it
+ * uploads are not the same signal.
+ *
+ * Frames with no samples are skipped rather than padded, and said so in the count
+ * that comes back: silence where a frame failed to decode is a stretch of the
+ * person's speech replaced by nothing.
+ */
+export function framesToWav(
+  frames: readonly (Int16Array | null)[],
+  sampleRate: number
+): { wav: Buffer | null; seconds: number; failed: number } {
+  const decoded = frames.filter((frame): frame is Int16Array => frame !== null);
+  const failed = frames.length - decoded.length;
+
+  const total = decoded.reduce((count, frame) => count + frame.length, 0);
+  if (total === 0) return { wav: null, seconds: 0, failed };
+
+  const joined = new Int16Array(total);
+  let at = 0;
+  for (const frame of decoded) {
+    joined.set(frame, at);
+    at += frame.length;
+  }
+
+  return { wav: buildWav(joined, sampleRate, 1), seconds: total / sampleRate, failed };
 }
 
 /** Narrow a configured number to a rate Opus accepts, or say why not. */

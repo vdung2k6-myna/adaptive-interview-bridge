@@ -301,9 +301,9 @@ compromised: it re-provisions every device at its next boot.
 
 ## Dependencies
 
-Runtime: `ws` — the WebSocket server. Nothing else; the HTTP side is
-`node:http`, credentials are `node:crypto`, and the Opus codec arrives with the
-task that first needs it (5.1).
+Runtime: `ws` — the WebSocket server — and `opusscript` — the Opus codec,
+which both directions of the audio need (5.1, 6.1). Nothing else; the HTTP side is
+`node:http` and credentials are `node:crypto`.
 
 Development: `tsx` (runs the TypeScript directly), `typescript` (type-checking
 only — it never emits), `@types/node`, `@types/ws`.
@@ -318,11 +318,14 @@ against, and its task numbers are used below.
 | | |
 | --- | --- |
 | Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2, 5.4, 5.5): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence — with each sentence announced as `tts sentence_start` ahead of its own frames so the device's display names what is being heard, and a sentence carrying no audio, or a reply with nothing speakable in it at all, completing the turn in silence rather than failing it. |
-| Does not work yet | Nothing the *person* says reaches a turn. A turn can be spoken, but only from text the bridge supplies itself: with `BRIDGE_VERIFY_TEXT` set, a `listen start` takes one turn from that text, which is enough to hear a gadget talk and to measure time-to-first-audio, and is scaffolding rather than a feature. Nothing yet turns speech into a turn — the audio a device streams is counted and discarded (6.1) and the endpointer that decides a turn is over does not exist (6.4) — so a gadget still cannot be *used* by speaking, and a deployment that leaves the verify text unset will handshake and then hear nothing. |
+| Speech from the device (6.1–6.7) | The device streams Opus; the bridge decodes it at the device's own 16000 Hz, decides for itself when the person has stopped speaking, and uploads the utterance rather than the window it was spoken into. The endpointer counts speech over a sliding window, closes a turn on silence after speech, holds it open across a pause inside a sentence, gives up on a window nobody spoke into, and refuses at start a configuration in which a turn could never close. The frames it judged are the frames it uploads — one structure, one verdict per frame, no second decode — trimmed back from the last voiced frame so 38.4 s of window carrying 1.32 s of speech does not go to the transcriber as 38.4 s (D11). The transcription comes back to the device as `stt` before the reply does. A wake word mid-reply cancels the turn at its source, so the display stops naming sentences nobody is hearing, and the turn ends rather than failing — recorded, so the question the person was cut off asking survives into the next turn's history. And after a turn the microphone is distrusted for as long as this reply's own audio is still playing, plus a guard. |
+| Does not work yet | The platform's `notice` and `error` events are surfaced to the device and to the log but the recovery around them has not been exercised against a live platform (4.4). What a newly bound gadget will *sound* like is not written down anywhere yet, since a persona carries no voice field (4.5). The device protocol deltas are written down (`docs/device-protocol.md`), but from the firmware source rather than from a running device: the reading is done and the confirmation is not (1.5). Every claim about a real board — the build, the PSRAM, the vendor baseline, the device pointed at this server, time to first audio, and barge-in on AEC hardware — is unverified: no board has been attached. Section 6's behaviour is asserted against a real socket, real Opus and a stub platform, but never against a gadget whose microphone is live. |
 
 ## Layout
 
 ```
+docs/
+  device-protocol.md  where the gadget departs from its own protocol document: the deltas only
 src/
   index.ts            starts both servers, prints the banner
   config.ts           everything read from the environment, read once
@@ -331,17 +334,18 @@ src/
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   turn.ts             the turn: the platform's voice-agent request, and the reply's stream
   conversation.ts     a device's conversation: per device, sent as history, bounded
+  listening.ts        the device's microphone: the endpointer that closes a turn, and the utterance it uploads
   speech.ts           the device's voice: each sentence announced for the display, then as Opus frames, inside the tts bracket
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
     framing.ts        the 4-byte (v3) and 16-byte (v2) headers around Opus
     messages.ts       the text messages, and the reply to a hello
-    opus.ts           one sentence's WAV, re-encoded as the device's Opus frames
-    wav.ts            the platform's sentence audio, unwrapped from its WAV container
+    opus.ts           the codec, both ways: a sentence re-encoded into the device's frames, and the device's frames decoded and joined into one WAV
+    wav.ts            the WAV container, both ways: the platform's sentence audio unwrapped, and the utterance wrapped for upload
   server/
     ota.ts            the OTA endpoint — issues the token, or refuses
-    ws.ts             the device socket, the refusal, the session, and the speech to it
+    ws.ts             the device socket: the refusal, the session, the speech to it, and the listening that ends a turn
 test/
   config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default, unbound devices
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
@@ -350,7 +354,8 @@ test/
   turn.test.ts        the request the browser would have sent, and a reply's events consumed as they arrive
   conversation.test.ts a device's conversation: what a turn carries in, and what it leaves behind
   speech.test.ts      the bracket around a reply, what it carries, and what the display is told
-  verify-turn.test.ts the whole speech path, against a stub platform and no device
+  listening.test.ts   the endpointer over frames, which part of the window to upload, and the utterance that closes a turn
+  spoken-turn.test.ts the whole path, both halves at once: a real socket, real Opus, a real endpointer and a stub platform
   framing.test.ts     round trips, and short packets
   opus.test.ts        a sentence's frames, checked against a real decoder
   wav.test.ts         the container: what the format chunk says, and where the samples start

@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { createPersonaCatalog, type Persona } from "../src/personas.js";
 import { createConversations, takeTurn } from "../src/conversation.js";
 import type { TurnSink } from "../src/turn.js";
@@ -61,6 +61,7 @@ function configFor(
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    ...ENDPOINTER_DEFAULTS,
     historyTurns: options.historyTurns ?? 20,
     language: "english",
   };

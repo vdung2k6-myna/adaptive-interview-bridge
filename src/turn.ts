@@ -176,6 +176,13 @@ export function turnForm(request: TurnRequest): FormData {
  * never became a stream: a refusal or a failure *inside* a turn arrives as an
  * `error` event over an HTTP 200, and is delivered to the sink rather than thrown,
  * because by then the turn exists and the caller has a device to answer.
+ *
+ * An abort is the third way a turn ends, and the only one the caller does itself
+ * (D15). It returns the outcome as it stood rather than throwing, because a turn
+ * the bridge cancelled is a turn that ended and not one that failed: raised as an
+ * exception it would reach the dispatcher as an error, and the conversation would
+ * lose the person's own question along with the reply that was cut off — spending
+ * the one half that certainly happened.
  */
 export async function runTurn(
   config: BridgeConfig,
@@ -183,14 +190,23 @@ export async function runTurn(
   sink: TurnSink,
   signal?: AbortSignal
 ): Promise<TurnOutcome> {
-  const response = await fetch(`${config.platformUrl}${TURN_PATH}`, {
-    method: "POST",
-    // No `Content-Type`: `fetch` writes the multipart boundary itself, and a
-    // hand-set header without it is a body the platform cannot parse.
-    headers: platformAuthHeaders(config),
-    body: turnForm(request),
-    signal: signal ?? null,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${config.platformUrl}${TURN_PATH}`, {
+      method: "POST",
+      // No `Content-Type`: `fetch` writes the multipart boundary itself, and a
+      // hand-set header without it is a body the platform cannot parse.
+      headers: platformAuthHeaders(config),
+      body: turnForm(request),
+      signal: signal ?? null,
+    });
+  } catch (error) {
+    // Aborted before the stream began: a turn with nothing in it, which is what an
+    // empty unsettled outcome says — and not a failure, which is what the abort of a
+    // barge-in would otherwise be reported as every single time.
+    if (signal?.aborted) return { replyText: "", settled: false };
+    throw error;
+  }
 
   if (!response.ok || !response.body) {
     // The stream never started, so there is no turn to report an event against.
@@ -201,7 +217,7 @@ export async function runTurn(
     throw new Error(`POST ${TURN_PATH} answered ${response.status} ${response.statusText}`);
   }
 
-  return consumeStream(response.body, sink);
+  return consumeStream(response.body, sink, signal);
 }
 
 const TURN_PATH = "/api/voice-agent/stream";
@@ -209,7 +225,8 @@ const TURN_PATH = "/api/voice-agent/stream";
 /** Read the reply's events, in arrival order, and report how it ended. */
 async function consumeStream(
   body: ReadableStream<Uint8Array>,
-  sink: TurnSink
+  sink: TurnSink,
+  signal?: AbortSignal
 ): Promise<TurnOutcome> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -238,6 +255,11 @@ async function consumeStream(
         else if (event.name === "text" && reported !== null) replyText += reported;
       }
     }
+  } catch (error) {
+    // The caller aborted: the reader lets go of a stream the platform is still
+    // writing to, and what was read stands. `settled` stays as it was — false
+    // unless the reply had already said it was finished (D15).
+    if (!signal?.aborted) throw error;
   } finally {
     // Releases the socket when the caller aborted, and is a no-op otherwise.
     await reader.cancel().catch(() => undefined);

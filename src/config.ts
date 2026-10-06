@@ -84,22 +84,45 @@ export interface BridgeConfig {
    */
   language: TurnLanguage;
   /**
-   * The text of a turn the bridge takes by itself, on `listen start`, instead of
-   * waiting for the person to speak (5.x verification).
+   * The rate the **device** encodes its uplink at, in Hz. Read from
+   * `BRIDGE_DEVICE_RATE`; the firmware's own declaration is 16000.
    *
-   * **This is scaffolding, and shaped to be deleted.** Section 5 can only be
-   * verified on a device by making the device speak, and speaking requires a
-   * turn — but the device protocol has no text input path, and the one that
-   * produces a turn from speech is §6, which is not built. So this stands in for
-   * the person: with it set, the bridge sends one turn carrying this text, and
-   * the reply comes back through the ordinary speech path.
-   *
-   * It is configuration rather than code so that the bridge is unchanged when it
-   * goes: absent — which is what a deployment sets — no turn is ever taken by
-   * itself, and the task that makes 6.4 close a turn from speech removes the
-   * branch and this field together. Nothing else reads it.
+   * Not the same number as `serverRate`, and not interchangeable with it. The
+   * hello declares `serverRate` for the downlink, and 24000 is a legal rate for
+   * both — so a port that reused it here would build a decoder at the wrong rate
+   * and fail in the one way that looks like a broken microphone: the sample count
+   * is part of what an Opus packet is read as, so the frames would not decode at
+   * all rather than decoding sharp (6.1).
    */
-  verifyText?: string;
+  deviceRate: number;
+  /**
+   * The endpointer, which is how the bridge knows the person has stopped speaking
+   * (D9, 6.4). The firmware sends no `listen stop`, so nothing else will say.
+   *
+   * All five of these are one decision together, and the relation between them is
+   * checked at start rather than left to an operator — see `requireEndpointer`.
+   */
+  /** The gate's absolute floor, in RMS. The quietest a frame may be and still be
+   *  counted, until the room's own floor is estimated. */
+  vadMinRms: number;
+  /** How far above the room's estimated floor a frame must be to count. */
+  vadFloorRatio: number;
+  /** How much silence after speech closes the turn. */
+  vadSilenceMs: number;
+  /** How much speech a window must hold before a turn may close at all. */
+  vadMinSpeechMs: number;
+  /** The sliding window speech is counted over. */
+  vadSpeechWindowMs: number;
+  /** The longest turn, as a backstop for a person who never stops. */
+  maxTurnMs: number;
+  /** How long a window may hold no speech at all before it is given up on. */
+  vadNoSpeechMs: number;
+  /** How long after the bridge's own audio the device's microphone is distrusted,
+   *  since the device reopens it before its speaker stops (D10, 6.6). */
+  drainGuardMs: number;
+  /** How much audio before the first voiced frame to keep, so a soft onset is not
+   *  clipped off the utterance (6.1). */
+  onsetLeadMs: number;
 }
 
 const PORT_MAX = 65535;
@@ -110,6 +133,18 @@ function readInt(env: NodeJS.ProcessEnv, name: string, fallback: number, max = N
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0 || value > max) {
     throw new Error(`${name} must be a positive integer at most ${max}, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+/** A positive number, integral or not — the floor ratio is the one knob that is
+ *  not a count of milliseconds, and a floor on it matters more than its width. */
+function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive number, got ${JSON.stringify(raw)}`);
   }
   return value;
 }
@@ -299,12 +334,78 @@ function requireBindings(allowedDevices: string[], devicePersonas: ReadonlyMap<s
   }
 }
 
+/**
+ * The endpointer's shipped defaults, and the only copy of them.
+ *
+ * Exported so a test can build a config that is a deployment's in every respect it
+ * does not care about, without spelling out ten numbers that would then drift from
+ * these the first time one of them moved. The rig's own defaults, measured on the
+ * board this service was built for: 7500 RMS against a room floor of about 3000 is
+ * the gate that separated a person from the device's own speaker.
+ */
+export const ENDPOINTER_DEFAULTS = {
+  /** The firmware declares 16000 Hz Opus mono upward; the hello's 24000 is the
+   *  downlink and is a different number (6.1). */
+  deviceRate: 16000,
+  vadMinRms: 7500,
+  vadFloorRatio: 2.5,
+  vadSilenceMs: 900,
+  vadMinSpeechMs: 240,
+  vadSpeechWindowMs: 3000,
+  maxTurnMs: 20000,
+  vadNoSpeechMs: 15000,
+  drainGuardMs: 400,
+  onsetLeadMs: 300,
+} as const;
+
+/**
+ * The one relation between the endpointer's knobs, checked at start (6.4).
+ *
+ * Speech is counted over a **sliding** window. If the window is no longer than the
+ * silence threshold plus the speech minimum, the frames that satisfied the speech
+ * minimum have already aged out of the window by the time the silence threshold is
+ * reached — so neither condition can ever hold at once and a turn can never close.
+ * The rig has the same relation and only warns about it, in a comment that names
+ * its own failure as silent: "the rig just waits forever". A bridge cannot be left
+ * in that state by a typo, so this throws.
+ */
+function requireEndpointer(config: {
+  vadSilenceMs: number;
+  vadMinSpeechMs: number;
+  vadSpeechWindowMs: number;
+}): void {
+  if (config.vadSpeechWindowMs <= config.vadSilenceMs + config.vadMinSpeechMs) {
+    throw new Error(
+      `BRIDGE_VAD_SPEECH_WINDOW_MS must exceed BRIDGE_VAD_SILENCE_MS + BRIDGE_VAD_MIN_SPEECH_MS ` +
+        `(${config.vadSilenceMs} + ${config.vadMinSpeechMs}), got ${config.vadSpeechWindowMs}: ` +
+        `speech ages out of the window before the silence threshold is reached, and no turn could ever close`
+    );
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   // The two device lists are read and cross-checked first, so bindings that
   // cannot work are reported even when some later value is wrong too.
   const allowedDevices = readAllowedDevices(env);
   const devicePersonas = readDevicePersonas(env);
   requireBindings(allowedDevices, devicePersonas);
+
+  // Read together, because they are one decision, and checked together before the
+  // rest of the service is built: an endpointer that can never close a turn is a
+  // gadget that never answers, and that is not something to discover from silence.
+  const endpointer = {
+    deviceRate: readInt(env, "BRIDGE_DEVICE_RATE", ENDPOINTER_DEFAULTS.deviceRate),
+    vadMinRms: readInt(env, "BRIDGE_VAD_MIN_RMS", ENDPOINTER_DEFAULTS.vadMinRms),
+    vadFloorRatio: readNumber(env, "BRIDGE_VAD_FLOOR_RATIO", ENDPOINTER_DEFAULTS.vadFloorRatio),
+    vadSilenceMs: readInt(env, "BRIDGE_VAD_SILENCE_MS", ENDPOINTER_DEFAULTS.vadSilenceMs),
+    vadMinSpeechMs: readInt(env, "BRIDGE_VAD_MIN_SPEECH_MS", ENDPOINTER_DEFAULTS.vadMinSpeechMs),
+    vadSpeechWindowMs: readInt(env, "BRIDGE_VAD_SPEECH_WINDOW_MS", ENDPOINTER_DEFAULTS.vadSpeechWindowMs),
+    maxTurnMs: readInt(env, "BRIDGE_MAX_TURN_MS", ENDPOINTER_DEFAULTS.maxTurnMs),
+    vadNoSpeechMs: readInt(env, "BRIDGE_VAD_NO_SPEECH_MS", ENDPOINTER_DEFAULTS.vadNoSpeechMs),
+    drainGuardMs: readInt(env, "BRIDGE_DRAIN_GUARD_MS", ENDPOINTER_DEFAULTS.drainGuardMs),
+    onsetLeadMs: readInt(env, "BRIDGE_ONSET_LEAD_MS", ENDPOINTER_DEFAULTS.onsetLeadMs),
+  };
+  requireEndpointer(endpointer);
 
   return {
     otaPort: readInt(env, "OTA_PORT", 8003, PORT_MAX),
@@ -322,15 +423,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     frameMs: readInt(env, "BRIDGE_FRAME_MS", 60),
     historyTurns: readInt(env, "BRIDGE_HISTORY_TURNS", 20),
     language: readLanguage(env),
-    // The one value with no default, because it has no sensible one: absent means
-    // the bridge never takes a turn by itself, which is what a deployment wants.
-    verifyText: readVerifyText(env),
+    ...endpointer,
   };
-}
-
-/** The scaffolding turn's text, or nothing at all. An empty string is the same
- *  as absent — a turn that says nothing would be a turn taken for no reason. */
-function readVerifyText(env: NodeJS.ProcessEnv): string | undefined {
-  const raw = env.BRIDGE_VERIFY_TEXT;
-  return raw === undefined || raw === "" ? undefined : raw;
 }

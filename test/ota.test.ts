@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { deriveToken } from "../src/credentials.js";
 import { createOtaServer } from "../src/server/ota.js";
 
@@ -30,6 +30,7 @@ function configFor(otaPort: number): BridgeConfig {
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
     language: "english",
   };

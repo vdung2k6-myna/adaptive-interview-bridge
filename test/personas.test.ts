@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import {
   boundPersona,
   createPersonaCatalog,
@@ -43,6 +43,7 @@ function configFor(platformUrl: string): BridgeConfig {
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
     language: "english",
   };

@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import {
   engineForLanguage,
   runTurn,
@@ -45,6 +45,7 @@ function configFor(platformUrl: string): BridgeConfig {
     framing: 3,
     serverRate: 24000,
     frameMs: 60,
+    ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
     language: "english",
   };
@@ -375,9 +376,13 @@ describe("when the platform refuses the turn", () => {
 });
 
 describe("aborting a turn", () => {
-  it("stops reading when the caller aborts", async () => {
+  it("stops reading when the caller aborts, and calls it ended rather than failed", async () => {
     // The wake word firing mid-turn is an abort (6.5): the turn is over, and the
-    // reader has to let go of a stream the platform is still writing to.
+    // reader has to let go of a stream the platform is still writing to. What it
+    // must not do is raise — an abort raised as an error reaches the dispatcher as
+    // a failure, and the conversation loses the person's question with the reply
+    // that was cut off (D15). So the outcome is the one `settled: false` already
+    // names: a turn that was cut off rather than one that ended.
     const platform = await stubPlatform(async (res) => {
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(sse("sentence", { index: 0, text: "one", audioData: null }));
@@ -388,25 +393,22 @@ describe("aborting a turn", () => {
     try {
       const controller = new AbortController();
       const seen: number[] = [];
-      await assert.rejects(
-        () =>
-          runTurn(
-            configFor(platform.url),
-            REQUEST,
-            {
-              onSentence: (sentence) => {
-                seen.push(sentence.index);
-                controller.abort();
-              },
-            },
-            controller.signal
-          ),
-        (error: Error) => {
-          assert.equal(error.name, "AbortError");
-          return true;
-        }
+      const outcome = await runTurn(
+        configFor(platform.url),
+        REQUEST,
+        {
+          onSentence: (sentence) => {
+            seen.push(sentence.index);
+            controller.abort();
+          },
+        },
+        controller.signal
       );
       assert.deepEqual(seen, [0], "the first sentence was delivered before the abort");
+      // The platform writes `done` half a second later, so an outcome that says the
+      // reply settled is an outcome from a reader that kept reading.
+      assert.equal(outcome.settled, false, "a cancelled turn did not settle");
+      assert.equal(outcome.replyText, "", "and nothing the platform said afterwards was read");
     } finally {
       platform.stop();
     }

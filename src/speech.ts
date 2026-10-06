@@ -24,9 +24,17 @@ import type { TurnSentence } from "./turn.js";
  *
  * This is also where the bridge's own sense of its voice lives: how much audio it
  * has sent, which is the only clock that knows when the device has finished
- * playing it (D10). The device reopens its microphone before its speaker stops,
- * so the frames that come back early are its own voice, and nothing but arithmetic
- * on what was sent can tell the difference.
+ * playing it (D10). The device reopens its microphone before its speaker stops —
+ * measured 1.7–2.3 s early in the rig — while reporting that it is listening, and
+ * the echo it sends back measures 5–8k RMS against 19–24k for speech, so no energy
+ * test separates them. Nothing but arithmetic on what was sent can.
+ *
+ * There are therefore **two** counters here and they must not be confused (6.6).
+ * `sessionMs()` is cumulative for the life of the socket: it is what an operator
+ * reads to see how much the bridge has said, and it deliberately never resets.
+ * `drainingUntil()` is this turn's own deadline, and only the input path reads it.
+ * The rig reached for the first where it needed the second, and a port that did the
+ * same would keep the microphone distrusted for every turn a device has ever taken.
  */
 
 /** 1 === OPEN, checked as a literal rather than through `ws`'s own constants. */
@@ -43,14 +51,37 @@ export interface Speaker {
   speak(sentence: TurnSentence): void;
   /** Close the bracket if it is open. Idempotent, and safe on a turn with no speech. */
   finish(): void;
-  /** How much audio has been sent to this device, in ms (D10, D11). */
-  sentMs(): number;
+  /** How much audio has been sent to this device over the life of the socket, in ms
+   *  (D10, D11). Session-cumulative by design: it does not reset at a turn boundary. */
+  sessionMs(): number;
+  /**
+   * The moment this turn's audio has finished playing, plus the drain guard, or
+   * `null` when no turn has finished speaking on this socket yet (6.6).
+   *
+   * Read from the session's clock, and anchored at this turn's **first** frame rather
+   * than at `finish()`: a turn that streams for four seconds has been playing for
+   * four seconds by the time the bracket closes, and a deadline set at the close
+   * would distrust the microphone for four seconds too many.
+   */
+  drainingUntil(): number | null;
 }
 
-export function createSpeaker(socket: SpeakerSocket, config: BridgeConfig): Speaker {
+export function createSpeaker(
+  socket: SpeakerSocket,
+  config: BridgeConfig,
+  clock: () => number = Date.now
+): Speaker {
   const framing = { sampleRate: config.serverRate, frameMs: config.frameMs };
   let speaking = false;
   let sent = 0;
+  // The per-turn pair (6.6): when this turn's bracket opened, and how much audio it
+  // has carried. Zeroed at the open rather than at the close, so both are this turn's.
+  let turnStart = 0;
+  let turnMs = 0;
+  // `null` is "no deadline", and only ever before a turn on this socket has spoken:
+  // a sentinel timestamp would be a value the clock could legitimately return, and
+  // the one thing this must never do is claim the device is playing when it is not.
+  let drainUntil: number | null = null;
 
   const sendJson = (message: Record<string, unknown>): boolean => {
     if (socket.readyState !== OPEN) {
@@ -90,6 +121,13 @@ export function createSpeaker(socket: SpeakerSocket, config: BridgeConfig): Spea
       if (!speaking) {
         if (!sendJson({ type: "tts", state: "start" })) return;
         speaking = true;
+        // The turn's clock starts here, not at the first frame below and not at
+        // `finish()`: the deadline 6.6 computes is anchored on the moment the device
+        // was told to start playing, which is the earliest this turn's audio can be
+        // audible. Zeroed rather than accumulated, so a previous turn's audio is not
+        // counted into this one.
+        turnStart = clock();
+        turnMs = 0;
       }
 
       // What the device's display shows while this sentence is heard (5.4). One
@@ -115,6 +153,7 @@ export function createSpeaker(socket: SpeakerSocket, config: BridgeConfig): Spea
         sentHere += 1;
       }
       sent += sentHere * config.frameMs;
+      turnMs += sentHere * config.frameMs;
       info(
         `sentence ${sentence.index}: ${sentHere} frame(s) @ ${config.serverRate}Hz/${config.frameMs}ms ` +
           `(${(sentHere * config.frameMs) / 1000}s, ${(sent / 1000).toFixed(2)}s this session)`
@@ -122,21 +161,37 @@ export function createSpeaker(socket: SpeakerSocket, config: BridgeConfig): Spea
     },
 
     finish(): void {
+      // A turn that spoke nothing never opened the bracket and leaves the previous
+      // deadline standing — there is no audio of its own to distrust the microphone
+      // for. That is the rig's behaviour too, and it is the right one: the device
+      // cannot be playing this turn's silence.
       if (!speaking) return;
       // Flipped before the send, so a socket that throws on the way out cannot
       // leave the bracket believed open — the next turn must start a fresh one.
       speaking = false;
+      // The deadline is armed before the send for the same reason, and it is armed
+      // whether or not the socket is still open: a device that has gone took the
+      // bracket with it, but a session that reconnects is a new session with a new
+      // speaker, so there is nothing here a stale deadline could outlive.
+      drainUntil = turnStart + turnMs + config.drainGuardMs;
       // A device that has already gone took the bracket with it: the state lives
       // in its socket, and the close is logged where it happened. Warning here
       // would report the same drop twice, once as a failure to say "stop" to
       // something that no longer exists.
       if (socket.readyState !== OPEN) return;
       socket.send(JSON.stringify({ type: "tts", state: "stop" }));
-      info(`tts stop — ${(sent / 1000).toFixed(2)}s of audio sent this session`);
+      info(
+        `tts stop — ${(turnMs / 1000).toFixed(2)}s of audio this turn, ` +
+          `microphone distrusted for another ${((drainUntil - clock()) / 1000).toFixed(2)}s`
+      );
     },
 
-    sentMs(): number {
+    sessionMs(): number {
       return sent;
+    },
+
+    drainingUntil(): number | null {
+      return drainUntil;
     },
   };
 }

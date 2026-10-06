@@ -123,20 +123,18 @@ for (const [device, personaId] of unresolvedBindings(config.devicePersonas, pers
   );
 }
 
-// What the device will and will not get, said plainly, because both halves are
-// surprising from the outside. The bridge can speak but cannot yet listen, so an
-// operator who talks to a gadget and gets no turn should know that is the state
-// of the service and not a broken device, a bad allowlist or a fault in §5.
-if (config.verifyText === undefined) {
-  log(
-    `NOTE a device that connects will handshake and hear nothing: the bridge speaks only what a turn ` +
-      `gives it, and nothing yet turns speech into a turn (6.1, 6.4). Set BRIDGE_VERIFY_TEXT to have ` +
-      `a listen start take a turn of the bridge's own text instead — scaffolding for verifying §5.`
-  );
-} else {
-  warn(
-    `NOTE BRIDGE_VERIFY_TEXT is set, so every listen start takes a turn from the bridge's own text ` +
-      `(${JSON.stringify(config.verifyText)}) rather than from a person. This is scaffolding for ` +
-      `verifying §5 on a device and must not be left on.`
-  );
-}
+// The endpointer, said plainly because its numbers are what decide when a gadget
+// answers and a wrong one is silent rather than loud. The relation between the three
+// that have one was checked at start and threw if it did not hold, so what is left is
+// to report the figures an operator would otherwise have to infer from a log of
+// frames that were never judged.
+log(
+  `endpointer: speech closes a turn after ${config.vadSilenceMs}ms of silence, ` +
+    `counted over ${config.vadSpeechWindowMs}ms and needing ${config.vadMinSpeechMs}ms of it; ` +
+    `gate ${config.vadMinRms} RMS or ${config.vadFloorRatio}x the room's floor; ` +
+    `a window with no speech is given up on after ${config.vadNoSpeechMs}ms`
+);
+log(
+  `uplink: opus ${config.deviceRate} Hz mono, ${config.frameMs}ms frames — ` +
+    `the utterance is decoded at this rate and uploaded trimmed (6.1)`
+);

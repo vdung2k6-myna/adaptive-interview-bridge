@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { createSpeaker, type SpeakerSocket } from "../src/speech.js";
 import type { TurnSentence } from "../src/turn.js";
 
@@ -23,6 +23,7 @@ import type { TurnSentence } from "../src/turn.js";
 const RATE = 24000;
 const FRAME_MS = 60;
 const SAMPLES_PER_FRAME = (RATE * FRAME_MS) / 1000;
+const DRAIN_GUARD_MS = ENDPOINTER_DEFAULTS.drainGuardMs;
 
 const config: BridgeConfig = {
   otaPort: 8003,
@@ -36,6 +37,7 @@ const config: BridgeConfig = {
   framing: 3,
   serverRate: RATE,
   frameMs: FRAME_MS,
+  ...ENDPOINTER_DEFAULTS,
   historyTurns: 20,
   language: "english",
 };
@@ -202,21 +204,71 @@ describe("what the bracket carries", () => {
     assert.equal(wire.readUInt16BE(2), wire.length - 4, "the header declares what it carries");
   });
 
-  it("counts the audio it has sent, which is the only clock on when the device is done", () => {
+  it("counts the audio it has sent for the life of the socket", () => {
     const socket = fakeSocket();
     const speaker = createSpeaker(socket, config);
-    assert.equal(speaker.sentMs(), 0);
+    assert.equal(speaker.sessionMs(), 0);
 
     speaker.speak(sentence(0, wav(3)));
-    assert.equal(speaker.sentMs(), 3 * FRAME_MS);
+    assert.equal(speaker.sessionMs(), 3 * FRAME_MS);
     speaker.speak(sentence(1, wav(2)));
-    assert.equal(speaker.sentMs(), 5 * FRAME_MS);
+    assert.equal(speaker.sessionMs(), 5 * FRAME_MS);
 
-    // The count is the session's, not the turn's: it is what §6 walks back from
-    // to know whether the frames coming in are the person or the speaker's tail,
-    // and that window does not reset at a turn boundary.
+    // The count is the session's, not the turn's: it is what an operator reads to
+    // see how much the bridge has said to this device, and it does not reset at a
+    // turn boundary. What a turn needs instead is `drainingUntil` below (6.6).
     speaker.finish();
-    assert.equal(speaker.sentMs(), 5 * FRAME_MS);
+    assert.equal(speaker.sessionMs(), 5 * FRAME_MS);
+  });
+
+  it("arms a drain deadline from this turn's own audio, not the session's", () => {
+    // 6.6. The device reopens its microphone before its speaker stops, so the
+    // bridge has to know when this turn's audio is over. The deadline is anchored at
+    // the moment the bracket opened and measured by this turn's frames alone; taking
+    // it from the session total instead would hold the microphone distrusted for every
+    // turn a gadget had ever taken.
+    let now = 1_000;
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, () => now);
+
+    assert.equal(speaker.drainingUntil(), null, "nothing has been spoken, so nothing is playing");
+
+    // First turn: 3 frames, and the clock moves 5s while they stream — the deadline
+    // must follow the audio, not the wall clock, or a slow reply would look like a
+    // long one.
+    speaker.speak(sentence(0, wav(3)));
+    now += 5_000;
+    speaker.finish();
+    assert.equal(speaker.drainingUntil(), 1_000 + 3 * FRAME_MS + DRAIN_GUARD_MS);
+
+    // Second turn: 2 frames. The deadline is this turn's, so it is behind the first
+    // one's rather than 8 frames' worth ahead of it.
+    now += 10_000;
+    speaker.speak(sentence(1, wav(2)));
+    speaker.finish();
+    assert.equal(
+      speaker.drainingUntil(),
+      16_000 + 2 * FRAME_MS + DRAIN_GUARD_MS,
+      "one reply's worth on the second turn, not two"
+    );
+  });
+
+  it("leaves the previous deadline standing when a turn says nothing", () => {
+    // A reply with nothing speakable in it never opens the bracket and returns from
+    // `finish()` at once (5.5). It has no audio of its own to distrust the microphone
+    // for, and the previous turn's deadline is about audio that is still playing.
+    let now = 1_000;
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, () => now);
+
+    speaker.speak(sentence(0, wav(2)));
+    speaker.finish();
+    const armed = speaker.drainingUntil();
+
+    now += 1_000;
+    speaker.speak(sentence(1, null));
+    speaker.finish();
+    assert.equal(speaker.drainingUntil(), armed, "silence is not a turn's worth of audio");
   });
 
   it("skips a sentence it cannot speak rather than ending the turn", () => {

@@ -237,6 +237,70 @@ describe("the rest of the configuration", () => {
     assert.equal(config.frameMs, 60);
   });
 
+  it("reads the endpointer's own defaults, which are not the downlink's rate", () => {
+    const config = loadConfig(minimal);
+    // 16000 upward, 24000 downward. A deployment that reused the hello's rate for
+    // the decoder would build it at a rate the device's packets do not decode at
+    // (6.1), so the two are asserted apart rather than together.
+    assert.equal(config.deviceRate, 16000);
+    assert.notEqual(config.deviceRate, config.serverRate);
+    assert.equal(config.vadMinRms, 7500);
+    assert.equal(config.vadFloorRatio, 2.5);
+    assert.equal(config.vadSilenceMs, 900);
+    assert.equal(config.vadMinSpeechMs, 240);
+    assert.equal(config.vadSpeechWindowMs, 3000);
+    assert.equal(config.maxTurnMs, 20000);
+    assert.equal(config.vadNoSpeechMs, 15000);
+    assert.equal(config.drainGuardMs, 400);
+    assert.equal(config.onsetLeadMs, 300);
+  });
+
+  it("reads them from the environment, floor ratio included", () => {
+    const config = loadConfig({
+      ...minimal,
+      BRIDGE_DEVICE_RATE: "48000",
+      BRIDGE_VAD_FLOOR_RATIO: "1.75",
+      BRIDGE_VAD_SPEECH_WINDOW_MS: "4000",
+    } as NodeJS.ProcessEnv);
+    assert.equal(config.deviceRate, 48000);
+    assert.equal(config.vadFloorRatio, 1.75);
+    assert.equal(config.vadSpeechWindowMs, 4000);
+  });
+
+  it("refuses an endpointer that could never close a turn", () => {
+    // 6.4. Speech is counted over a sliding window, so a window no longer than the
+    // silence threshold plus the speech minimum means the frames that satisfied the
+    // minimum have aged out before the threshold is reached — and the gadget simply
+    // never answers. The rig warned about this and the rig's own comment names its
+    // failure as silent; here it is a startup failure, where the operator is.
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: "1140" } as NodeJS.ProcessEnv),
+      /BRIDGE_VAD_SPEECH_WINDOW_MS must exceed/
+    );
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_VAD_SILENCE_MS: "2800" } as NodeJS.ProcessEnv),
+      /BRIDGE_VAD_SPEECH_WINDOW_MS must exceed/
+    );
+    // One millisecond more than the sum is enough, which is the boundary the error
+    // is about rather than an arbitrary margin.
+    assert.equal(
+      loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: "1141" } as NodeJS.ProcessEnv)
+        .vadSpeechWindowMs,
+      1141
+    );
+  });
+
+  it("refuses a floor ratio that is not a positive number", () => {
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_VAD_FLOOR_RATIO: "0" } as NodeJS.ProcessEnv),
+      /BRIDGE_VAD_FLOOR_RATIO/
+    );
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_VAD_FLOOR_RATIO: "twice" } as NodeJS.ProcessEnv),
+      /BRIDGE_VAD_FLOOR_RATIO/
+    );
+  });
+
   it("still refuses a malformed value rather than falling back", () => {
     assert.throws(() => loadConfig({ ...minimal, BRIDGE_FRAMING: "4" } as NodeJS.ProcessEnv), /BRIDGE_FRAMING/);
     assert.throws(() => loadConfig({ ...minimal, WS_PORT: "0" } as NodeJS.ProcessEnv), /WS_PORT/);

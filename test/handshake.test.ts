@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
-import type { BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { createConversations } from "../src/conversation.js";
 import { deriveToken } from "../src/credentials.js";
 import { createPersonaCatalog } from "../src/personas.js";
@@ -42,6 +42,7 @@ const config: BridgeConfig = {
   framing: 3,
   serverRate: 24000,
   frameMs: 60,
+  ...ENDPOINTER_DEFAULTS,
   historyTurns: 20,
   language: "english",
 };
@@ -56,8 +57,8 @@ const deviceHello = {
 };
 
 // A catalog that was never refreshed, and a conversation nobody has spoken into.
-// Neither is reached here: these tests assert the handshake, and a turn needs a
-// `BRIDGE_VERIFY_TEXT` this config does not set.
+// Neither is reached here: these tests assert the handshake, and a turn now comes
+// only from speech the device streams, which none of them sends.
 const services = { catalog: createPersonaCatalog(config), conversations: createConversations(config) };
 
 async function startedServer() {
