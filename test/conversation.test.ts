@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import { createPersonaCatalog, type Persona } from "../src/personas.js";
 import { createConversations, takeTurn } from "../src/conversation.js";
-import type { TurnSink } from "../src/turn.js";
+import type { TurnLanguage, TurnSink } from "../src/turn.js";
 
 /**
  * A gadget's conversation, which the platform does not keep.
@@ -44,7 +44,7 @@ const CATALOG: Persona[] = [
 
 function configFor(
   platformUrl: string,
-  options: { historyTurns?: number; binding?: string } = {}
+  options: { historyTurns?: number; binding?: string; language?: TurnLanguage } = {}
 ): BridgeConfig {
   return {
     otaPort: 0,
@@ -63,7 +63,8 @@ function configFor(
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
     historyTurns: options.historyTurns ?? 20,
-    language: "english",
+    commandStep: 10,
+    language: options.language ?? "english",
   };
 }
 
@@ -397,6 +398,154 @@ describe("a device's turn, from the conversation's side", () => {
         { language: "english", text: "again" }, noSink
       );
       assert.equal(after.served, true);
+    } finally {
+      platform.stop();
+    }
+  });
+});
+
+describe("a command the bridge answered itself", () => {
+  it("is not carried into the conversation", async () => {
+    // Requirement 4, at the one recording site (4.2). The command does reach the platform
+    // — the transcript is the only place it exists at all, since the bridge has no
+    // recogniser of its own (D12) — and is dropped there. What must not survive it is the
+    // transcript: a history holding "giảm âm lượng" with silence where the answer would
+    // be is a question nobody put to the model, and the next interview turn would be
+    // asked against a conversation that never took place.
+    const platform = await stubPlatform();
+    // No `done`: the bridge let go of the stream, and what it had read by then stands.
+    platform.reply((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('event: user\ndata: {"text":"giảm âm lượng"}\n\n');
+      res.end();
+    });
+    try {
+      const config = configFor(platform.url, { language: "vietnamese" });
+      const catalog = await readyCatalog(config);
+      const conversations = createConversations(config);
+
+      const result = await takeTurn(
+        config, catalog, conversations, "b81f3f4a9b01",
+        { language: "vietnamese", text: "anything" }, noSink
+      );
+
+      assert.equal(result.served, true, "the turn was taken; it was the gadget that answered it");
+      assert.deepEqual(conversations.history("b81f3f4a9b01"), []);
+    } finally {
+      platform.stop();
+    }
+  });
+
+  it("is recorded all the same when the platform did answer it", async () => {
+    // The other half of the shape the recording site reads. A turn that was spoken for
+    // was answered, however its transcript happens to read, and leaving it out would
+    // lose the person's own half — which is the half that certainly happened (D15).
+    const platform = await stubPlatform();
+    platform.reply(replyingWith(["Được."]));
+    try {
+      const config = configFor(platform.url, { language: "vietnamese" });
+      const catalog = await readyCatalog(config);
+      const conversations = createConversations(config);
+
+      await takeTurn(
+        config, catalog, conversations, "b81f3f4a9b01",
+        { language: "vietnamese", text: "giảm âm lượng" }, noSink
+      );
+
+      assert.deepEqual(conversations.history("b81f3f4a9b01"), [
+        { role: "user", content: "asked 1" },
+        { role: "agent", content: "Được." },
+      ]);
+    } finally {
+      platform.stop();
+    }
+  });
+});
+
+describe("the gadget's condition, on the turn", () => {
+  // The device's own report, as `gadget.ts` writes it — the one string the platform
+  // ever sees about the gadget on the other end.
+  const REPORT =
+    "The device this reply is spoken through reports its own state as: speaker volume 42 of 100; " +
+    "battery 12%, not charging.";
+
+  it("carries the gadget's own report, after the persona's own words", async () => {
+    // 42 and 12% are the gadget's facts; "nearly flat" is nobody's. What is pinned
+    // here is that the report reaches the model word for word and unembellished, which
+    // is the bridge's whole share of the requirement — whether the model then says
+    // anything sensible with it is the model's, and is checked on the device.
+    const platform = await stubPlatform();
+    platform.reply(replyingWith(["ok"]));
+    try {
+      const config = configFor(platform.url);
+      const catalog = await readyCatalog(config);
+
+      await takeTurn(
+        config, catalog, createConversations(config), "b81f3f4a9b01",
+        { language: "english", text: "how are you", gadgetCondition: REPORT }, noSink
+      );
+
+      const [turn] = platform.requests.filter((r) => r.path.includes("stream"));
+      const prompt = fieldOf(turn.body, "systemPrompt");
+      assert.ok(prompt !== null);
+      assert.ok(prompt.startsWith("You are an interview coach."), `the persona's own words still open it: ${prompt}`);
+      assert.ok(prompt.includes(REPORT), `the report is carried verbatim: ${prompt}`);
+      // Read back through the multipart encoder's own line endings: `FormData` writes a
+      // field's newlines as CRLF, the way a browser posts a form, and that is the wire
+      // format rather than anything this module decided.
+      assert.equal(prompt.replace(/\r\n/g, "\n"), `You are an interview coach.\n\n${REPORT}`);
+    } finally {
+      platform.stop();
+    }
+  });
+
+  it("asks for a turn with no condition exactly as it asked before this existed", async () => {
+    // A gadget that reported nothing, or whose report could not be read, sends a turn
+    // byte-identical to one from a bridge that has never heard of the gadget's
+    // condition: no placeholder, no empty appendix (requirement 5).
+    const platform = await stubPlatform();
+    platform.reply(replyingWith(["ok"]));
+    try {
+      const config = configFor(platform.url);
+      const catalog = await readyCatalog(config);
+
+      await takeTurn(
+        config, catalog, createConversations(config), "b81f3f4a9b01",
+        { language: "english", text: "how are you" }, noSink
+      );
+
+      const [turn] = platform.requests.filter((r) => r.path.includes("stream"));
+      assert.equal(fieldOf(turn.body, "systemPrompt"), "You are an interview coach.");
+    } finally {
+      platform.stop();
+    }
+  });
+
+  it("leaves the conversation the condition is not part of untouched", async () => {
+    // The condition is per turn and never recorded: a later turn carries it again from
+    // the gadget, and the history behind it holds only what was actually said.
+    const platform = await stubPlatform();
+    platform.reply(replyingWith(["first answer", "second answer"]));
+    try {
+      const config = configFor(platform.url);
+      const catalog = await readyCatalog(config);
+      const conversations = createConversations(config);
+
+      await takeTurn(
+        config, catalog, conversations, "b81f3f4a9b01",
+        { language: "english", text: "one", gadgetCondition: REPORT }, noSink
+      );
+      await takeTurn(
+        config, catalog, conversations, "b81f3f4a9b01",
+        { language: "english", text: "two" }, noSink
+      );
+
+      const turns = platform.requests.filter((r) => r.path.includes("stream"));
+      assert.deepEqual(historyOf(turns[1].body), [
+        { role: "user", content: "asked 1" },
+        { role: "agent", content: "first answer" },
+      ]);
+      assert.equal(fieldOf(turns[1].body, "systemPrompt"), "You are an interview coach.");
     } finally {
       platform.stop();
     }

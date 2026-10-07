@@ -44,6 +44,7 @@ const config: BridgeConfig = {
   frameMs: 60,
   ...ENDPOINTER_DEFAULTS,
   historyTurns: 20,
+  commandStep: 10,
   language: "english",
 };
 
@@ -97,10 +98,28 @@ async function connectedDevice() {
   });
   assert.equal(status, 101, "the provisioned device is accepted");
 
+  // Every frame the server sends, and a cursor over them. A queue rather than a
+  // `once` per reader, because `ws`'s `once` invokes **every** listener it holds on the
+  // next message: two registered together both resolve with the first frame, which is
+  // not a frame count. The MCP handshake is the first exchange here with more than one
+  // frame to it, so this only had to be right by the time it did.
+  const frames: string[] = [];
+  const waiting: Array<() => void> = [];
+  let taken = 0;
+  ws.on("message", (d) => {
+    frames.push(d.toString());
+    waiting.shift()?.();
+  });
+
   return {
     ws,
-    /** Resolves with the next text frame the server sends. */
-    next: () => new Promise<string>((resolve) => ws.once("message", (d) => resolve(d.toString()))),
+    frames,
+    /** Resolves with the next text frame the server sends that nothing has taken yet. */
+    async next(): Promise<string> {
+      while (frames.length <= taken) await new Promise<void>((resolve) => waiting.push(resolve));
+      taken += 1;
+      return frames[taken - 1];
+    },
     stop() {
       ws.terminate();
       stop();
@@ -273,6 +292,75 @@ describe("the device handshake", () => {
       const hello = JSON.parse(await reply) as { session_id: string };
       assert.match(hello.session_id, /^s[0-9a-z]+$/);
       assert.equal(ws.readyState, WebSocket.OPEN, "the socket is still usable for the next turn");
+    } finally {
+      stop();
+    }
+  });
+
+  it("asks a gadget that advertises its own tools, and reads the answer", async () => {
+    // The gadget is the MCP server and the bridge is the client (D1), so the whole of
+    // this exchange is the bridge speaking first: the board's own hello carries
+    // `features: {mcp: true}` and nothing else on the wire ever mentions it.
+    const { ws, next, stop } = await connectedDevice();
+    try {
+      ws.send(JSON.stringify({ ...deviceHello, features: { mcp: true, glyph_push: true } }));
+
+      const greeting = JSON.parse(await next()) as { type: string; session_id: string };
+      assert.equal(greeting.type, "hello");
+      const initialize = JSON.parse(await next()) as {
+        session_id: string;
+        type: string;
+        payload: { jsonrpc: string; id: number; method: string };
+      };
+      assert.equal(initialize.type, "mcp", "the envelope the firmware routes on");
+      assert.equal(initialize.session_id, greeting.session_id, "the same session the hello named");
+      assert.equal(initialize.payload.method, "initialize");
+      assert.equal(typeof initialize.payload.id, "number", "the firmware refuses a method with no numeric id (D2)");
+
+      // The gadget answers as the firmware does, and the bridge goes on to ask what it
+      // can do — through the same door the reply just came in by.
+      ws.send(
+        JSON.stringify({
+          type: "mcp",
+          payload: {
+            jsonrpc: "2.0",
+            id: initialize.payload.id,
+            result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "xiaozhi-s3", version: "1.0.0" } },
+          },
+        })
+      );
+      const list = JSON.parse(await next()) as { payload: { id: number; method: string } };
+      assert.equal(list.payload.method, "tools/list");
+
+      ws.send(
+        JSON.stringify({
+          type: "mcp",
+          payload: {
+            jsonrpc: "2.0",
+            id: list.payload.id,
+            result: { tools: [{ name: "self.get_device_status", description: "…", inputSchema: { type: "object", properties: {} } }], nextCursor: "" },
+          },
+        })
+      );
+
+      // The channel is a passenger on this socket, not a mode it enters: the session
+      // comes out of the exchange as able to take a turn as it went in.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(ws.readyState, WebSocket.OPEN);
+    } finally {
+      stop();
+    }
+  });
+
+  it("asks nothing of a gadget that advertises nothing", async () => {
+    // A device that does not say it has tools is one the bridge asks nothing of, and
+    // the handshake is still the only reply it receives (D4).
+    const { ws, frames, stop } = await connectedDevice();
+    try {
+      ws.send(JSON.stringify(deviceHello));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(frames.length, 1, `only the hello came back: ${JSON.stringify(frames)}`);
+      assert.equal((JSON.parse(frames[0]) as { type: string }).type, "hello");
     } finally {
       stop();
     }

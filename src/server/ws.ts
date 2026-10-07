@@ -1,12 +1,15 @@
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
+import { describeCommand, matchCommand, type GadgetCommand } from "../commands.js";
 import { takeTurn, type Conversations } from "../conversation.js";
 import { authorizeDevice, describeDenial } from "../credentials.js";
+import { createGadget } from "../gadget.js";
 import { createListening } from "../listening.js";
 import { err, info, log, section, warn } from "../log.js";
 import type { PersonaCatalog } from "../personas.js";
-import { isAbort, isHello, isListen, parseClientMessage, serverHello } from "../protocol/messages.js";
+import { advertisesTools } from "../protocol/mcp.js";
+import { isAbort, isHello, isListen, isMcp, parseClientMessage, serverHello } from "../protocol/messages.js";
 import { createSpeaker } from "../speech.js";
 
 /**
@@ -115,6 +118,12 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
     // The person's voice, for the life of the socket: the decoder belongs to the
     // window rather than to the process, so this is the only place it is held.
     const listening = createListening(config, clock);
+    // The gadget itself, for the life of the socket: the tool channel the bridge opens
+    // to it, and the condition it reports about itself. The catalog that channel reads
+    // is a property of the firmware this session is talking to, so it belongs to this
+    // connection and not to the process — and nothing here is awaited by a turn (D3,
+    // D4).
+    const gadget = createGadget(ws, config, session.id);
     // One turn at a time per device. A `listen start` arriving while a reply is
     // still playing is either a person talking over it or the echo of a wake word
     // (6.5); neither is a second turn, and starting one would talk over a reply
@@ -164,12 +173,45 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       turning = true;
       const controller = new AbortController();
       turn = controller;
+      /**
+       * The command this turn turned out to be, or `null` for a turn that was a turn.
+       *
+       * It is set from inside `onUser`, because the transcript is the first moment a
+       * command is knowable at all — the platform decodes the utterance and the bridge
+       * has no recogniser of its own (D12) — and read after the turn has unwound, by
+       * which point there is nothing left to say and a setting to change (4.1).
+       */
+      let commanded: GadgetCommand | null = null;
       log(
         `turn from speech: ${upload.seconds.toFixed(2)}s of the person's own voice` +
           `${upload.failed ? `, ${upload.failed} frame(s) undecodable` : ""}`
       );
 
+      // What the turn is asked with, so that "the conversation is the one it would
+      // have been" is a thing an operator reads rather than infers (4.3). A command
+      // is left out of the conversation before it is ever recorded, and a command
+      // that had been recorded would appear here — as one more of the person's own
+      // lines, since the turn it came from was dropped before the platform answered
+      // anything and has no reply of its own to carry. Only the person's side is
+      // printed: the replies are the model's prose, already counted by `turn ended`,
+      // and a digest carrying them would be a paragraph in the middle of the log.
+      // Read here as well as in `takeTurn` — this is where a turn is narrated, and
+      // nothing between the two reads can change what the conversation holds.
+      const history = services.conversations.history(deviceId);
+      const asked = history
+        .filter((message) => message.role === "user")
+        .map((message) => `user ${JSON.stringify(message.content).slice(0, 80)}`);
+      log(
+        `turn asked with ${history.length} earlier message(s)` +
+          `${asked.length === 0 ? "" : `: ${asked.join(" / ")}`}`
+      );
+
       try {
+        // What the gadget last reported about itself, read once per turn and not
+        // held: a turn is asked with the condition as it stands, and a gadget that
+        // reported nothing is asked for exactly the turn it would have been asked for
+        // had none of this existed (2.2).
+        const condition = gadget.condition();
         const result = await takeTurn(
           config,
           services.catalog,
@@ -178,6 +220,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
           {
             language: config.language,
             audio: { filename: "turn.wav", contentType: "audio/wav", data: upload.wav },
+            ...(condition !== null ? { gadgetCondition: condition } : {}),
           },
           {
             onUser: (said) => {
@@ -187,8 +230,24 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
               // from the stream's own transcription rather than from a second one here,
               // because the platform is the thing that decodes the utterance (D12) and a
               // bridge that transcribed as well would be answering from different words
-              // than it is about to speak to.
+              // than it is about to speak to. A command reaches the display through this
+              // same line and no other, which is what leaves the gadget naming what was
+              // asked of it (requirement 4).
               if (said !== "") sendJson({ type: "stt", text: said });
+
+              // The person may have been giving the gadget an instruction rather than
+              // taking their turn. The turn stops here — the abort reaches the platform's
+              // stream before it produces a reply, so nothing of its answer is spoken,
+              // and the speaker's `finish()` will find a bracket that was never opened
+              // (4.1, D8). The change itself is made once the turn has unwound, below.
+              const command = matchCommand(config.language, said);
+              if (command === null) return;
+              commanded = command;
+              log(
+                `the person's words are a command — asked for ${describeCommand(command)}; ` +
+                  `answering it on the gadget and dropping the turn`
+              );
+              controller.abort();
             },
             onSentence: (sentence) => speaker.speak(sentence),
             // The platform's remark about a turn it did not act on. Surfaced, and said
@@ -210,7 +269,16 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
           controller.signal
         );
 
-        if (!result.served) {
+        if (commanded !== null) {
+          // Requirement 2, and the only place in the session where a command is carried
+          // out. Reported either way: a command that did not take leaves the gadget as it
+          // was, which is where the person already was, and the line is what an operator
+          // has to act on (D7). The turn ends with it rather than beside it, so the log
+          // reads as one exchange and not as a turn followed by an unrelated change.
+          const outcome = await gadget.apply(commanded);
+          if (outcome.ok) log(`command carried out: ${outcome.detail}`);
+          else warn(`command not carried out: ${outcome.detail}`);
+        } else if (!result.served) {
           // No persona answered, which is 3.4's miss rather than a failure of the turn.
           // The device has already been left in a state to take the next one.
           err(`turn not served: ${result.message}`);
@@ -233,6 +301,27 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         speaker.finish();
         if (turn === controller) turn = null;
         turning = false;
+        // A turn the bridge said nothing for leaves the device exactly where it was: no
+        // bracket was opened, so it never left `Listening`, and being already in the
+        // state it would come back to, it never sends the `listen start` that opens the
+        // next window. Without this, every frame the person speaks from here on is
+        // counted and not judged — silence on their side of a session that looks
+        // healthy — until something wakes the gadget and opens a window by another
+        // route. The window is the bridge's own state (D9), so the bridge is the one to
+        // reopen it: requirement 4 asks that a command leave the gadget able to take the
+        // next turn rather than waiting for one. Read after `finish()`, which is where
+        // the answer is fixed, and gated on the window being shut: a turn that *did*
+        // speak is followed by the device's own `listen start`, and opening a second
+        // window under that one would judge its opening audio against decisions already
+        // taken in it (6.7).
+        if (!session.listening && !speaker.spokeThisTurn()) {
+          session.listening = true;
+          listening.open();
+          log(
+            `no bracket was opened for that turn — the window is open again, since the ` +
+              `device never left Listening and will not send a listen start (requirement 4)`
+          );
+        }
       }
     }
 
@@ -331,6 +420,14 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         );
         ws.send(JSON.stringify(serverHello(session.id, config)));
         log(`server hello sent (opus ${config.serverRate} Hz / ${config.frameMs} ms, framing v${config.framing})`);
+        // The gadget advertised its own controls, so the bridge asks what they are (1.1)
+        // and what condition it is in (2.1). Asked here, once, and awaited by nothing: a
+        // gadget that never answers leaves this session running exactly as it would have
+        // (D4).
+        if (advertisesTools(msg.features)) {
+          log(`device advertises MCP — asking what it can be asked to do (1.1)`);
+          void gadget.start();
+        }
         return;
       }
 
@@ -376,6 +473,16 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         // device was just called by.
         listening.open();
         session.listening = false;
+        return;
+      }
+
+      if (isMcp(msg)) {
+        // A reply to something the bridge asked the gadget. Anything else on this
+        // channel is the gadget speaking first, which it has no path to do (D1) — so a
+        // payload nothing is waiting for is logged rather than dispatched, since
+        // acting on a message nobody asked for is the one thing this direction of the
+        // protocol never means.
+        if (!gadget.receive(msg.payload)) info(`mcp payload with no request waiting for it: ${JSON.stringify(msg.payload).slice(0, 160)}`);
         return;
       }
 

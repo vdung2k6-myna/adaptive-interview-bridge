@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
-import { createSpeaker, type SpeakerSocket } from "../src/speech.js";
+import { createSpeaker, type SpeakerSchedule, type SpeakerSocket } from "../src/speech.js";
 import type { TurnSentence } from "../src/turn.js";
 
 /**
@@ -39,6 +39,7 @@ const config: BridgeConfig = {
   frameMs: FRAME_MS,
   ...ENDPOINTER_DEFAULTS,
   historyTurns: 20,
+  commandStep: 10,
   language: "english",
 };
 
@@ -92,10 +93,21 @@ const framesOf = (sent: Sent[]) => sent.filter((s) => s.binary);
 /** What went out, as a sequence: a frame, or the JSON the device was sent. */
 const spoken = (sent: Sent[]) => sent.map((s) => (s.binary ? "frame" : jsonOf(s)));
 
+/**
+ * A scheduler that runs now. The frames are paced on the turn's own clock (D16), and
+ * most of what this file asserts is *what order* things left in — which the pacing
+ * does not change, since a turn reserves its slots in the order its frames arrived.
+ * So the pacing is taken out of these checks, and asserted on its own below.
+ */
+const runNow: SpeakerSchedule = (run) => run();
+
+const speakerFor = (socket: SpeakerSocket, clock?: () => number) =>
+  createSpeaker(socket, config, clock, runNow);
+
 describe("the bracket around a reply", () => {
   it("opens before the first frame and closes at the end of the turn", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     // The start, the sentence's own announcement, and its frame — in that order:
@@ -113,7 +125,7 @@ describe("the bracket around a reply", () => {
 
   it("opens once for a reply of many sentences, not once per sentence", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     speaker.speak(sentence(1, wav(2)));
@@ -132,7 +144,7 @@ describe("the bracket around a reply", () => {
     // The rule the firmware enforces, asserted as a property rather than as a
     // sequence: every frame sits after the start and before the stop.
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     speaker.speak(sentence(1, null)); // nothing speakable in this one (5.5)
@@ -149,7 +161,7 @@ describe("the bracket around a reply", () => {
 
   it("says nothing at all when a reply has nothing speakable in it (5.5)", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, null));
     speaker.finish();
@@ -159,7 +171,7 @@ describe("the bracket around a reply", () => {
 
   it("closes only what it opened, so a second finish is harmless", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     speaker.finish();
@@ -175,7 +187,7 @@ describe("the bracket around a reply", () => {
 
   it("does not speak to a device that has already gone", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
     speaker.speak(sentence(0, wav(1)));
 
     socket.readyState = 3; // CLOSED
@@ -195,7 +207,7 @@ describe("the bracket around a reply", () => {
 describe("what the bracket carries", () => {
   it("carries the declared framing in front of every packet", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
     speaker.speak(sentence(0, wav(1)));
 
     const [frame] = framesOf(socket.sent);
@@ -206,7 +218,7 @@ describe("what the bracket carries", () => {
 
   it("counts the audio it has sent for the life of the socket", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
     assert.equal(speaker.sessionMs(), 0);
 
     speaker.speak(sentence(0, wav(3)));
@@ -229,7 +241,7 @@ describe("what the bracket carries", () => {
     // turn a gadget had ever taken.
     let now = 1_000;
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config, () => now);
+    const speaker = speakerFor(socket, () => now);
 
     assert.equal(speaker.drainingUntil(), null, "nothing has been spoken, so nothing is playing");
 
@@ -259,7 +271,7 @@ describe("what the bracket carries", () => {
     // for, and the previous turn's deadline is about audio that is still playing.
     let now = 1_000;
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config, () => now);
+    const speaker = speakerFor(socket, () => now);
 
     speaker.speak(sentence(0, wav(2)));
     speaker.finish();
@@ -273,7 +285,7 @@ describe("what the bracket carries", () => {
 
   it("skips a sentence it cannot speak rather than ending the turn", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     // Bytes that are not a WAV: a defect in one sentence, not a reason to drop
     // the rest of a reply that has already been generated.
@@ -289,7 +301,7 @@ describe("what the bracket carries", () => {
 describe("what the device is told to display (5.4)", () => {
   it("announces each spoken sentence, in order, with its own text", () => {
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     speaker.speak(sentence(1, wav(1)));
@@ -314,7 +326,7 @@ describe("what the device is told to display (5.4)", () => {
     // that says nothing: it would leave words on the screen for a sentence the
     // reply never spoke, and stay there through the silence.
     const socket = fakeSocket();
-    const speaker = createSpeaker(socket, config);
+    const speaker = speakerFor(socket);
 
     speaker.speak(sentence(0, wav(1)));
     speaker.speak(sentence(1, null));
@@ -331,5 +343,93 @@ describe("what the device is told to display (5.4)", () => {
       ],
       "sentence 1 is absent from the display as well as from the audio"
     );
+  });
+});
+
+describe("the pace of the downlink (D16)", () => {
+  /** A clock and a scheduler that move only when the test says so. */
+  function timers(start: number) {
+    let now = start;
+    const pending: { at: number; run: () => void }[] = [];
+    return {
+      clock: () => now,
+      schedule: (run: () => void, delayMs: number) => {
+        pending.push({ at: now + delayMs, run });
+      },
+      /** Run everything due within `ms`, in due order, and land on the far side. */
+      advance(ms: number) {
+        const until = now + ms;
+        for (;;) {
+          pending.sort((a, b) => a.at - b.at);
+          const next = pending[0];
+          if (next === undefined || next.at > until) break;
+          pending.shift();
+          now = next.at;
+          next.run();
+        }
+        now = until;
+      },
+      pending: () => pending.length,
+    };
+  }
+
+  it("sends the lead at once and the rest no faster than realtime", () => {
+    // The device decodes from a queue of 20 frames — 1.2s — and drops a frame it has
+    // no room for without a line in either log, so a turn must not be written out as
+    // fast as the platform produces it. Measured on hardware: 17.46s of audio handed
+    // over in about six seconds, of which the device played the first 1.2s.
+    const t = timers(1_000);
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, t.clock, t.schedule);
+
+    // Ten frames of 60ms: 600ms of audio.
+    speaker.speak(sentence(0, wav(10)));
+
+    const lead = framesOf(socket.sent).length;
+    assert.ok(lead >= 1 && lead < 10, `the lead went out with the bracket (${lead} frames)`);
+    assert.equal(lead + t.pending(), 10, "and every frame is either out or on the clock");
+    assert.ok(lead <= 5, `the lead stays well inside the device's 20-frame queue (${lead})`);
+
+    // One frame duration buys exactly one frame, and no more.
+    t.advance(FRAME_MS);
+    assert.equal(framesOf(socket.sent).length, lead + 1);
+
+    // The close is not sent here: frames of this turn are still on the clock, and a
+    // device told to stop discards the frames that follow it (delta 4).
+    speaker.finish();
+    assert.equal(
+      socket.sent.filter((s) => !s.binary && jsonOf(s).state === "stop").length,
+      0,
+      "the bracket stays open for as long as the audio it qualifies"
+    );
+
+    // The deadline is the turn's whole audio rather than the part that has left,
+    // because `finish()` arms it while the tail is still on the clock (6.6).
+    assert.equal(speaker.drainingUntil(), 1_000 + 10 * FRAME_MS + DRAIN_GUARD_MS);
+
+    t.advance(10 * FRAME_MS);
+    assert.equal(framesOf(socket.sent).length, 10, "the turn finishes on its own clock");
+    assert.equal(jsonOf(socket.sent.at(-1)!).state, "stop", "and the close follows the last frame");
+  });
+
+  it("does not push the first frame past the reply's last text event (5.3)", () => {
+    // The pacing is the one thing here that could delay the first audio until after
+    // the stream's `done` — the requirement the spec calls the most likely to regress
+    // silently. The lead is what stops it: without one, frame 0 would be due a frame
+    // duration after the bracket opened, and any lateness in the clock would land it
+    // after the text had finished.
+    const t = timers(1_000);
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, t.clock, t.schedule);
+
+    speaker.speak(sentence(0, wav(4)));
+    assert.deepEqual(spoken(socket.sent), [
+      { type: "tts", state: "start" },
+      { type: "tts", state: "sentence_start", text: "sentence 0" },
+      "frame",
+      "frame",
+      "frame",
+      "frame",
+    ]);
   });
 });

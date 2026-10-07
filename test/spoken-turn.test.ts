@@ -129,6 +129,7 @@ function configFor(platformUrl: string): BridgeConfig {
     frameMs: FRAME_MS,
     ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
+    commandStep: 10,
     language: "english",
   };
 }
@@ -364,6 +365,231 @@ describe("a person speaks to the gadget", () => {
       assert.ok(
         device.messages.some((m) => m.includes("the third time")),
         "and the turn after the refusals was taken and transcribed"
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("asks the turn with the gadget's own condition, having read it at the handshake", async () => {
+    // 2.1 and 2.2, end to end and through the real socket. The board's hello is the
+    // only place its tool channel is mentioned (D1), so everything after it is the
+    // bridge asking: the handshake, the catalog, and — new here — the gadget's own
+    // status, which is what a turn is asked with so that a reply may account for a
+    // gadget that is nearly flat rather than describing one at full battery.
+    const status = {
+      audio_speaker: { volume: 42 },
+      screen: { brightness: 68, theme: "dark" },
+      battery: { level: 12, charging: false },
+      network: { type: "wifi", ssid: "nha", signal: "weak" },
+    };
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "how are you" }));
+      res.write(sse("done", { fullText: "ok" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      // The gadget's side of the exchange, answered the way the firmware answers:
+      // by method, echoing the id it was asked with. A real board's reply arrives
+      // through the same socket this test is holding, as `{"type":"mcp","payload":…}`.
+      // Each method is asked once, so finding it by name is finding the only one.
+      const asked = (method: string): number | null => {
+        for (const raw of device.messages) {
+          const msg = JSON.parse(raw) as { type?: string; payload?: { id?: number; method?: string } };
+          if (msg.type === "mcp" && msg.payload?.method === method && typeof msg.payload.id === "number") {
+            return msg.payload.id;
+          }
+        }
+        return null;
+      };
+      const replyTo = async (method: string, result: unknown): Promise<void> => {
+        await device.until(() => asked(method) !== null, `the bridge to ask ${method}`);
+        device.send({ type: "mcp", payload: { jsonrpc: "2.0", id: asked(method), result } });
+      };
+
+      await replyTo("initialize", { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "xiaozhi-s3", version: "1.0.0" } });
+      await replyTo("tools/list", {
+        tools: [{ name: "self.get_device_status", description: "…", inputSchema: { type: "object", properties: {} } }],
+        nextCursor: "",
+      });
+      await replyTo("tools/call", {
+        content: [{ type: "text", text: JSON.stringify(status) }],
+        isError: false,
+      });
+
+      // The condition is held from the reply, which the bridge reads off the socket
+      // and into the session on its own turn of the loop: the frames above are
+      // written and answered, and the session still has to look at them.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to reach the platform");
+
+      // The platform's own view of the turn: the persona's words, and the gadget's
+      // report after them. Nothing between the two is the bridge's.
+      const body = platform.requests[0]!.body.toString("utf8").replace(/\r\n/g, "\n");
+      const at = body.indexOf('name="systemPrompt"');
+      assert.ok(at > 0, "the turn carried a systemPrompt");
+      const prompt = body.slice(body.indexOf("\n\n", at) + 2, body.indexOf("\n--", at));
+      assert.ok(
+        prompt.startsWith("You are a patient language partner."),
+        `the persona's own words still open the prompt: ${prompt}`
+      );
+      assert.match(prompt, /speaker volume 42 of 100/);
+      assert.match(prompt, /brightness 68 of 100, theme dark/);
+      assert.match(prompt, /battery 12%, not charging/);
+      assert.match(prompt, /network wifi "nha", signal weak/);
+      assert.ok(!/nearly flat|low battery/i.test(prompt), `the bridge added no reading of its own: ${prompt}`);
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+});
+
+describe("a command spoken to the gadget", () => {
+  it("changes the setting, names it on the display, and answers nothing", async () => {
+    // 4.1, requirement 2 and requirement 4, through the real socket.
+    //
+    // The command is knowable only once the platform has transcribed it — the bridge
+    // has no recogniser of its own (D12) — so the turn is already under way before the
+    // bridge can tell that it is not a turn at all. That is why the abort, and not a
+    // check made earlier, is what leaves nothing of the platform's answer spoken; and
+    // why the transcript reaching the device's display is allowed to stay, since the
+    // requirement asks for exactly that: the display names the command.
+    const platform = await stubPlatform((res, call) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (call > 0) {
+        res.write(sse("user", { text: "va bay gio" }));
+        res.write(sse("done", { fullText: "ok" }));
+        res.end();
+        return;
+      }
+      res.write(sse("user", { text: "turn it up" }));
+      // A reply the platform had already produced, written into the same read as the
+      // transcript — which is what a small reply on a fast link arrives as. A bridge that
+      // stopped dispatching only at the next read would speak this sentence into a turn
+      // it had just cancelled, and the person would hear the bridge answer a command it
+      // was answering itself.
+      res.write(sse("sentence", { index: 0, text: "There, it is louder.", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: "There, it is louder." }));
+      res.end();
+    });
+
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      // The gadget's side of the exchange, answered the way the firmware answers: by
+      // method, echoing the id it was asked with. `asks` is a pure read of what the
+      // bridge has sent, and each reply below answers the nth ask of its method, so the
+      // cursor is the ask count rather than a mark on a message.
+      interface McpFrame {
+        type?: string;
+        state?: string;
+        text?: string;
+        payload?: { method?: string; params?: { name?: string; arguments?: Record<string, unknown> } };
+      }
+      const frames = (): McpFrame[] => device.messages.map((m) => JSON.parse(m) as McpFrame);
+      const asks = (method: string): number[] =>
+        frames()
+          .filter((f) => f.type === "mcp" && f.payload?.method === method)
+          .map((f) => (f.payload as { id?: number }).id)
+          .filter((id): id is number => typeof id === "number");
+      const answer = async (method: string, nth: number, result: unknown): Promise<void> => {
+        await device.until(() => asks(method).length > nth, `ask ${nth + 1} of ${method}`);
+        device.send({ type: "mcp", payload: { jsonrpc: "2.0", id: asks(method)[nth], result } });
+      };
+      const reported = (volume: number) => ({
+        content: [{ type: "text", text: JSON.stringify({ audio_speaker: { volume } }) }],
+        isError: false,
+      });
+
+      await answer("initialize", 0, {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        serverInfo: { name: "xiaozhi-s3", version: "1.0.0" },
+      });
+      await answer("tools/list", 0, {
+        tools: [
+          { name: "self.get_device_status", description: "…", inputSchema: { type: "object", properties: {} } },
+          {
+            name: "self.audio_speaker.set_volume",
+            description: "…",
+            inputSchema: {
+              type: "object",
+              properties: { volume: { type: "integer", minimum: 0, maximum: 100 } },
+              required: ["volume"],
+            },
+          },
+        ],
+        nextCursor: "",
+      });
+      // The handshake's own read (2.1), so that the session has a catalog to call through
+      // before the command arrives.
+      await answer("tools/call", 0, reported(42));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to reach the platform");
+
+      // The bridge answers the command itself, once the turn has unwound: the read the
+      // relative change is computed from, the call, and the read that confirms it (3.3).
+      await answer("tools/call", 1, reported(42));
+      await answer("tools/call", 2, { content: [{ type: "text", text: "true" }], isError: false });
+      await answer("tools/call", 3, reported(52));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const sent = frames();
+
+      // Requirement 4 — what the display shows for such a turn is the person's own words.
+      assert.deepEqual(
+        sent.filter((f) => f.type === "stt").map((f) => f.text),
+        ["turn it up"]
+      );
+
+      // And nothing is spoken for it: no bracket, no frames, and so no `tts stop` either.
+      // `finish()` finds a bracket that was never opened and leaves the session's own
+      // record of how long the speaker is busy exactly where a person who had not spoken
+      // would have left it (4.1).
+      assert.deepEqual(sent.filter((f) => f.type === "tts"), []);
+      assert.equal(device.binaries.length, 0, "not one frame of the platform's answer was played");
+
+      // The setting moved — from what the gadget reported at that moment, by the step the
+      // deployment configured (D6). 42 is the gadget's own number and 52 is this bridge's
+      // arithmetic on it, which is the half of 3.3 that only the wire can show.
+      const call = sent.find((f) => f.payload?.params?.name === "self.audio_speaker.set_volume");
+      assert.ok(call, "the gadget was asked to change its volume");
+      assert.deepEqual(call.payload?.params?.arguments, { volume: 52 });
+
+      // 4.2, from the platform's side — the next interview turn is asked with the
+      // conversation the command did not add to. And requirement 4's second scenario
+      // with it: the gadget is left able to take that next turn. No `listen start` is
+      // sent here, because the device does not send one: a turn the bridge never spoke
+      // for never took the device out of `Listening`, so it has no state to come back
+      // to and no reason to announce one — the board was watched doing exactly this on
+      // 2026-10-07, and the bridge sat with no window open for the ninety seconds that
+      // followed. The window is the bridge's own (D9), so a bridge that does not reopen
+      // it hears the person's next words as frames counted and not judged.
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the next turn to be served");
+
+      const next = platform.requests[1]!.body.toString("latin1");
+      const at = next.indexOf('name="history"');
+      assert.ok(at > 0, "every turn carries a history field");
+      assert.equal(
+        next.slice(next.indexOf("\r\n\r\n", at) + 4, next.indexOf("\r\n--", at)),
+        "[]",
+        "the command is not in the conversation the interview is asked to continue"
       );
     } finally {
       device.stop();

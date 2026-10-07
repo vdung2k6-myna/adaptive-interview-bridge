@@ -247,6 +247,12 @@ async function consumeStream(
       buffer = blocks.pop() ?? "";
 
       for (const block of blocks) {
+        // Checked per block rather than only per read, because a cancel can arrive from
+        // *inside* the sink — 4.1 aborts the turn from the `user` event it is handed —
+        // and the rest of what came in that same read is already parsed and in hand. A
+        // sentence in it would otherwise be spoken into a turn that has been cancelled,
+        // which is the one thing a cancelled turn may not do (D15, requirement 4).
+        if (signal?.aborted) break;
         const event = parseSseBlock(block);
         if (!event) continue;
         if (event.name === "done" || event.name === "error" || event.name === "notice") settled = true;

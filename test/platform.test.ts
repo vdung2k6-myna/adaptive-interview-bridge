@@ -35,6 +35,7 @@ function configFor(apiAuthToken: string): BridgeConfig {
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
+    commandStep: 10,
     language: "english",
   };
 }

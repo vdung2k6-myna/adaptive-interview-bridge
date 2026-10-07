@@ -4,10 +4,12 @@ import type { BridgeConfig } from "../config.js";
  * The text messages the device and the bridge exchange, to the depth this service
  * needs them.
  *
- * Only messages the bridge acts on are modelled. The display and capability
- * messages (`mcp`, `iot`, `alert`) are relayed or ignored by design (D8), and
- * giving them types here would suggest the bridge does something with them — the
- * next reader would look for the handling that is not there.
+ * Only messages the bridge acts on are modelled, and each only to the depth of the
+ * acting. `mcp` is routed and nothing more: its payload is the gadget's tool channel,
+ * a conversation with its own ids and its own replies, and it lives in `mcp.ts` —
+ * what is typed here is the frame that carries it, not what it carries. `iot` and
+ * `alert` are not acted on at all and are given no type, which is what keeps the next
+ * reader from looking for handling that is not there (D8).
  */
 
 export interface AudioParams {
@@ -42,7 +44,19 @@ export interface AbortMessage {
   reason?: string;
 }
 
-export type ClientMessage = ClientHello | ListenMessage | AbortMessage | { type: string; [k: string]: unknown };
+/** A frame of the gadget's tool channel. `payload` is left unread here on purpose:
+ *  what it must be is a JSON-RPC message, and how one is read is `mcp.ts`'s business. */
+export interface McpMessage {
+  type: "mcp";
+  payload?: unknown;
+}
+
+export type ClientMessage =
+  | ClientHello
+  | ListenMessage
+  | AbortMessage
+  | McpMessage
+  | { type: string; [k: string]: unknown };
 
 /** Parse a text frame. Returns null rather than throwing: a device that sends
  * something unparsable is a thing to log and survive, not to end a connection
@@ -69,6 +83,10 @@ export function isListen(msg: ClientMessage): msg is ListenMessage {
 
 export function isAbort(msg: ClientMessage): msg is AbortMessage {
   return msg.type === "abort";
+}
+
+export function isMcp(msg: ClientMessage): msg is McpMessage {
+  return msg.type === "mcp";
 }
 
 /**

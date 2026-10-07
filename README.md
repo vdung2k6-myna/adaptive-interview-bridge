@@ -8,10 +8,12 @@ to connect, then open a WebSocket and say hello. The platform
 between them — it answers the device's OTA request, holds the device's socket,
 and will translate every spoken turn into the platform's turn API.
 
-This repository is being built task by task, and **today it speaks but does not
-listen**: the handshake works, each device is bound to a persona, and a turn's
-reply reaches the device's own speaker in Opus — but nothing the *person* says yet
-becomes a turn. See [Status](#status).
+This repository is being built task by task, and **today it speaks and it listens**:
+the handshake works, each device is bound to a persona, a turn's reply reaches the
+device's own speaker in Opus, and what the person says comes back as a turn of its
+own — closed by this service's own endpointer rather than by anything the device
+sends. A short command said to the gadget is the exception: it is not sent to the
+platform at all, and the bridge carries it out itself. See [Status](#status).
 
 ## Running it
 
@@ -241,6 +243,104 @@ question that is no longer in it. The current turn is not part of what is sent: 
 platform appends it to the history itself, so sending it as well would put the same
 question to the model twice.
 
+### Time to first audio
+
+Measured on the development board on 2026-10-06, over four spoken turns in one
+session (7.1). The clock is the bridge's own — seconds since it started, the same
+stamp as every line in its log.
+
+| | |
+| --- | --- |
+| Board | ESP32-S3-WROOM-1 N16R8, board type `bread-compact-wifi-lcd` (`docs/hardware.md`) |
+| Network | device on Wi-Fi at `192.168.1.50` → the bridge at `192.168.1.101:8001`, one LAN; bridge → the platform at `127.0.0.1:4000` |
+| Model | `deepseek-v4.1-flash:cloud` through Ollama — a cloud model, so the reply leg leaves this machine |
+| Speech in | `stt` on audiocpp |
+| Speech out | Kokoro, Vietnamese — the engine `engineForLanguage` picks for `language=vietnamese`, voice `diem_trinh` |
+
+Two anchors, because neither end of this is logged directly. The endpointer closes a
+turn 900 ms after the person's last word, so **the end of speech is the turn's close
+minus the silence threshold** — derived, not read. The first audio is the
+`sentence 0` line, written just after that sentence's first frame went to `socket.send`
+(`src/speech.ts:234`).
+
+| Turn | closed | transcribed | `sentence 0` sent | end of speech → first audio | closed → first audio |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 336.13 | 338.03 | 343.78 | **8.55 s** | 7.65 s |
+| 2 | 362.88 | 364.68 | 370.36 | **8.38 s** | 7.48 s |
+| 3 | 383.62 | 385.65 | 390.24 | **7.52 s** | 6.62 s |
+| 4 | 546.81 | 548.49 | 551.94 | **6.03 s** | 5.13 s |
+
+**6.0–8.6 s** from the person's last word; 7.6 s across the middle of the four. That
+spread is the reproducibility check 7.1 asks for: four runs, no change to the
+deployment between them, agreeing to within 2.5 s.
+
+The shape of the wait is the same every time. The 900 ms silence threshold is this
+service's own and is spent by construction; the rest splits like this.
+
+| Turn | silence threshold | upload + transcribe | reply → its first sentence's audio |
+| --- | --- | --- | --- |
+| 1 | 0.90 s | 1.90 s | 5.75 s |
+| 2 | 0.90 s | 1.80 s | 5.68 s |
+| 3 | 0.90 s | 2.03 s | 4.59 s |
+| 4 | 0.90 s | 1.68 s | 3.45 s |
+
+So about a fifth of the wait is the bridge deciding the person has stopped, a
+quarter is the platform hearing them, and **the large half is the reply being
+generated and its first sentence spoken** — the leg that runs through the cloud
+model. The bridge's own work does not show up as a stage of its own here; it is
+inside those two legs rather than between them.
+
+One thing the figures are not. `sentence 0` marks the moment the sentence's first
+frame went to `socket.send`, not the moment the gadget played it; the hop in between
+is one LAN segment. That is a send-side marker all the same, and the figures above
+were measured before the downlink was paced (5.6, D16) — which does not move it, since
+the pacing sends a turn's first frames the instant the bracket opens and spreads only
+the rest. What the pacing changed is the **tail**: a turn is still on its way when the
+platform has finished producing it, so `tts stop` follows the turn's last frame rather
+than its last sentence, which is what lets the gadget play the whole reply rather than
+the first 1.2 s of it. Delta 5 of `docs/device-protocol.md` is the measurement that
+made the case for it; the confirmation on a device is 5.6's own. That confirmation is
+of the **tail** — the whole reply playing rather than its first 1.2 s — and not of the
+drain estimate 6.6 arms, which is anchored on the turn's own clock and so is accurate
+only while the platform produces no slower than realtime. A turn on 2026-10-07 where
+it did not is why D16's claim carries that condition.
+
+### The bound
+
+The deployment's bound is **10 s from the person's last word to the first audio of the
+reply** (7.2). The number is set by the rule `design.md` gives this bar — real margin
+over the worst observed rather than the best — against the 8.55 s worst above, and
+**every turn recorded here is inside it**.
+
+The paced deployment was measured again on the same board in one session, after the
+downlink was rewritten (5.6). Same clock and the same two anchors as the table above:
+
+| Turn | closed | transcribed | `sentence 0` sent | end of speech → first audio |
+| --- | --- | --- | --- | --- |
+| 1 | 342.10 | 343.87 | 346.30 | **5.10 s** |
+| 2 | 453.98 | 455.63 | 458.80 | **5.72 s** |
+| 3 | 481.20 | 483.26 | 486.52 | **6.22 s** |
+| 4 | 605.96 | 608.09 | 611.72 | **6.66 s** |
+
+Where the rest of the wait is — a bound says only that the gadget is acceptable, not
+why it is not faster:
+
+| | silence threshold | upload + transcribe | reply → its first sentence's audio |
+| --- | --- | --- | --- |
+| paced, 4 turns | 0.90 s | 1.65–2.13 s | 2.43–3.63 s |
+| above, 4 turns | 0.90 s | 1.68–2.03 s | 3.45–5.75 s |
+
+The bridge's own two legs are the same in both runs and are about a quarter of the
+budget: deciding the person has stopped, and hearing them. What moved is the third —
+the reply generated and its first sentence synthesised — which the bridge does not own,
+and which is therefore the stage the excess over a snappier figure falls in. That is
+also the leg the drift `design.md` records as unexplained sits in: the spike's own runs
+disagreed on this one and not on the other two. Narrowing it is a platform question.
+
+The hop from `sentence 0` to the gadget playing it is in neither leg — one LAN segment,
+and one the bridge cannot see. That is why these are send-side figures. What closed
+5.6 was the gadget's own ear instead, and it heard each reply whole.
+
 ### Adding a device
 
 Two lines in `.env`, and no code:
@@ -351,13 +451,17 @@ only — it never emits), `@types/node`, `@types/ws`.
 What this repository is for is the change
 `adaptive-interview-gadget-xiaozhi-bridge` in the `team-plans` OpenSpec store;
 its `design.md` and `tasks.md` are the specification this code is written
-against, and its task numbers are used below.
+against, and its task numbers are used below. The gadget's own tools were built
+under a second change in the same store, `adaptive-interview-gadget-device-tools`,
+and the one row they own is numbered from that change rather than from this one.
 
 | | |
 | --- | --- |
 | Works | The OTA answer, the per-device credential, the connect and its refusal, the hello exchange, the session id, the platform credential held on this side of the boundary and written up for an operator, and — the things that use it — the persona catalog read from the platform at start and cached, the binding that maps each device onto one persona's prompt, topics and answer mode, and the resolution of that binding for a turn: from the cache, from a fresh read when the cache misses, and a refusal that names the device and the identifier when it still misses (3.3, 3.4). The turn itself (4.1): the browser's own request, carrying that persona's fields and the device's language, with the reply's events consumed as they arrive. The conversation around it (4.2, 4.3): each device's turns held on this side, sent back as the turn's history and bounded to the most recent. And the speech back to the device (5.1, 5.2, 5.4, 5.5): each sentence's audio unwrapped from its WAV, re-encoded as Opus at the rate the hello declared, framed, and bracketed with `tts start` and `tts stop` — without which the firmware discards every frame in silence — with each sentence announced as `tts sentence_start` ahead of its own frames so the device's display names what is being heard, and a sentence carrying no audio, or a reply with nothing speakable in it at all, completing the turn in silence rather than failing it. |
-| Speech from the device (6.1–6.7) | The device streams Opus; the bridge decodes it at the device's own 16000 Hz, decides for itself when the person has stopped speaking, and uploads the utterance rather than the window it was spoken into. The endpointer counts speech over a sliding window, closes a turn on silence after speech, holds it open across a pause inside a sentence, gives up on a window nobody spoke into, and refuses at start a configuration in which a turn could never close. The frames it judged are the frames it uploads — one structure, one verdict per frame, no second decode — trimmed back from the last voiced frame so 38.4 s of window carrying 1.32 s of speech does not go to the transcriber as 38.4 s (D11). The transcription comes back to the device as `stt` before the reply does. A wake word mid-reply cancels the turn at its source, so the display stops naming sentences nobody is hearing, and the turn ends rather than failing — recorded, so the question the person was cut off asking survives into the next turn's history. And after a turn the microphone is distrusted for as long as this reply's own audio is still playing, plus a guard. |
-| Does not work yet | The platform's `notice` and `error` events are surfaced to the device and to the log, but the recovery around them has been exercised against a stub platform rather than the live one (4.4). The device protocol deltas are written down (`docs/device-protocol.md`), but from the firmware source rather than from a running device: the reading is done and the confirmation is not (1.5). Every claim about a real board — the build, the PSRAM, the vendor baseline, the device pointed at this server, time to first audio, and barge-in on AEC hardware — is unverified: no board has been attached. Section 6's behaviour is asserted against a real socket, real Opus and a stub platform, but never against a gadget whose microphone is live. |
+| Speech from the device (6.1–6.7) | The device streams Opus; the bridge decodes it at the device's own 16000 Hz, decides for itself when the person has stopped speaking, and uploads the utterance rather than the window it was spoken into. The endpointer counts speech over a sliding window, closes a turn on silence after speech, holds it open across a pause inside a sentence, gives up on a window nobody spoke into, and refuses at start a configuration in which a turn could never close. The frames it judged are the frames it uploads — one structure, one verdict per frame, no second decode — trimmed back from the last voiced frame so 38.4 s of window carrying 1.32 s of speech does not go to the transcriber as 38.4 s (D11). The transcription comes back to the device as `stt` before the reply does. A wake word mid-reply cancels the turn at its source, so the display stops naming sentences nobody is hearing, and the turn ends rather than failing — recorded, so the question the person was cut off asking survives into the next turn's history. And after a turn the microphone is distrusted for as long as this reply's own audio is still playing, plus a guard — which is accurate for a reply the platform produces no slower than realtime, and spent before it is armed when the platform is slower (D16). |
+| The gadget's own tools (device-tools 1–4) | The gadget runs an MCP server of its own and the bridge is its client (D1): the hello declares it, the bridge reads back the catalog the gadget reports, and what it calls is a short list — the speaker's volume, the screen's brightness and the screen's theme, which is the whole of what this board registers that a deployment has any business changing. A stated value is passed through; a relative change is computed from a status read taken *at that moment* — the same `self.get_device_status` that is read once at the handshake and appended to the turn's `systemPrompt`, so a persona can speak about the gadget it is in — and clamped to the range the tool declares, so a value past the end of the range leaves the setting at that end rather than unset. The step a relative change takes is configuration — `BRIDGE_COMMAND_STEP`, as `BRIDGE_HISTORY_TURNS` is for the conversation — rather than a constant in the code. **What it cannot do is as much of the feature as what it can.** There is no configuration, no camera on this board, and nothing a different board registers: the bridge calls only names the catalog actually reported, so a command naming anything else is abandoned and said so in the log, with the gadget left as it was. A spoken command is also not an interview turn. It is recognised by its whole utterance and nothing less, in the gadget's own language, and when it is recognised the turn is aborted at the transcript — nothing of the platform's answer is spoken, because the speaker's bracket never opens — and the exchange is kept out of the conversation, so the next interview turn is asked with the history it would have been asked with had the command not happened. The command is then answered twice, and neither answer is spoken: the speaker stays silent, and the display names the command — from the `stt` the bridge sends, which carries the person's own words, rather than from anything the tool call puts on the screen. |
+| Verified on a device (2026-10-06, 2026-10-07) | The board is attached and running this build. It is an N16R8 — 16 MB flash and 8 MB PSRAM, read from the silicon rather than from the boot log, which on this console cannot carry them (1.2, `docs/hardware.md`). It is pointed at this server rather than the vendor's, is admitted by the credential flow, and has taken turns here (1.4). The protocol document was confirmed against it: the connect message, the `listen` messages, both directions' declared rates and the framing version in use (1.5, `docs/device-protocol.md`). And it held four spoken turns in one session — wake word, transcription, reply, playback — which is where 7.1's figures come from. It now also runs firmware rebuilt from a clean checkout of upstream, flashed from that tree and checked on the image rather than assumed — its OTA endpoint, its compiled UI language, and its ELF hash against the build's own `xiaozhi.elf` — and has held turns on that image (1.1, `docs/hardware.md`). |
+| Does not work yet | The platform's `notice` and `error` events are surfaced to the device and to the log, but the recovery around them has been exercised against a stub platform rather than the live one (4.4). The vendor baseline was never taken, so a failure on the kit cannot yet be attributed between our work and the platform's (1.3 — declined, not missed). A wake word fired mid-reply — 6.5's cancel — has not been exercised on the device, so that delta still rests on the source. And barge-in on AEC hardware is unverified: this kit has no echo canceller, and 7.3 waits on a BOX-3. The same board is not attached at all at the moment, which is why the gadget's own tools above are the one row with no device column: they have been driven against a socket that answers as a gadget does, and not against a gadget — the catalog this board reports, a command spoken mid-session and the words without the command are all still to be checked there (the device-tools change's 1.3, 4.3 and 4.4, which are not this change's tasks of those numbers). |
 
 ## Layout
 
@@ -371,19 +475,22 @@ src/
   platform.ts         the platform's credential, turned into a request in one place
   personas.ts         the persona catalog: fetched, validated, cached, resolved per device, and mapped onto a turn's three fields
   turn.ts             the turn: the platform's voice-agent request, and the reply's stream
-  conversation.ts     a device's conversation: per device, sent as history, bounded
+  conversation.ts     a device's conversation: per device, sent as history, bounded, and the one turn kept out of it
   listening.ts        the device's microphone: the endpointer that closes a turn, and the utterance it uploads
   speech.ts           the device's voice: each sentence announced for the display, then as Opus frames, inside the tts bracket
+  commands.ts         the commands the bridge answers itself: what a command is, whole-utterance only, in either language
+  gadget.ts           the gadget's own tools: the catalog it reports, the condition read from it, and the settings changed on it
   log.ts              stamped log lines, matching the rig's format
   net/local-ip.ts     picking a LAN address the device can route to
   protocol/
     framing.ts        the 4-byte (v3) and 16-byte (v2) headers around Opus
+    mcp.ts            the JSON-RPC the gadget speaks, as its client: the envelope, the catalog, and one tool call
     messages.ts       the text messages, and the reply to a hello
     opus.ts           the codec, both ways: a sentence re-encoded into the device's frames, and the device's frames decoded and joined into one WAV
     wav.ts            the WAV container, both ways: the platform's sentence audio unwrapped, and the utterance wrapped for upload
   server/
     ota.ts            the OTA endpoint — issues the token, or refuses
-    ws.ts             the device socket: the refusal, the session, the speech to it, and the listening that ends a turn
+    ws.ts             the device socket: the refusal, the session, the speech to it, the listening that ends a turn, and the commands answered without one
 test/
   config.test.ts      the fail-closed rules: empty allowlist, two credentials with no default, unbound devices
   credentials.test.ts tokens, the allowlist, and every way a connection is refused
@@ -394,7 +501,10 @@ test/
   speech.test.ts      the bracket around a reply, what it carries, and what the display is told
   listening.test.ts   the endpointer over frames, which part of the window to upload, and the utterance that closes a turn
   spoken-turn.test.ts the whole path, both halves at once: a real socket, real Opus, a real endpointer and a stub platform
+  commands.test.ts    the utterances that are commands, and the ones that only look like them
+  gadget.test.ts      the gadget's condition, the catalog, and what changing one of its settings does
   framing.test.ts     round trips, and short packets
+  mcp.test.ts         the envelope, the handshake, and what a tool's answer is read as
   opus.test.ts        a sentence's frames, checked against a real decoder
   wav.test.ts         the container: what the format chunk says, and where the samples start
   ota.test.ts         the answer's fields, and who gets one

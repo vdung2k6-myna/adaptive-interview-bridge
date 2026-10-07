@@ -1,4 +1,5 @@
 import type { BridgeConfig } from "./config.js";
+import { matchCommand } from "./commands.js";
 import type { PersonaCatalog, PersonaMissReason } from "./personas.js";
 import { describePersonaMiss, resolveBoundPersona, turnFieldsFor } from "./personas.js";
 import type { TurnAudio, TurnLanguage, TurnMessage, TurnOutcome, TurnSink } from "./turn.js";
@@ -25,6 +26,12 @@ import { runTurn } from "./turn.js";
  * `user` event, which is the platform's transcription of what they said and the
  * only place it exists; the gadget's side is the reply text, which the bridge has
  * anyway because it is about to speak it. Neither is guessed.
+ *
+ * One turn is not a turn of the conversation: a command the bridge recognised and
+ * answered by changing one of the gadget's own settings (D8). It is asked of the
+ * platform — the transcript is the only place a command is knowable at all — and
+ * then dropped, and what must not survive it is the transcript. `takeTurn` is where
+ * it is left out, and the reason is at the check itself.
  */
 
 /** One completed exchange, as the conversation keeps it. */
@@ -101,6 +108,17 @@ export interface DeviceTurnInput {
   language: TurnLanguage;
   audio?: TurnAudio;
   text?: string;
+  /**
+   * The gadget's own account of itself, when it gave one (2.1). Appended to the
+   * persona's prompt for this turn only, never stored: it is a fact about a device
+   * that can change between turns, so a copy kept here would be a second, staler
+   * answer to a question `gadget.ts` already answers.
+   *
+   * Absent — not empty — is the whole of how "this gadget has no condition to report"
+   * is said, so that a gadget without a tool channel is asked for exactly the turn it
+   * would have been asked for had none of this existed (requirement 5).
+   */
+  gadgetCondition?: string;
 }
 
 export type DeviceTurnResult =
@@ -150,10 +168,19 @@ export async function takeTurn(
   // event that carried it is gone.
   let userText = "";
 
+  const fields = turnFieldsFor(resolution.persona);
   const outcome = await runTurn(
     config,
     {
-      ...turnFieldsFor(resolution.persona),
+      ...fields,
+      // After the persona's own words, separated by a blank line, so the prompt the
+      // persona author wrote still opens the request and reads as one instruction
+      // with a footnote rather than as two. What the gadget reported is the gadget's
+      // own words restated, and nothing here paraphrases or interprets them (2.2).
+      systemPrompt:
+        input.gadgetCondition === undefined
+          ? fields.systemPrompt
+          : `${fields.systemPrompt}\n\n${input.gadgetCondition}`,
       language: input.language,
       history: conversations.history(deviceId),
       ...(input.audio ? { audio: input.audio } : {}),
@@ -169,6 +196,21 @@ export async function takeTurn(
     signal
   );
 
-  conversations.record(deviceId, { user: userText, agent: outcome.replyText });
+  // A command the bridge answered itself is not a turn of this conversation (D8,
+  // requirement 4). The person said nothing to the interview and the platform answered
+  // nothing — what happened happened on the gadget — so recording it would put a
+  // question nobody put to the model into the history, followed by the silence where
+  // its answer should be, and the next interview turn would be asked against a
+  // conversation that never took place.
+  //
+  // The check is here, at the one recording site, rather than at each caller: a caller
+  // that forgot it would leave the defect to be found as the model answering a command
+  // nobody gave it. Nothing said in reply is the second half of the shape and not a
+  // repetition of it — a turn that *was* spoken for was answered, whatever its
+  // transcript happens to read as, and belongs in the history as much as any other.
+  const answeredByTheBridge = outcome.replyText === "" && matchCommand(config.language, userText) !== null;
+  if (!answeredByTheBridge) {
+    conversations.record(deviceId, { user: userText, agent: outcome.replyText });
+  }
   return { served: true, userText, outcome };
 }

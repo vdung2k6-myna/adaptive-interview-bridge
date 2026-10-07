@@ -84,6 +84,18 @@ export interface BridgeConfig {
    */
   language: TurnLanguage;
   /**
+   * How far one relative command moves a setting — "giảm âm lượng", "sáng hơn" —
+   * in the units the setting is measured in, 0 to 100 (D6). Read from
+   * `BRIDGE_COMMAND_STEP`.
+   *
+   * A configuration value rather than a constant in the matcher, for the reason
+   * the endpointer's thresholds are: it is a feel. Ten points is a nudge a person
+   * can hear and a screen a person can see, and whether it is the right nudge is
+   * settled by ear rather than by argument — which is only possible if it is not
+   * a literal in the code that would have to be rebuilt to try another.
+   */
+  commandStep: number;
+  /**
    * The rate the **device** encodes its uplink at, in Hz. Read from
    * `BRIDGE_DEVICE_RATE`; the firmware's own declaration is 16000.
    *
@@ -423,6 +435,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     frameMs: readInt(env, "BRIDGE_FRAME_MS", 60),
     historyTurns: readInt(env, "BRIDGE_HISTORY_TURNS", 20),
     language: readLanguage(env),
+    // Not bounded to 100: the range a setting is clamped to is the range the
+    // gadget's own tool declares (D6), and this is only how far one command moves
+    // it. A step past the end of that range lands on the end, which is a legal
+    // outcome rather than a mistake to refuse.
+    commandStep: readInt(env, "BRIDGE_COMMAND_STEP", 10),
     ...endpointer,
   };
 }

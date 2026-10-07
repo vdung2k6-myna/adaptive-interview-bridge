@@ -35,6 +35,7 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
     historyTurns: 20,
+    commandStep: 10,
     language: "english",
   };
 }
