@@ -252,7 +252,7 @@ stamp as every line in its log.
 | | |
 | --- | --- |
 | Board | ESP32-S3-WROOM-1 N16R8, board type `bread-compact-wifi-lcd` (`docs/hardware.md`) |
-| Network | device on Wi-Fi at `192.168.1.50` → the bridge at `192.168.1.100:8001`, one LAN; bridge → the platform at `127.0.0.1:4000` |
+| Network | device on Wi-Fi at `192.168.1.50` → the bridge at `192.168.1.100:8001`, one LAN; bridge → the platform at `127.0.0.1:4000`. This deployment's `.env` sets `WS_PORT`, and `8001` is what it chose — the banner above and the address section are the default `8000` |
 | Model | `deepseek-v4.1-flash:cloud` through Ollama — a cloud model, so the reply leg leaves this machine |
 | Speech in | `stt` on audiocpp |
 | Speech out | Kokoro, Vietnamese — the engine `engineForLanguage` picks for `language=vietnamese`, voice `diem_trinh` |
