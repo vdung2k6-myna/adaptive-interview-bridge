@@ -7,7 +7,14 @@ schema: spec-driven
 # own config supplies the project context and rules.
 #
 # Do not create openspec/specs/ or openspec/changes/ here. A local planning
-# shape takes precedence over this pointer and the declaration is silently
-# ignored ("this directory is a real OpenSpec root; the declaration is
-# ignored"), which would split the spec library in two.
+# shape outranks this pointer: the `store:` line is ignored and every command
+# warns that "this directory is a real OpenSpec root; the declaration is
+# ignored", then plans against an empty local root instead — splitting the
+# spec library in two. It is not silent; `openspec doctor` reports it.
+#
+# It takes no deliberate act to get there. `openspec init` creates both
+# directories and anchors each otherwise-empty one with a `.gitkeep` so a
+# clone keeps it, and its guard against initializing a pointer repository
+# fires only while those directories are absent — so running `init` again
+# extends them instead of refusing.
 store: team-plans
