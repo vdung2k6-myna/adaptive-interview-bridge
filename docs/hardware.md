@@ -9,7 +9,10 @@ a second tree, the clean clone of upstream at `<esp-root>\xiaozhi-clean`, built 
 2026-10-07, flashed to the board, and spoken through. One thing is still open and is
 marked where it belongs — 1.3's baseline, which was declined rather than missed.
 
-Paths are as they are on this machine, not relative.
+Paths are absolute, as they were on the machine this was read from, with the two
+machine-specific roots replaced by placeholders: `<esp-root>` is where the firmware
+trees live, and `<idf-tools>` is where EIM installed the ESP-IDF toolchain. Substitute
+your own.
 
 ## The board
 
