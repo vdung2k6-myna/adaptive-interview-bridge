@@ -261,7 +261,7 @@ Two anchors, because neither end of this is logged directly. The endpointer clos
 turn 900 ms after the person's last word, so **the end of speech is the turn's close
 minus the silence threshold** — derived, not read. The first audio is the
 `sentence 0` line, written just after that sentence's first frame went to `socket.send`
-(`src/speech.ts:234`).
+(`src/speech.ts:239`, the send; `249`, the line).
 
 | Turn | closed | transcribed | `sentence 0` sent | end of speech → first audio | closed → first audio |
 | --- | --- | --- | --- | --- | --- |

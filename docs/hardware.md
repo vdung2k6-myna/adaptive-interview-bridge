@@ -60,7 +60,7 @@ carries a hardware echo canceller and this kit does not (D7, and 7.3).
 | The build is | |
 | --- | --- |
 | Project | `xiaozhi-esp32` |
-| Version | `2.5.1` — `main/CMakeLists.txt:12`, and reported by the device as `Ota: Current version: 2.5.1` |
+| Version | `2.5.1` — `CMakeLists.txt:12` (the project root's, where `PROJECT_VER` is set — not `main/`'s, which is the source list), and reported by the device as `Ota: Current version: 2.5.1` |
 | Source | upstream `78/xiaozhi-esp32`, a snapshot of `main` taken 2026-10-04 |
 | ESP-IDF | v6.1, at `<esp-root>\v6.1\esp-idf` |
 | Tree | `<esp-root>\v6.1\esp-idf\examples\xiaozhi-esp32-main` |

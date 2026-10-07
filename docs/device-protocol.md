@@ -33,8 +33,9 @@ and no `aec` in `features` (this board declares none, §3's rule; D7, 7.3). **Th
 word's `"text":"Alexa"`; no `stop` (delta 1). **The rates** are the device's own
 16000 Hz up and the server's 24000 Hz down, each declared in its own hello, §8.3.
 **The framing version** is 3, and it is not the device's choice: the bridge's OTA
-reply sets `websocket.version`, `Ota::SetupHttp` stores it into the `websocket`
-namespace (`ota.cc`), and `WebsocketProtocol::OpenAudioChannel` reads it back and
+reply sets `websocket.version`, `Ota::CheckVersion` stores it into the `websocket`
+namespace as it parses that reply — not `Ota::SetupHttp`, which only builds the
+request (`ota.cc`) — and `WebsocketProtocol::OpenAudioChannel` reads it back and
 echoes it into both the header and the hello (`protocols/websocket_protocol.cc`).
 The frames then carry the 4-byte `BinaryProtocol3` header of §3.3. So v3 arrives
 with provisioning, and a bridge that changes its `framing` changes it on the device.
@@ -55,9 +56,12 @@ nothing raises it.
 So in the mode `kListeningModeAutoStop` puts the device in, the uplink runs from
 `listen start` until the server speaks, and the server has no `stop` to wait for
 and no message that ends it. `listen` is a device-to-server type, so there is no
-way to ask: the device accepts `notify`, `tts`, `stt`, `llm`, `mcp`, `system`,
-`alert` and `custom` from the server, and none of them stops the microphone.
-`tts start` is the only lever, which is the same one speech already uses.
+way to ask: the device accepts `notify`, `tts`, `stt`, `llm`, `mcp`, `system` and
+`alert` from the server, and none of them stops the microphone. (`docs/websocket.md`
+also lists `custom`; this build does not take it — the branch is behind
+`CONFIG_RECEIVE_CUSTOM_MESSAGE`, `default n` and unset here, so a `custom` message
+falls through to `Unknown message type`.) `tts start` is the only lever, which is the
+same one speech already uses.
 
 **The bridge:** runs its own endpointer and closes the turn itself (D9), and
 treats the `stop` message as something a device may send — it is not an error —
@@ -140,7 +144,10 @@ Three separate reasons, all in `application.cc`:
   under `listening_mode_ == kListeningModeAutoStop`, and only if
   `!audio_service_.IsPlaybackIdle()`, via `pending_listening_start_` and
   `MAIN_EVENT_PLAYBACK_DRAINED`. In the other modes it calls `StartListeningAudio()`
-  there and then.
+  there and then — though all of it sits behind an outer gate,
+  `play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()`, and when
+  that is false the branch calls `ConfigureWakeWordForListening()` instead and starts
+  no listening audio at all.
 - **A drained queue is not a silent speaker.** The measurement is the spike's
   (D10, `design.md`): on the board it ran against, the microphone went live
   **1.7–2.3 s** before the speaker stopped, while the device reported itself
@@ -195,7 +202,10 @@ inbound message, and `IsAudioChannelOpened()` — which nearly every entry point
 `application.cc` is guarded by — folds that in. From `Idle`, a start-listening with
 the channel in that state does not simply listen: it sets `kDeviceStateConnecting`
 and runs the whole connect again (`ContinueOpenAudioChannel`). And
-`CanEnterSleepMode()` becomes true once the device is Idle.
+`CanEnterSleepMode()` needs three things, not one: the device Idle, **and** the audio
+channel closed, **and** the audio service idle (`application.cc`). Idle on its own is
+not enough, which is what makes a quiet deployment's sleep behaviour follow from the
+timeout rather than from the state alone.
 
 **The bridge:** has nothing to change — a turn or its bracket goes out within
 seconds of any speech — but a deployment left quiet for two minutes is not in the
