@@ -1,6 +1,7 @@
 {
   "name": "adaptive-interview-bridge",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "Speaks the XiaoZhi gadget protocol in front of the interview platform.",
   "type": "module",
