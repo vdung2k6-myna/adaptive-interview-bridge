@@ -121,7 +121,17 @@ export interface TurnRequest {
 
 export interface TurnSentence {
   index: number;
-  text: string;
+  /**
+   * What the device's display is told before this audio is heard, or `null` where there is nothing
+   * to tell it (5.4).
+   *
+   * Deliberately not the empty string, which is a different message to a device: a `tts` message
+   * whose text is a string is read, and an empty one either paints nothing or blanks a display,
+   * while a message carrying no text at all is read as nothing and leaves the display as it is.
+   * So this is how a piece of audio that is part of something already named — a track's second
+   * piece, whose name went out with the first — says so.
+   */
+  text: string | null;
   /** Decoded audio for this sentence, or null where synthesis failed. */
   audio: Buffer | null;
 }
@@ -403,7 +413,7 @@ async function dispatch(
   if (name === "sentence") {
     await sink.onSentence?.({
       index: typeof payload.index === "number" ? payload.index : -1,
-      text: asString(payload.text),
+      text: announced(payload.text),
       audio: decodeAudio(payload.audioData),
     });
     return null;
@@ -446,6 +456,22 @@ async function dispatch(
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * What to announce for a sentence, or `null` where there is nothing to announce (5.4).
+ *
+ * The platform's own text, untrimmed when there is something in it — the bridge reports the words
+ * it was given, and a sentence whose only content is whitespace is not one to trim the display of.
+ * A text that is empty, or nothing but whitespace, is `null`: a sentence with no words has nothing
+ * to name, and a name of nothing is a display cleared or blanked while the person is still hearing
+ * the sentence. The person's own side of that display is already read this way — `ws.ts` sends the
+ * `stt` message only for a transcription with something in it — and this is the reply's side of it
+ * answering to the same rule.
+ */
+function announced(value: unknown): string | null {
+  const text = asString(value);
+  return text.trim() === "" ? null : text;
 }
 
 /** The platform's request that a gadget tool be called, or `null` for a payload that is not

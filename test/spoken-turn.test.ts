@@ -334,6 +334,45 @@ describe("a person speaks to the gadget", () => {
     }
   });
 
+  it("names every sentence of a reply, in order, as it is heard (5.4)", async () => {
+    // The other half of what a track taught, and the behaviour that must not have changed: a
+    // reply's sentences are each a thing spoken, so each is named, where a track is one thing
+    // spoken and is named once. Both reach the device down the same path — the difference is in
+    // what the caller hands the speaker, not in the speaker.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "ke cho toi mot cau chuyen" }));
+      res.write(sse("sentence", { index: 0, text: "Ngay xua...", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("sentence", { index: 1, text: "va roi...", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: "Ngay xua... va roi..." }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the reply's bracket to close"
+      );
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.deepEqual(
+        typed.filter((m) => m.state === "sentence_start").map((m) => m.text),
+        ["Ngay xua...", "va roi..."],
+        "a sentence of a reply is named as it is heard; only a track's later pieces say nothing"
+      );
+      assert.equal(typed.filter((m) => m.state === "start").length, 1, "still one bracket per reply");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
   it("keeps the second turn its own, not a prefix grown by the first", async () => {
     // 6.1's own warning, and the rig's run 10: a window that was never cleared makes
     // every turn after the first upload everything since `listen start`, which the
@@ -1454,6 +1493,44 @@ describe("music the bridge plays itself", () => {
     }
   });
 
+  it("names the track once, however many pieces it is handed over in", async () => {
+    // On the wire, which is where the defect was: the track is cut into ten-second pieces so that
+    // one WAV is built at a time, and the name used to go out with every piece. Measured on the
+    // board 2026-10-11, whose firmware keeps a **list** of what it was told — so a twelve-second
+    // fixture named itself twice, and the four-to-six minute tracks this deployment holds named
+    // themselves twenty times over, filling that list with one repeated entry.
+    //
+    // The wait is the point rather than incidental: a second announcement would arrive with the
+    // second piece, ten seconds in, so a test that looked at the wire as soon as the bracket
+    // opened could not tell the two behaviours apart. Played out to the end, the whole track is
+    // there to be counted — 166 frames is the first piece, and anything past it is the second.
+    const platform = await hears("phát nhạc");
+    const device = await ask(platform, "phát nhạc");
+    try {
+      await device.until(() => device.binaries.length > 0, "the track to start playing");
+      await device.played(12);
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.deepEqual(
+        typed.filter((m) => m.state === "sentence_start").map((m) => m.text),
+        ["Long Tone"],
+        "the track is named once, and the pieces after the first say nothing at all"
+      );
+      assert.equal(
+        typed.filter((m) => m.type === "tts" && m.state === "start").length,
+        1,
+        "one bracket around all of it, as before"
+      );
+      assert.ok(
+        device.binaries.length > 180,
+        `the whole track was handed over, in more than one piece: ${device.binaries.length} frames`
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
   it("judges nothing while a track plays, and takes the next turn once it has ended", async () => {
     // The measurement this change exists for (2026-10-11): judged frames of the bridge's own
     // *speech* land below the gate and are harmless, where a room playing music is not — so a
@@ -1493,32 +1570,105 @@ describe("music the bridge plays itself", () => {
     }
   });
 
-  it("plays nothing, and says why, for a name nothing answers to", async () => {
-    const platform = await hears("mở bài không có bài này");
-    const device = await ask(platform, "mở bài không có bài này");
-    // The refusal is a log line and not a bracket, so the log is where it has to be read: the
-    // device is sent nothing either way, and silence on the wire cannot tell a track that was
-    // refused from an utterance the bridge never took for a command at all.
-    const lines: string[] = [];
-    const original = console.log;
-    console.log = (...a: unknown[]): void => void lines.push(a.map(String).join(" "));
+  it("leaves a name the directory cannot meet to the platform, and the model hears why", async () => {
+    // On the board 2026-10-11 this was silence. The utterance was recognised as a command, so the
+    // turn was dropped before the platform could answer it (4.1) — and *then* the directory was asked
+    // and could not settle what had been asked for. Nothing played, nothing was said, and the only
+    // trace was a `warn` line in a log nobody at the gadget reads. From the person's seat the gadget
+    // had ignored them.
+    //
+    // Now the directory is asked before the turn is dropped, and an answer it cannot give leaves the
+    // utterance to the platform as the ordinary thing it is: the model is the one that can speak
+    // about it, and it reaches for `bridge.play_music` itself, refused here with the directory's own
+    // reason. What the person hears is a reply about what happened.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "mở bài không có bài này" }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "bridge.play_music",
+          arguments: { query: "không có bài này" },
+        })
+      );
+      res.write(sse("sentence", { index: 0, text: "Không có bài đó.", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: "Không có bài đó." }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
     try {
-      await device.until(
-        () => lines.some((line) => line.includes("command not carried out")),
-        "the refusal to be reported"
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+
+      // The turn reached the platform, which is the whole of the difference between a person being
+      // answered and a person being ignored.
+      await device.until(() => platform.requests.length === 1, "the turn to reach the platform");
+      await device.until(() => platform.toolResults.length === 1, "the bridge to answer the call");
+
+      assert.equal(platform.toolResults[0]!.ok, false, "nothing was played, so the call is refused");
+      assert.match(
+        String(platform.toolResults[0]!.message),
+        /nothing in .* matches/,
+        "and the model is given the directory's own reason — which is what it speaks from"
       );
 
       // Nothing was played: playing the wrong track is worse than playing none, because the person
       // hears something they did not ask for and has no way to tell that is what happened — the
       // directory is the whole of what may be played.
-      assert.equal(
-        device.messages.filter((m) => m.includes('"tts"')).length,
-        0,
-        "no bracket was opened for a track that does not exist"
-      );
-      assert.equal(device.binaries.length, 0, "and no audio went out unqualified by one");
+      await device.until(() => device.binaries.length > 0, "the model's answer to be heard");
+      const brackets = device.messages.filter((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start");
+      assert.equal(brackets.length, 1, "the one bracket is the reply's, not a track's");
     } finally {
-      console.log = original;
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("will not guess between tracks, and says which ones a name covers", async () => {
+    // The other half of the same defect, and the likelier one in a real directory: the person names
+    // an artist, and several files carry that name. The fixtures' two "tone" files stand in for the
+    // three Kenny G tracks that were in this deployment's own directory when it was reported.
+    //
+    // The refusal to guess is deliberate and stays (playing the wrong track is worse than playing
+    // none). What changed is that the refusal is now *said*, and that the person can answer it —
+    // "mở bài Long Tone" plays, which a dropped turn could never have reached.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "mở bài tone" }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "bridge.play_music",
+          arguments: { query: "tone" },
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+
+      await device.until(() => platform.requests.length === 1, "the turn to reach the platform");
+      await device.until(() => platform.toolResults.length === 1, "the bridge to answer the call");
+
+      assert.equal(platform.toolResults[0]!.ok, false, "the bridge did not pick one of them");
+      assert.match(
+        String(platform.toolResults[0]!.message),
+        /2 tracks match tone/,
+        "and the model is told which ones, rather than that something went wrong"
+      );
+      assert.equal(device.binaries.length, 0, "no track was started on a name that covers two");
+    } finally {
       device.stop();
       platform.stop();
     }

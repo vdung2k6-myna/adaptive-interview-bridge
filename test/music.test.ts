@@ -1,7 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { decodeTrack, musicTools, playTrack } from "../src/music.js";
+import { chooseTrack, decodeTrack, musicTools, playTrack } from "../src/music.js";
 import { parseWavAudio } from "../src/protocol/wav.js";
 import type { TurnSentence } from "../src/turn.js";
 
@@ -105,6 +108,62 @@ describe("what the bridge offers the model of its own", () => {
   });
 });
 
+describe("the file a request names", () => {
+  /** A directory of names and nothing else: `chooseTrack` lists a directory, and never opens a
+   *  file, so a track here is a name that exists rather than audio that decodes. A real directory
+   *  is used rather than a fake `readdir` because the listing is half of what is under test. */
+  function library(...names: string[]): string {
+    const dir = mkdtempSync(join(tmpdir(), "bridge-music-"));
+    for (const name of names) writeFileSync(join(dir, name), "");
+    return dir;
+  }
+
+  it("finds a name however the hyphen in it arrives", () => {
+    // Measured on the deployment 2026-10-11: "Un-Break My Heart" is the file, and the platform
+    // returned "unbreak my heart" — one word where the name has two, which a whole-word search then
+    // found nothing in. The file exists; saying it does not is the one answer a person cannot act on.
+    const dir = library("Toni Braxton - Un-Break My Heart.mp3", "Lionel Richie - Hello.mp3");
+
+    return Promise.all([
+      chooseTrack(dir, "unbreak my heart"),
+      chooseTrack(dir, "un break my heart"),
+      chooseTrack(dir, "Un-Break My Heart"),
+    ]).then(([joined, spaced, asWritten]) => {
+      for (const choice of [joined, spaced, asWritten]) {
+        assert.ok(choice.ok, "each writing of the name finds the file");
+        assert.match(choice.path, /Un-Break My Heart\.mp3$/);
+      }
+    });
+  });
+
+  it("still answers in the three ways it did", async () => {
+    // The rules this module was built on, pinned here beside the new one: nothing named is the
+    // first by name, nothing matching is a report, and a name several files carry is a report too
+    // rather than a guess.
+    const dir = library("Alpha.mp3", "Beta One.mp3", "Beta Two.mp3", "notes.txt");
+
+    const any = await chooseTrack(dir, "");
+    assert.match(any.ok ? any.path : "", /Alpha\.mp3$/, "nothing named plays the first by name");
+
+    const none = await chooseTrack(dir, "nothing here is called this");
+    assert.equal(none.ok, false, "no file is a report, not a guess");
+    assert.equal(none.ok === false && none.reason, "no-match");
+
+    // A word both names carry, and not a name either of them is: the one thing this may not do is
+    // choose between them. "Beta One" asked for exactly is a different question, and is answered.
+    const several = await chooseTrack(dir, "beta");
+    assert.equal(several.ok, false, "two files carrying the name is a report as well");
+    assert.equal(several.ok === false && several.reason, "ambiguous");
+
+    const exact = await chooseTrack(dir, "beta one");
+    assert.match(exact.ok ? exact.path : "", /Beta One\.mp3$/, "and the name itself still finds its file");
+
+    const txt = await chooseTrack(dir, "notes");
+    assert.equal(txt.ok, false, "and only mp3 files are tracks at all");
+    assert.equal(txt.ok === false && txt.reason, "no-match");
+  });
+});
+
 describe("playing a track through the device's speaker", () => {
   it("hands the whole track over as one bracket, numbered from zero", () => {
     const { sentences, finishes, speaker } = recordingSpeaker();
@@ -125,8 +184,15 @@ describe("playing a track through the device's speaker", () => {
     );
     assert.equal(parts.reduce((n, part) => n + part.pcm.length / 2, 0), track.samples.length, "all of it");
 
-    // The screen names what is playing rather than numbering chunks.
-    assert.ok(sentences.every((sentence) => sentence.text === "A Tone"));
+    // The screen names what is playing, and names it **once**: the pieces are one thing spoken.
+    // Measured on the board, whose firmware keeps a list of what it was told — a name per piece is
+    // that name repeated down the screen, one entry per ten seconds of the track, which is what a
+    // four-minute track did to it.
+    assert.equal(sentences[0]!.text, "A Tone", "the first piece names the track");
+    assert.ok(
+      sentences.slice(1).every((sentence) => sentence.text === null),
+      "and the pieces after it announce nothing at all, rather than announcing an empty name"
+    );
   });
 
   it("plays a track shorter than one chunk as a single one", () => {
@@ -136,6 +202,9 @@ describe("playing a track through the device's speaker", () => {
 
     assert.deepEqual(sentences.map((sentence) => sentence.index), [0]);
     assert.equal(finishes(), 1);
+    // One piece is also the first piece, so the name goes out with it: a short track is named
+    // exactly as a long one is, which is once.
+    assert.equal(sentences[0]!.text, "Short");
   });
 
   it("closes the bracket even for a track with nothing in it", () => {

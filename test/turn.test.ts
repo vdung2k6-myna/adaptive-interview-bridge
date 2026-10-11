@@ -302,6 +302,37 @@ describe("reading the reply's stream", () => {
     }
   });
 
+  it("hands a sentence with no words to name as one with nothing to announce (5.4)", async () => {
+    // What the device's display is told comes off the same field, and a text that is empty or only
+    // whitespace has no words in it to name. `null` rather than the empty string, because the two
+    // are different messages to a device: an empty announcement is one the firmware reads, and on a
+    // display that is a single bar it hides the bar — a screen blanked while the sentence is still
+    // being heard. The sentence itself is untouched: its audio still goes out.
+    const platform = await stubPlatform(
+      streamSse([
+        ["sentence", { index: 0, text: "   ", audioData: Buffer.from("A").toString("base64") }],
+        ["sentence", { index: 1, text: "", audioData: Buffer.from("B").toString("base64") }],
+        ["sentence", { index: 2, text: "Chào bạn.", audioData: null }],
+        ["done", { messageId: "m1", fullText: "Chào bạn." }],
+      ])
+    );
+    try {
+      const { sink, sentences } = recordingSink();
+      await runTurn(configFor(platform.url), REQUEST, sink);
+
+      assert.equal(sentences[0].text, null, "whitespace names nothing");
+      assert.equal(sentences[1].text, null, "and neither does an empty text");
+      assert.deepEqual(sentences[0].audio, Buffer.from("A"), "whose audio is still spoken");
+      assert.deepEqual(sentences[1].audio, Buffer.from("B"));
+
+      // And the text that has words in it is the platform's own, untrimmed: the bridge reports
+      // what it was given rather than editing the reply it is about to speak.
+      assert.equal(sentences[2].text, "Chào bạn.");
+    } finally {
+      platform.stop();
+    }
+  });
+
   it("reads an event split across two chunks", async () => {
     // Chunk boundaries fall wherever the network puts them, and a reader that
     // parsed each chunk as if it were whole would drop whichever sentence was cut.

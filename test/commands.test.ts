@@ -350,6 +350,15 @@ describe("the bridge's own commands, which are music", () => {
         ["mở bài diễm xưa", playMusic("diem xua")],
         ["phát bài Diễm Xưa nhé", playMusic("diem xua")],
         ["cho tôi nghe bài Trịnh Công Sơn", playMusic("trinh cong son")],
+        // The song said in full, which is how a person most often says it — and the reason the nouns
+        // are ordered longest-first: with `bai` ahead of `bai hat` this arrives as a track called
+        // "hat diem xua", which is a name no file has.
+        ["mở bài hát Diễm Xưa", playMusic("diem xua")],
+        ["nghe ca khúc Diễm Xưa", playMusic("diem xua")],
+        ["cho tôi nghe bài hát Diễm Xưa", playMusic("diem xua")],
+        // And the music itself, which is what a person reaches for when the track has no words to
+        // call it by.
+        ["mở nhạc Songbird", playMusic("songbird")],
       ],
       { music: true }
     );
@@ -370,8 +379,16 @@ describe("the bridge's own commands, which are music", () => {
       [
         ["tôi thường nghe nhạc khi làm việc", null],
         ["bài này hay đấy", null],
+        ["bài hát này hay đấy", null],
         ["mở bài", null],
         ["nhạc", null],
+        // "mở bài hát" is deliberately **not** here, and it is worth saying why: the nouns are an
+        // ordered alternation, so with no name to take, `bai hat` backtracks to `bai` and the "hát"
+        // becomes the track's name. What comes out is a request for a file called "hát" — which no
+        // directory has, and which is now answered by the platform rather than dropped in silence
+        // (`spoken-turn.test.ts`). A form clever enough to refuse it would be a form that has to
+        // know which words are nouns, and the whole-utterance rule is the only thing this file
+        // promises about what a command is.
       ],
       { music: true }
     );

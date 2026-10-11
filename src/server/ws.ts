@@ -2,7 +2,7 @@ import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
 import { basename } from "node:path";
-import { describeCommand, matchCommand, type BridgeCommand, type SpokenCommand } from "../commands.js";
+import { describeCommand, matchCommand, type BridgeCommand, type GadgetCommand } from "../commands.js";
 import { BRIDGE_TOOL_PREFIX, chooseTrack, decodeTrack, musicCommand, musicTools, playTrack } from "../music.js";
 import type { Track } from "../music.js";
 import { takeTurn, type Conversations } from "../conversation.js";
@@ -260,13 +260,56 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
      * they arrived, and no part of the window is decoded twice (6.1, 6.7).
      */
     /**
+     * What a music command comes to once the bridge's own directory has been asked: the file to
+     * play, or the one playing that is to stop.
+     *
+     * A file rather than the query it came from, because the question is asked exactly once — where
+     * the utterance is read — and the answer is what the rest of the turn carries. It is also what
+     * makes "a play that reaches this code has a track" a thing the type says rather than a thing a
+     * reader has to check.
+     */
+    type SettledMusic = { task: "play-music"; path: string } | { task: "stop-music" };
+
+    /** A command the bridge turned out to be, and what the bridge settled about it. Kept as one
+     *  answer rather than two, so that the branch that carries it out cannot read half of it. */
+    type Taken =
+      | { decider: "gadget"; command: GadgetCommand }
+      | { decider: "bridge"; music: SettledMusic };
+
+    /**
+     * The bridge's answer to one of its own commands, or `null` where the directory cannot settle it.
+     *
+     * A stop is always settleable: nothing playing is a report and not a refusal. A play is settled by
+     * the directory — a name that several files carry is a request the bridge will not guess at, and
+     * one that none carries is a request it cannot meet — and `null` is what leaves the utterance to
+     * the platform, where a model can say what happened and ask what was meant.
+     */
+    async function settle(command: BridgeCommand): Promise<SettledMusic | null> {
+      if (command.task === "stop-music") return { task: "stop-music" };
+
+      const choice = await chooseTrack(config.musicDir, command.query);
+      if (choice.ok) return { task: "play-music", path: choice.path };
+
+      warn(
+        `the person asked for ${describeCommand({ decider: "bridge", command })} — ` +
+          `${choice.detail}; leaving the turn to the platform`
+      );
+      return null;
+    }
+
+    /**
      * Carry out a command the bridge answers itself, which is music and nothing else yet.
      *
      * Answers in the same shape `gadget.apply` does, because the reporting that follows it is one
      * place and one line: a command that did not take leaves the room as it was, which is where the
      * person already was, and the line is what an operator has to act on.
+     *
+     * It is handed a **settled** play — a file the directory already answered with — and not a
+     * query. What the directory can settle is decided where the utterance is read (`onUser`), so
+     * that a request it cannot settle is never a command at all; by the time anything here runs the
+     * choice exists, and the decode is the only step that can still fail.
      */
-    async function carryOutMusic(command: BridgeCommand): Promise<CommandOutcome> {
+    async function carryOutMusic(command: SettledMusic): Promise<CommandOutcome> {
       if (command.task === "stop-music") {
         // A person asking a silent gadget to stop has been answered. Nothing playing is not a
         // failure, and there is no bracket to close — `stop()` says so itself.
@@ -276,16 +319,18 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         return { ok: true, detail: "the music stopped" };
       }
 
-      const chosen = await chooseMusic(command.query);
-      if (!chosen.ok) return { ok: false, detail: chosen.detail };
+      const track = await decodeTrack(command.path);
+      if (track === null) {
+        return { ok: false, detail: `${command.path} is not a track this bridge can play` };
+      }
 
       // Whatever was playing goes first: two tracks at once are two streams into one speaker, and
       // the person asked for this one rather than for both. Safe here, and only here, because this
       // turn spoke nothing — a command's turn is dropped before the platform answers it (4.1) — so
       // whatever bracket is open belongs to the track rather than to a reply.
       if (playing) speaker.stop();
-      startTrack(chosen.track);
-      return { ok: true, detail: `the track ${basename(chosen.track.path)}` };
+      startTrack(track);
+      return { ok: true, detail: `the track ${basename(track.path)}` };
     }
 
     /** The file a request names, decoded, or the reason there is none. */
@@ -348,7 +393,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       // than a `let`: it is written from inside the turn's own callbacks and read once the turn
       // has unwound, and TypeScript follows a `let` no further than its initialiser — every later
       // read of one is `null`, and the branch that uses it is `never`.
-      const taken: { command: SpokenCommand | null } = { command: null };
+      const taken: { command: Taken | null } = { command: null };
       /**
        * The track the model asked for in this turn, held until the turn has unwound.
        *
@@ -448,7 +493,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
             ...(tools.length > 0 ? { tools } : {}),
           },
           {
-            onUser: (said) => {
+            onUser: async (said) => {
               session.heard += 1;
               info(`platform transcribed the turn as ${JSON.stringify(said)}`);
               // What the device's display shows before the reply is heard (6.2). Taken
@@ -467,7 +512,30 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
               // (4.1, D8). The change itself is made once the turn has unwound, below.
               const command = matchCommand(config.language, said, { music: config.musicDir !== "" });
               if (command === null) return;
-              taken.command = command;
+
+              // A request for music is only a command this bridge answers where its own directory
+              // can settle it. Where it cannot — a name several files carry, or none of them — the
+              // utterance is left to the platform as the ordinary thing it then is, and the model
+              // answers it: it has `bridge.play_music` itself, that call is refused with the
+              // directory's own reason, and the model says so or asks which track was meant.
+              //
+              // The alternative was measured on the board 2026-10-11 and is what this replaces: a
+              // command that was recognised and then could not be carried out was dropped like any
+              // other, so the person heard **nothing at all** — no reply, no music, and a `warn`
+              // line in a log they will never read.
+              //
+              // Read as the file **is chosen** and not as it is decoded: this await sits between the
+              // transcript and the abort, and an abort that arrives after the platform has begun to
+              // answer is a reply the person hears half of. A directory listing is microseconds; a
+              // five-megabyte mp3 is not, so the decode stays where it always was, below.
+              if (command.decider === "bridge") {
+                const music = await settle(command.command);
+                if (music === null) return;
+                taken.command = { decider: "bridge", music };
+              } else {
+                taken.command = command;
+              }
+
               log(
                 `the person's words are a command — asked for ${describeCommand(command)}; ` +
                   `answering it here and dropping the turn`
@@ -533,7 +601,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
           const outcome =
             taken.command.decider === "gadget"
               ? await gadget.apply(taken.command.command)
-              : await carryOutMusic(taken.command.command);
+              : await carryOutMusic(taken.command.music);
           if (outcome.ok) log(`command carried out: ${outcome.detail}`);
           else warn(`command not carried out: ${outcome.detail}`);
         } else if (!result.served) {

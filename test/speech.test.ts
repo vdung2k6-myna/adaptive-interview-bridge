@@ -86,8 +86,12 @@ function wav(count = 1): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
-function sentence(index: number, audio: Buffer | null): TurnSentence {
-  return { index, text: `sentence ${index}`, audio };
+function sentence(
+  index: number,
+  audio: Buffer | null,
+  text: string | null = `sentence ${index}`
+): TurnSentence {
+  return { index, text, audio };
 }
 
 const jsonOf = (sent: Sent) => JSON.parse(sent.data as string) as Record<string, unknown>;
@@ -373,6 +377,52 @@ describe("what the device is told to display (5.4)", () => {
       ],
       "sentence 1 is absent from the display as well as from the audio"
     );
+  });
+
+  it("announces a track once, and plays the pieces after it without moving the display", () => {
+    // A track is one thing spoken, handed over in pieces (`music.ts`): the name goes out with the
+    // first piece and the pieces after it carry no announcement at all. Measured on the board: the
+    // firmware keeps a *list* of what it was told, so an announcement per piece is the same name
+    // repeated down the screen — one entry for every ten seconds of the track.
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.speak(sentence(0, wav(1), "Kenny G - Songbird"));
+    speaker.speak(sentence(1, wav(1), null));
+    speaker.speak(sentence(2, wav(1), null));
+    speaker.finish();
+
+    assert.deepEqual(spoken(socket.sent), [
+      { type: "tts", state: "start" },
+      { type: "tts", state: "sentence_start", text: "Kenny G - Songbird" },
+      "frame",
+      "frame",
+      "frame",
+      { type: "tts", state: "stop" },
+    ]);
+  });
+
+  it("sends no announcement at all for a text with no words in it", () => {
+    // The other half of the same rule, and the one a future caller could otherwise reach by
+    // accident: an empty announcement is not "nothing to say" to a device — a display that is a
+    // single bar hides on it — so it is refused here rather than sent. `null` is how a caller says
+    // this; this is so that saying it badly does not put a blank screen in front of someone.
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.speak(sentence(0, wav(1), ""));
+    speaker.speak(sentence(1, wav(1), "   "));
+    speaker.finish();
+
+    assert.deepEqual(
+      socket.sent.filter((s) => !s.binary).map(jsonOf),
+      [
+        { type: "tts", state: "start" },
+        { type: "tts", state: "stop" },
+      ],
+      "the audio goes out, and the display is left where it was"
+    );
+    assert.equal(framesOf(socket.sent).length, 2, "and both pieces were still spoken");
   });
 });
 

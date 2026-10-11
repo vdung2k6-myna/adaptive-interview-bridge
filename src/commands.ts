@@ -302,7 +302,13 @@ const VIETNAMESE: Grammar = {
   // "cho tôi nghe nhạc" arrives here as "nghe nhac": the frames `cho toi` is stripped by, above.
   music: {
     play: [/^(phat|mo|bat|nghe) nhac$/],
-    named: [/^(phat|mo|bat|nghe) bai (?<query>.+)$/],
+    // The nouns a person names a track through, and **longest first**: the alternation is ordered,
+    // so `bai` would take the first word of `bai hat` and leave the other one inside the track's
+    // name — a name no file has, which is the difference between a request that works and one that
+    // reports nothing found. "bài hát" and "ca khúc" are how the song is said in full, and "nhạc"
+    // is the music itself, which is what a person reaches for when the song has no words to call it
+    // by ("mở nhạc Songbird").
+    named: [/^(phat|mo|bat|nghe) (bai hat|ca khuc|nhac|bai) (?<query>.+)$/],
     stop: [/^(dung|tat) nhac$/, /^dung phat nua$/],
   },
 };

@@ -132,6 +132,51 @@ nobody is hearing, with a clean log — while the audio it sends is silently dro
 at the device. 6.5 asserts what the bridge stopped saying, not what the device
 stopped playing.
 
+### What the announcement's *text* does — and where the two display branches differ
+
+Read from the tree named at the top of this file, and not measured on it: the handler passes `text`
+to the display only when the message carries it **as a string** — `cJSON_GetObjectItem(root,
+"text")` and then `cJSON_IsString(text)` (`application.cc:640-641`) — so a message with no
+`text` field at all is read as nothing and **leaves the display as it is**. What an *empty*
+string does instead depends on which display the build was configured for, and both branches
+are in `main/display/lcd_display.cc` (`:387`, `:853`):
+
+| The build takes | An empty `text` arrives |
+| --- | --- |
+| `CONFIG_USE_WECHAT_MESSAGE_STYLE=y` — a list of entries, capped at `MAX_MESSAGES` 20 on an ESP32-S3 (`:537-541`) | nothing is added: the branch returns before drawing anything (`:605-608`) |
+| its `#else` — a single bar | **the bar is hidden** (`:1103-1110`) |
+
+So one intent has three different messages — a name, a blank, and nothing at all — and only
+the last of them leaves the display as it was on **both** branches. The tree this deployment's
+board was last flashed from (`build/xiaozhi_flashed.bin`, 2026-10-10 22:21) sets
+`CONFIG_USE_WECHAT_MESSAGE_STYLE=y` (`sdkconfig:1147`), so the board is the list branch and
+the bar branch is the one read here rather than seen.
+
+**The bridge:** this is why a piece of audio that is part of something already named sends
+**no announcement at all** rather than an empty one. A track is one thing spoken, handed over
+in ten-second pieces, so its name goes out with the first piece and the pieces after it say
+nothing (5.4, `music.ts`) — where a name per piece is the same entry written down a list
+display once per ten seconds of the track, and a screen blanked mid-track on a bar display.
+An empty text is refused in `speech.ts` as well, so that neither caller can reach the second
+column of the table above by accident.
+
+**Seen on the board, 2026-10-11.** With the bridge playing `Toni Braxton - Un-Break My Heart.mp3`,
+the display showed the track's name **once** and held it for as long as the track played, with what
+it had been showing before still above it — no entry repeated as the track went over in its pieces,
+which is the list branch of the table above behaving as it reads. That track is twenty-seven pieces
+long, and the wire was counted on the same day for the half a screen cannot show: **one**
+announcement went out for it, with 444 frames of its audio over the first twenty-eight seconds,
+where one per piece would have been three by then. The board is the image recorded in
+`hardware.md` as flashed on 2026-10-10 (`build/xiaozhi_flashed.bin`, 2,710,384 B, from the tree
+whose `sdkconfig` takes the list branch); the boot log's `ELF file SHA256` was not read for this
+observation, so the image is established by that tree and that artifact rather than by the device's
+own report of itself.
+
+**And a reply is unchanged on it**, seen in the same sitting: each sentence appears as it is spoken,
+which is the behaviour the announcement rule already had and the half of it that a track's pieces
+must not be confused with. The two sit on either side of one line in the bridge — a sentence of a
+reply carries its own words, and a piece of a track after the first carries none.
+
 ## 5. The device's own listening transition is not the server's playback clock
 
 Three separate reasons, all in `application.cc`:

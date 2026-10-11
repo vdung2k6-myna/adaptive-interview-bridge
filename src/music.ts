@@ -215,7 +215,7 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
   // The name itself first, without its extension: "nhạc không lời 2" is what that file is called,
   // and a whole-word search would have found it too — but only because no other name contains
   // those words, which is the coincidence this check does not rely on.
-  const named = tracks.filter((name) => fold(name.replace(/\.[^.]+$/, "")) === wanted);
+  const named = tracks.filter((name) => writings(name.replace(/\.[^.]+$/, "")).includes(wanted));
   if (named.length === 1) return { ok: true, path: join(directory, named[0]!) };
   if (named.length > 1) {
     return { ok: false, reason: "ambiguous", detail: `${named.length} tracks are called ${query}` };
@@ -225,7 +225,7 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
   // "Trinh Cong Son - Diem Xua". Whole words rather than a substring, so that "nhac" does not
   // match every name containing those four letters.
   const words = wanted.split(" ").filter((word) => word !== "");
-  const found = tracks.filter((name) => holdsWords(fold(name), words));
+  const found = tracks.filter((name) => writings(name).some((writing) => holdsWords(writing, words)));
   if (found.length === 1) return { ok: true, path: join(directory, found[0]!) };
   if (found.length > 1) {
     return {
@@ -236,6 +236,23 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
   }
 
   return { ok: false, reason: "no-match", detail: `nothing in ${directory} matches ${query}` };
+}
+
+/**
+ * A file's name as the words it is made of — in **both** writings a hyphen allows.
+ *
+ * `un break` and `unbreak` are the same two words to a person and to the file that carries them,
+ * and which one arrives is not the directory's to decide: measured on this deployment 2026-10-11,
+ * "Un-Break My Heart" was asked for and the platform returned "unbreak my heart", which a
+ * whole-word search then found nothing in — a file that exists, reported as one that does not,
+ * because of a hyphen. So both writings are tried rather than either one being declared correct.
+ *
+ * One writing when the two are the same, which is every name without a hyphen in it.
+ */
+function writings(name: string): string[] {
+  const spaced = fold(name);
+  const joined = fold(name.replace(/-/g, ""));
+  return spaced === joined ? [spaced] : [spaced, joined];
 }
 
 /** The slice of a speaker this module needs, so a test can be a speaker too — the same narrowing
@@ -272,6 +289,19 @@ export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buff
  * playback and holds the bracket open until the last of them is due, so a track is the same act
  * as a long reply — handed over, and then heard.
  *
+ * **The track is named once**, on its first piece, and the pieces after it say nothing: they are
+ * one thing spoken, handed over in ten-second pieces only because a WAV is built a piece at a
+ * time. An announcement per piece is not a display naming a track, it is the same name written
+ * down the screen — measured on the board 2026-10-11, whose firmware keeps a **list** of what it
+ * was told, so a track of the four to six minutes this deployment holds fills that list twenty
+ * times over with one repeated entry and pushes the conversation off it.
+ *
+ * The pieces after the first carry `null` and **not** an empty text, and the difference is the
+ * device's: it reads a text that is a string, and an empty one hides the bar on a board whose
+ * display is a single bar — a screen blanked mid-track, which is the opposite of the concern that
+ * put the title on every piece to begin with. A message carrying no `text` at all is read as
+ * nothing and leaves the display as it is (5.4, `speech.ts`).
+ *
  * `finish()` is called even for a track with no samples, which plays nothing. A caller that
  * skipped the decode's refusal would otherwise hand a device a bracket that never closes, and a
  * device left in `Speaking` discards whatever the person says next.
@@ -279,10 +309,7 @@ export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buff
 export function playTrack(player: TrackPlayer, track: Track): void {
   const title = basename(track.path).replace(/\.[^.]+$/, "");
   trackChunks(track).forEach((audio, index) => {
-    // The title on every chunk rather than on the first alone: a `sentence_start` carrying
-    // nothing is a display that blanks mid-track, and the screen is the one place a person can
-    // read what is playing.
-    player.speak({ index, text: title, audio });
+    player.speak({ index, text: index === 0 ? title : null, audio });
   });
   player.finish();
 }

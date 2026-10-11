@@ -96,7 +96,14 @@ export interface Speaker {
    * judged. Measured on the board 2026-10-11.
    */
   beginTurn(): void;
-  /** Speak one sentence of the reply (5.2, 5.3). Safe to call for every event. */
+  /**
+   * Speak one piece of what is being said (5.2, 5.3): a sentence of the reply, or a piece of the
+   * bridge's own audio. Safe to call for every event.
+   *
+   * A piece that carries text announces it for the display before its audio (5.4); a piece that
+   * carries none — the second and later pieces of a track, which is one thing spoken — is heard
+   * without the display being moved for it.
+   */
   speak(sentence: TurnSentence): void;
   /** Close the bracket if it is open. Idempotent, and safe on a turn with no speech. */
   finish(): void;
@@ -265,18 +272,35 @@ export function createSpeaker(
         generation += 1;
       }
 
-      // What the device's display shows while this sentence is heard (5.4). One
-      // per sentence and ahead of its frames, so the display names what is being
-      // said rather than what has just finished; the firmware turns it into its
-      // own `SetChatMessage("assistant", …)`, and text arriving here is the only
-      // thing that moves that display.
+      // What the device's display shows while this audio is heard (5.4), and the one
+      // place that writes it. One announcement and ahead of this audio's frames, so
+      // the display names what is being said rather than what has just finished; the
+      // firmware turns it into its own `SetChatMessage("assistant", …)`, and text
+      // arriving here is the only thing that moves that display.
       //
       // It sits after the null-audio and transcode checks rather than before them
       // because it is a claim about audio: a sentence the device will not speak
       // must not be announced, or the display would show words nobody hears. That
       // makes 5.5's silent sentences mute on the display too, which is the honest
       // reading of a sentence with nothing to play.
-      if (!sendJson({ type: "tts", state: "sentence_start", text: sentence.text })) return;
+      //
+      // A piece of audio with nothing to announce says **nothing at all** rather than
+      // sending an empty text, and the difference is the device's: a display that lists
+      // what it was told ignores an empty one, and a display that is a single bar
+      // *hides* — so an empty announcement blanks the screen while the person is still
+      // hearing the audio, which is the failure this is here to prevent. `null` is the
+      // type's way of saying so (a track's second piece has its name on the first), and
+      // a text with no words in it is refused here as well, so that the display cannot
+      // be moved by an announcement that names nothing whichever caller is in front of
+      // this.
+      //
+      // The early return belongs to the send and not to the announcement: a piece with
+      // nothing to announce still has frames to deliver, and delivering them is what
+      // tells us the socket has gone.
+      const words = sentence.text;
+      if (words !== null && words.trim() !== "") {
+        if (!sendJson({ type: "tts", state: "sentence_start", text: words })) return;
+      }
 
       // The turn's slots are reserved before any of them is filled (D16). `finish()`
       // arms the deadline 6.6 reads while the tail of this turn is still on the clock,
