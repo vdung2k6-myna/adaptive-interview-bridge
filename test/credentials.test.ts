@@ -34,6 +34,8 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     serverRate: 24000,
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
+    sessionIdleMs: 60000,
+    musicDir: "",
     historyTurns: 20,
     commandStep: 10,
     language: "english",

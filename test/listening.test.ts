@@ -66,6 +66,21 @@ function wire(payload: Buffer): Buffer {
 const speechFrame = wire(speechPcm);
 const roomFrame = wire(roomPcm);
 
+/** Everything the bridge logged while `run` ran, as one string. The giveup report is
+ *  the whole of what this change adds to a discarded window, so it is asserted as
+ *  output rather than inferred from state. */
+function capturing(run: () => void): string {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...a: unknown[]): void => void lines.push(a.map(String).join(" "));
+  try {
+    run();
+  } finally {
+    console.log = original;
+  }
+  return lines.join("\n");
+}
+
 describe("the endpointer, over frames", () => {
   it("keeps its per-frame verdict on the frame itself, not in a second array", () => {
     // 6.7. The rig kept `frames` and `frameVoiced` side by side, and both defects it
@@ -107,8 +122,9 @@ describe("the endpointer, over frames", () => {
       "background noise is not a turn, however long the window stays open"
     );
 
-    // Then a person speaks, and stops.
-    for (let i = 0; i < 6; i++) {
+    // Then a person speaks, and stops. Ten frames, because the endpointer needs 500 ms
+    // of a sliding window to count as speech and six frames is only 360 ms.
+    for (let i = 0; i < 10; i++) {
       now += FRAME_MS;
       listening.frame(speechFrame);
     }
@@ -131,7 +147,7 @@ describe("the endpointer, over frames", () => {
     const pause = FRAMES(ENDPOINTER_DEFAULTS.vadSilenceMs) - 1;
     const verdicts: string[] = [];
     for (const kind of ["speech", "pause", "speech", "pause", "speech"] as const) {
-      const count = kind === "speech" ? 6 : pause;
+      const count = kind === "speech" ? 10 : pause;
       for (let i = 0; i < count; i++) {
         now += FRAME_MS;
         verdicts.push(listening.frame(kind === "speech" ? speechFrame : roomFrame));
@@ -163,16 +179,206 @@ describe("the endpointer, over frames", () => {
 
     // And one that did hear a person is never given up on: it closes instead.
     const heard = createVad(0);
-    for (let i = 0; i < 6; i++) vadStep(heard, 12000, config);
+    for (let i = 0; i < 10; i++) vadStep(heard, 12000, config);
     assert.equal(vadDecision(heard, at, config), "wait", "the silence threshold has not been reached yet");
+  });
+
+  it("reports what a discarded window held, and the gate it was judged against", () => {
+    // The window that produced this change: one transient, loud enough to pass the
+    // gate, in a room where nobody spoke. What the discard has to say is the loudness
+    // it threw away and the threshold that judged it — the two numbers the rig printed
+    // and the bridge did not, which is why the failure was invisible until a transcript
+    // came back (D4). They cannot be read off the sliding window: it ages the transient
+    // out long before the giveup is reached and would report zero.
+    let now = 0;
+    const listening = createListening(config, () => now);
+    listening.open();
+
+    const heard = capturing(() => {
+      for (let i = 0; i < 20; i++) {
+        now += FRAME_MS;
+        listening.frame(roomFrame);
+      }
+      now += FRAME_MS;
+      listening.frame(speechFrame);
+      let verdict = "wait";
+      let guard = 0;
+      while (verdict === "wait" && guard++ < FRAMES(ENDPOINTER_DEFAULTS.vadNoSpeechMs) + 10) {
+        now += FRAME_MS;
+        verdict = listening.frame(roomFrame);
+      }
+    });
+
+    const reported =
+      /no speech in 15s \(loudest (\d+), floor (\d+)\) at gate (\d+), (\d+) frame\(s\) over it/.exec(heard);
+    assert.ok(reported, `the discard did not report its numbers:\n${heard}`);
+    const [, loudest, , gate, frames] = reported;
+    assert.ok(
+      Number(loudest) > Number(gate),
+      `the loudness it threw away is reported and it did cross the gate (${loudest} vs ${gate})`
+    );
+    assert.equal(Number(frames), 1, "and how much of the window crossed, which is one frame of it");
+  });
+
+  it("says zero when nothing crossed the gate at all", () => {
+    let now = 0;
+    const listening = createListening(config, () => now);
+    listening.open();
+
+    const heard = capturing(() => {
+      let verdict = "wait";
+      let guard = 0;
+      while (verdict === "wait" && guard++ < FRAMES(ENDPOINTER_DEFAULTS.vadNoSpeechMs) + 10) {
+        now += FRAME_MS;
+        verdict = listening.frame(roomFrame);
+      }
+    });
+
+    assert.match(
+      heard,
+      /loudest 0, floor \d+\) at gate \d+, 0 frame\(s\) over it/,
+      "a room nobody spoke in reports a loudness of zero, which is the truth of it"
+    );
+  });
+
+  it("does not close a turn on a burst nobody spoke under, however loud", () => {
+    // The field case. A door, a chair, a case set down — loud enough to cross the gate
+    // and over inside a fraction of a second. The log holds one at 0.36 s / 6 frames
+    // that the platform answered "đi", nine times in one session (D5; the corpus below
+    // is the whole of it). Loudness cannot separate these from a person, so what is
+    // asserted here is that length can: 4 frames is the shortest in the corpus and 8
+    // the longest, and none of them may close a turn.
+    for (const burst of [4, 6, 8]) {
+      let now = 0;
+      const listening = createListening(config, () => now);
+      listening.open();
+
+      const verdicts: string[] = [];
+      const step = (f: Buffer): void => {
+        now += FRAME_MS;
+        verdicts.push(listening.frame(f));
+      };
+      for (let i = 0; i < 20; i++) step(roomFrame);
+      for (let i = 0; i < burst; i++) step(speechFrame);
+      let guard = 0;
+      while (verdicts.at(-1) === "wait" && guard++ < FRAMES(ENDPOINTER_DEFAULTS.vadNoSpeechMs) + 10) {
+        step(roomFrame);
+      }
+
+      assert.ok(!verdicts.includes("turn"), `a ${burst}-frame burst with no speaker closed a turn`);
+      assert.equal(
+        verdicts.at(-1),
+        "giveup",
+        `a ${burst}-frame burst spent the window rather than closing it`
+      );
+    }
   });
 
   it("holds a turn open past the cap when the person never stops, and closes it", () => {
     const v = createVad(0);
-    for (let i = 0; i < 6; i++) vadStep(v, 12000, config);
+    for (let i = 0; i < 10; i++) vadStep(v, 12000, config);
     const cap = ENDPOINTER_DEFAULTS.maxTurnMs;
     assert.equal(vadDecision(v, cap - FRAME_MS, config), "wait");
     assert.equal(vadDecision(v, cap, config), "turn", "the backstop for a person who never stops");
+  });
+});
+
+describe("the 37 turns on record, replayed", () => {
+  /**
+   * Every turn `bridge-run.log` recorded on 2026-10-06: how long the endpointer counted
+   * it as speech, the peak it measured, and what the platform transcribed it as. The
+   * peak is the endpointer's own reading, so replaying a turn at it reproduces that
+   * turn's frames by construction — what is under test is not the gate but where the
+   * line between a sound and an utterance falls.
+   *
+   * The transcripts are what makes this a measurement rather than an opinion: the
+   * eight-frame-and-under group is the one the platform answered with "đi", "Alexa.",
+   * "gọi gọi gọi gọi gọi" and single words, and the nine-and-over group is the one it
+   * answered with Vietnamese sentences. The one exception at nine frames is
+   * "đang cãi lộn mà.", a real sentence sitting inside the noise band — that is the
+   * cost of the line, and it is why the line is drawn below it rather than at it.
+   */
+  const CORPUS: readonly { fr: number; peak: number; text: string }[] = [
+    { fr: 4, peak: 12554, text: "mừng ngoài gì?" },
+    { fr: 4, peak: 12578, text: "đi" },
+    { fr: 5, peak: 11570, text: "đi" },
+    { fr: 5, peak: 10528, text: "mười ngày." },
+    { fr: 5, peak: 11427, text: "Alexa." },
+    { fr: 5, peak: 9088, text: "ở tình huống là nói chung là." },
+    { fr: 5, peak: 9164, text: "trả lời theo star là trả lời theo" },
+    { fr: 5, peak: 13392, text: "gọi gọi gọi gọi gọi" },
+    { fr: 6, peak: 19397, text: "đi" },
+    { fr: 6, peak: 16891, text: "đi" },
+    { fr: 6, peak: 16314, text: "Ừ." },
+    { fr: 6, peak: 15364, text: "đi" },
+    { fr: 6, peak: 17032, text: "một làm gì?" },
+    { fr: 6, peak: 15004, text: "thế" },
+    { fr: 6, peak: 12201, text: "có gì ở ở hải ngoại vậy à, hải" },
+    { fr: 7, peak: 11765, text: "ừm." },
+    { fr: 7, peak: 17142, text: "đi" },
+    { fr: 7, peak: 18659, text: "đi" },
+    { fr: 7, peak: 10944, text: "cái là bắt luôn đi vô ngủ." },
+    { fr: 7, peak: 13864, text: "ừ." },
+    { fr: 8, peak: 16816, text: "Nhiều người cho rằng" },
+    { fr: 8, peak: 20395, text: "Alexa." },
+    { fr: 9, peak: 21099, text: "đi" },
+    { fr: 9, peak: 16529, text: "đi" },
+    { fr: 9, peak: 12099, text: "mà lại mấy ấm á, trong đó mấy lạnh á." },
+    { fr: 9, peak: 13254, text: "đang cãi lộn mà." },
+    { fr: 10, peak: 16203, text: "có cái gì mới không?" },
+    { fr: 10, peak: 10875, text: "không trả lời đâu." },
+    { fr: 11, peak: 15518, text: "điều gì" },
+    { fr: 12, peak: 12688, text: "ở một lần tôi làm việc nhóm là tôi phải bưng" },
+    { fr: 13, peak: 14288, text: "không nghe thấy gì luôn." },
+    { fr: 17, peak: 17459, text: "có chuyện gì đâu mà cãi." },
+    { fr: 17, peak: 20966, text: "phẩm với hành vi là sao?" },
+    { fr: 20, peak: 24889, text: "đi" },
+    { fr: 22, peak: 19296, text: "có chuyện gì vui không kể tôi nghe." },
+    { fr: 23, peak: 17609, text: "cũng ngày nào tôi không bị áp lực." },
+    { fr: 29, peak: 24476, text: "có gì vui không nói tôi nghe chơi." },
+  ];
+
+  /** One recorded turn, driven back through the state machine at its recorded peak.
+   *  Twenty frames of room first, because the floor estimate needs ten quiet frames
+   *  before it stops reading zero, and every window in the field opens that way. */
+  function replay(fr: number, peak: number): string {
+    const v = createVad(0);
+    for (let i = 0; i < 20; i++) vadStep(v, 400, config);
+    for (let i = 0; i < fr; i++) vadStep(v, peak, config);
+    let now = (20 + fr) * FRAME_MS;
+    for (let i = 0; i < FRAMES(ENDPOINTER_DEFAULTS.vadNoSpeechMs); i++) {
+      const verdict = vadDecision(v, now, config);
+      if (verdict !== "wait") return verdict;
+      vadStep(v, 400, config);
+      now += FRAME_MS;
+    }
+    return "wait";
+  }
+
+  it("is the corpus the line was drawn on, not a sample of it", () => {
+    assert.equal(CORPUS.length, 37, "every turn the log recorded");
+    assert.equal(CORPUS.filter((t) => t.fr <= 8).length, 22, "the noise band, as measured");
+    assert.equal(CORPUS.filter((t) => t.fr >= 9).length, 15, "and everything above it");
+  });
+
+  it("does not close a turn on what the platform answered as noise", () => {
+    for (const turn of CORPUS.filter((t) => t.fr <= 8)) {
+      assert.equal(
+        replay(turn.fr, turn.peak),
+        "giveup",
+        `${turn.fr} frames (peak ${turn.peak}) closed a turn, which the platform answered ${JSON.stringify(turn.text)}`
+      );
+    }
+  });
+
+  it("still closes a turn on everything the platform answered with a sentence", () => {
+    for (const turn of CORPUS.filter((t) => t.fr >= 9)) {
+      assert.equal(
+        replay(turn.fr, turn.peak),
+        "turn",
+        `${turn.fr} frames (peak ${turn.peak}) no longer closes a turn, and it was ${JSON.stringify(turn.text)}`
+      );
+    }
   });
 });
 
@@ -261,7 +467,7 @@ describe("the utterance that closes a turn", () => {
       listening.frame(roomFrame);
     }
     const utteranceStart = now;
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 10; i++) {
       now += FRAME_MS;
       listening.frame(speechFrame);
     }
@@ -283,11 +489,11 @@ describe("the utterance that closes a turn", () => {
     assert.equal(audio.channels, 1);
 
     const seconds = audio.pcm.length / 2 / RATE;
-    const windowSeconds = ((40 + 6 + FRAMES(ENDPOINTER_DEFAULTS.vadSilenceMs)) * FRAME_MS) / 1000;
+    const windowSeconds = ((40 + 10 + FRAMES(ENDPOINTER_DEFAULTS.vadSilenceMs)) * FRAME_MS) / 1000;
     assert.ok(seconds < windowSeconds, `${seconds}s uploaded out of a ${windowSeconds}s window`);
-    // The six speech frames plus the silence that closed the turn, plus the onset
+    // The ten speech frames plus the silence that closed the turn, plus the onset
     // lead — and not the forty frames of room tone the window opened with.
-    const expected = (6 + FRAMES(ENDPOINTER_DEFAULTS.vadSilenceMs) + FRAMES(ENDPOINTER_DEFAULTS.onsetLeadMs)) * FRAME_MS / 1000;
+    const expected = (10 + FRAMES(ENDPOINTER_DEFAULTS.vadSilenceMs) + FRAMES(ENDPOINTER_DEFAULTS.onsetLeadMs)) * FRAME_MS / 1000;
     assert.ok(
       Math.abs(seconds - expected) <= 2 * FRAME_MS / 1000,
       `${seconds}s of upload, expected about ${expected}s`

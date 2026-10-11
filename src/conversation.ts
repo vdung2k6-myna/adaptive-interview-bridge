@@ -2,7 +2,7 @@ import type { BridgeConfig } from "./config.js";
 import { matchCommand } from "./commands.js";
 import type { PersonaCatalog, PersonaMissReason } from "./personas.js";
 import { describePersonaMiss, resolveBoundPersona, turnFieldsFor } from "./personas.js";
-import type { TurnAudio, TurnLanguage, TurnMessage, TurnOutcome, TurnSink } from "./turn.js";
+import type { TurnAudio, TurnLanguage, TurnMessage, TurnOutcome, TurnSink, TurnTool } from "./turn.js";
 import { runTurn } from "./turn.js";
 
 /**
@@ -119,6 +119,17 @@ export interface DeviceTurnInput {
    * would have been asked for had none of this existed (requirement 5).
    */
   gadgetCondition?: string;
+  /**
+   * What this turn may be asked to do: what the gadget says it can be asked to do, carried from
+   * the session's own report, and beside it the tools the bridge answers for itself — the
+   * catalogue the platform's model decides from (D3). Read per turn rather than stored here, like
+   * the condition above and for the same reason: it is the session's, and a copy would be a second
+   * answer that can go stale.
+   *
+   * Absent — not empty — when there is neither, so such a turn is asked for exactly as it would
+   * have been asked for had none of this existed.
+   */
+  tools?: readonly TurnTool[];
 }
 
 export type DeviceTurnResult =
@@ -185,6 +196,7 @@ export async function takeTurn(
       history: conversations.history(deviceId),
       ...(input.audio ? { audio: input.audio } : {}),
       ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(input.tools && input.tools.length > 0 ? { tools: input.tools } : {}),
     },
     {
       ...sink,
@@ -208,7 +220,8 @@ export async function takeTurn(
   // nobody gave it. Nothing said in reply is the second half of the shape and not a
   // repetition of it — a turn that *was* spoken for was answered, whatever its
   // transcript happens to read as, and belongs in the history as much as any other.
-  const answeredByTheBridge = outcome.replyText === "" && matchCommand(config.language, userText) !== null;
+  const answeredByTheBridge =
+    outcome.replyText === "" && matchCommand(config.language, userText, { music: config.musicDir !== "" }) !== null;
   if (!answeredByTheBridge) {
     conversations.record(deviceId, { user: userText, agent: outcome.replyText });
   }

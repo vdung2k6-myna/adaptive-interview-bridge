@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, ENDPOINTER_DEFAULTS } from "../src/config.js";
 
 /**
  * The configuration is where the rules that must not fail open live: an empty
@@ -247,12 +247,54 @@ describe("the rest of the configuration", () => {
     assert.equal(config.vadMinRms, 7500);
     assert.equal(config.vadFloorRatio, 2.5);
     assert.equal(config.vadSilenceMs, 900);
-    assert.equal(config.vadMinSpeechMs, 240);
+    assert.equal(config.vadMinSpeechMs, 500);
     assert.equal(config.vadSpeechWindowMs, 3000);
     assert.equal(config.maxTurnMs, 20000);
     assert.equal(config.vadNoSpeechMs, 15000);
     assert.equal(config.drainGuardMs, 400);
     assert.equal(config.onsetLeadMs, 300);
+  });
+
+  it("reads the session window, where nought is a value and not a mistake", () => {
+    // The window is the one count in this file that may be nought, and nought is how
+    // it is turned off: a bridge with the window off holds a session open for as long
+    // as the device keeps it open, which is what this bridge did before the window
+    // existed. Every other count goes through `readInt`, which refuses nought because
+    // for those a nought is a mistake rather than a value.
+    assert.equal(loadConfig(minimal).sessionIdleMs, 60000);
+    assert.equal(
+      loadConfig({ ...minimal, BRIDGE_SESSION_IDLE_MS: "0" } as NodeJS.ProcessEnv).sessionIdleMs,
+      0
+    );
+    assert.equal(
+      loadConfig({ ...minimal, BRIDGE_SESSION_IDLE_MS: "90000" } as NodeJS.ProcessEnv).sessionIdleMs,
+      90000
+    );
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_SESSION_IDLE_MS: "-1" } as NodeJS.ProcessEnv),
+      /BRIDGE_SESSION_IDLE_MS must be a non-negative integer/
+    );
+    assert.throws(
+      () => loadConfig({ ...minimal, BRIDGE_SESSION_IDLE_MS: "1.5" } as NodeJS.ProcessEnv),
+      /BRIDGE_SESSION_IDLE_MS must be a non-negative integer/
+    );
+  });
+
+  it("leaves the bridge with no music unless a deployment says where it is", () => {
+    // Empty is the absent case and not a degraded one: with no directory the two music commands
+    // go unrecognised and fall through, and no tool of the bridge's own is offered to a model —
+    // which is this bridge before the change. A shipped default would instead point every bridge
+    // at a directory that exists on none of them.
+    assert.equal(loadConfig(minimal).musicDir, "");
+    assert.equal(
+      loadConfig({ ...minimal, BRIDGE_MUSIC_DIR: "   " } as NodeJS.ProcessEnv).musicDir,
+      "",
+      "whitespace is not a directory either"
+    );
+    assert.equal(
+      loadConfig({ ...minimal, BRIDGE_MUSIC_DIR: "/srv/music" } as NodeJS.ProcessEnv).musicDir,
+      "/srv/music"
+    );
   });
 
   it("reads them from the environment, floor ratio included", () => {
@@ -273,8 +315,14 @@ describe("the rest of the configuration", () => {
     // minimum have aged out before the threshold is reached — and the gadget simply
     // never answers. The rig warned about this and the rig's own comment names its
     // failure as silent; here it is a startup failure, where the operator is.
+    //
+    // The boundary is the sum of two knobs this change moved, so it is computed from
+    // the shipped defaults rather than written down: a hard-coded 1141 was the old
+    // 900 + 240, and it would have gone on passing had the constant been raised and
+    // this line not read.
+    const boundary = ENDPOINTER_DEFAULTS.vadSilenceMs + ENDPOINTER_DEFAULTS.vadMinSpeechMs;
     assert.throws(
-      () => loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: "1140" } as NodeJS.ProcessEnv),
+      () => loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: `${boundary}` } as NodeJS.ProcessEnv),
       /BRIDGE_VAD_SPEECH_WINDOW_MS must exceed/
     );
     assert.throws(
@@ -284,9 +332,9 @@ describe("the rest of the configuration", () => {
     // One millisecond more than the sum is enough, which is the boundary the error
     // is about rather than an arbitrary margin.
     assert.equal(
-      loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: "1141" } as NodeJS.ProcessEnv)
+      loadConfig({ ...minimal, BRIDGE_VAD_SPEECH_WINDOW_MS: `${boundary + 1}` } as NodeJS.ProcessEnv)
         .vadSpeechWindowMs,
-      1141
+      boundary + 1
     );
   });
 

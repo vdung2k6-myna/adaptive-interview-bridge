@@ -98,6 +98,8 @@ function configFor(options: { commandStep?: number } = {}): BridgeConfig {
     serverRate: 24000,
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
+    sessionIdleMs: 60000,
+    musicDir: "",
     historyTurns: 20,
     commandStep: options.commandStep ?? 10,
     language: "english",

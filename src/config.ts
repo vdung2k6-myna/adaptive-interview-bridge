@@ -96,6 +96,34 @@ export interface BridgeConfig {
    */
   commandStep: number;
   /**
+   * How long a session may hold nobody before the bridge ends it, in ms. Read from
+   * `BRIDGE_SESSION_IDLE_MS`; `0` turns the window off, which leaves a session open
+   * for as long as the device keeps it open — how this bridge behaved before the
+   * window existed, and the way back to that.
+   *
+   * A session is what the bridge ends and the device is left in: Idle, its
+   * microphone closed and its wake word armed again. Held open, the device never
+   * reaches that state, and `CanEnterSleepMode()` — which needs Idle, a closed audio
+   * channel and an idle audio service together — can never be satisfied, so none of
+   * the firmware's own power management can run. See `docs/vendor-server.md` for the
+   * window the vendor server closes an idle session on.
+   */
+  sessionIdleMs: number;
+  /**
+   * Where this bridge's own music is, as a directory it lists when asked rather than at start.
+   * Read from `BRIDGE_MUSIC_DIR`; empty means this deployment has no music at all, which is this
+   * bridge before the change.
+   *
+   * A directory rather than a playlist, and read per request rather than at boot, so that a file
+   * dropped in while the bridge runs is playable and a directory that is not there is an answer
+   * — "nothing to play" — rather than a failure to start.
+   *
+   * Empty is not a degraded mode: with no directory the two commands go unrecognised and fall
+   * through as ordinary utterances, and no tool of the bridge's own is offered to a model, so a
+   * turn is asked for exactly as it was before any of this existed.
+   */
+  musicDir: string;
+  /**
    * The rate the **device** encodes its uplink at, in Hz. Read from
    * `BRIDGE_DEVICE_RATE`; the firmware's own declaration is 16000.
    *
@@ -157,6 +185,22 @@ function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): num
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive number, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+/** A count that may be nought.
+ *
+ *  `readInt` refuses nought, because for every count it reads nought is a mistake
+ *  rather than a value. The session window is the one where nought means something —
+ *  it is how the window is turned off — so it reads through this instead, where a
+ *  negative is still refused and only nought is newly allowed. */
+function readNonNegativeInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer, got ${JSON.stringify(raw)}`);
   }
   return value;
 }
@@ -362,7 +406,14 @@ export const ENDPOINTER_DEFAULTS = {
   vadMinRms: 7500,
   vadFloorRatio: 2.5,
   vadSilenceMs: 900,
-  vadMinSpeechMs: 240,
+  /** How much speech makes a sound an utterance rather than furniture — a door, a
+   *  chair, the case being set down. Measured over the 37 turns on record: every
+   *  trigger the platform answered as noise needed 8 frames or fewer, and every one it
+   *  answered with a full sentence needed 9 or more. The test is `>=` against speech
+   *  accumulated over `vadSpeechWindowMs`, so the band that excludes exactly the 8-frame
+   *  group is (480, 540) at 60 ms frames; 500 is the readable value inside it, and 480
+   *  is not — `480 >= 480` still closes a turn. */
+  vadMinSpeechMs: 500,
   vadSpeechWindowMs: 3000,
   maxTurnMs: 20000,
   vadNoSpeechMs: 15000,
@@ -440,6 +491,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     // it. A step past the end of that range lands on the end, which is a legal
     // outcome rather than a mistake to refuse.
     commandStep: readInt(env, "BRIDGE_COMMAND_STEP", 10),
+    // Sixty seconds is the vendor server's own window, measured on 2026-10-10 at
+    // 60 s from the session hello — a figure this deployment had already been
+    // living with before its OTA was pointed here, so nothing about a gadget's
+    // behaviour changes by adopting it.
+    sessionIdleMs: readNonNegativeInt(env, "BRIDGE_SESSION_IDLE_MS", 60000),
+    // Empty, and unset is empty: music is something a deployment opts into, and a shipped
+    // non-empty default would point every bridge at a directory that is not there on any of them.
+    musicDir: (env.BRIDGE_MUSIC_DIR ?? "").trim(),
     ...endpointer,
   };
 }

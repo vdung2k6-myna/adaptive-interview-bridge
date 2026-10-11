@@ -1,0 +1,152 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+import { decodeTrack, musicTools, playTrack } from "../src/music.js";
+import { parseWavAudio } from "../src/protocol/wav.js";
+import type { TurnSentence } from "../src/turn.js";
+
+/** A speaker that records what it was told and does nothing else — the narrowing `playTrack`
+ *  asks for, which is why this test needs no socket, no clock and no schedule. */
+function recordingSpeaker(): {
+  sentences: TurnSentence[];
+  finishes: () => number;
+  speaker: { speak(sentence: TurnSentence): void; finish(): void };
+} {
+  const sentences: TurnSentence[] = [];
+  let finishes = 0;
+  return {
+    sentences,
+    finishes: () => finishes,
+    speaker: {
+      speak: (sentence) => void sentences.push(sentence),
+      finish: () => void (finishes += 1),
+    },
+  };
+}
+
+/** A second of a 440 Hz tone at the rate the fixture decodes to. */
+function tone(count: number): Int16Array {
+  const samples = new Int16Array(count);
+  for (let i = 0; i < count; i++) {
+    samples[i] = Math.round(Math.sin((2 * Math.PI * 440 * i) / 44100) * 12000);
+  }
+  return samples;
+}
+
+const FIXTURE = fileURLToPath(new URL("./fixtures/tone-440.mp3", import.meta.url));
+const NOT_AUDIO = fileURLToPath(new URL("./fixtures/not-audio.mp3", import.meta.url));
+const MISSING = fileURLToPath(new URL("./fixtures/no-such-file.mp3", import.meta.url));
+
+describe("decoding a track of the bridge's own", () => {
+  it("gives the samples the speaker path takes, at the file's own rate", async () => {
+    const track = await decodeTrack(FIXTURE);
+
+    assert.ok(track, "the fixture decodes");
+    // The file's rate, not the device's: the resampler every reply already passes through is
+    // where 44100 becomes the 24000 the device is told to expect, and this module does not
+    // keep a second one.
+    assert.equal(track.sampleRate, 44100);
+    assert.equal(track.samples.length, 44100, "one second of it");
+    assert.ok(track.samples instanceof Int16Array, "mono, as the device takes it");
+
+    // The tone is checked by its *shape* and not by its level, because the level is the
+    // encoder's business and the shape is not: 440 Hz crosses zero 880 times a second, which
+    // a decode producing silence, or noise, or samples at the wrong rate would not. Its level
+    // is measured in the fixture's own terms rather than assumed — ffmpeg wrote this one at a
+    // peak of 3899, and a test asserting a loud tone would be asserting ffmpeg's defaults.
+    let crossings = 0;
+    for (let i = 1; i < track.samples.length; i++) {
+      if (track.samples[i - 1]! < 0 !== track.samples[i]! < 0) crossings++;
+    }
+    assert.ok(crossings > 800 && crossings < 960, `440 Hz survived the decode: ${crossings} zero crossings`);
+  });
+
+  it("refuses a file that is not audio, rather than playing silence as a track", async () => {
+    // Measured: junk decodes to zero samples and reports zero *errors*, so a caller that read
+    // the decoder's error list would play a second of nothing and call it music.
+    assert.equal(await decodeTrack(NOT_AUDIO), null);
+  });
+
+  it("refuses a file it cannot read, and says so rather than throwing", async () => {
+    assert.equal(await decodeTrack(MISSING), null);
+  });
+});
+
+describe("what the bridge offers the model of its own", () => {
+  it("names its tools so that they are not the gadget's, and offers none with no directory", () => {
+    const offered = musicTools("/srv/music");
+
+    // The name is what tells the model which of the two catalogues it is reaching for, and what
+    // lets the sink route the call back here rather than to the gadget. The gadget's own tools are
+    // `self.` because they are about the gadget; these are about the bridge's machine.
+    assert.deepEqual(offered.map((tool) => tool.name), ["bridge.play_music", "bridge.stop_music"]);
+    assert.ok(offered.every((tool) => tool.name.startsWith("bridge.")));
+
+    // A tool the model can only be told "that did not work" about is worse than one it was never
+    // offered: it reaches for it, and the person hears an account of a failure the bridge knew
+    // about before they spoke. So this is the same gate the grammar is behind.
+    assert.deepEqual(musicTools(""), []);
+  });
+
+  it("describes each tool as a schema the platform can hand a model", () => {
+    for (const tool of musicTools("/srv/music")) {
+      assert.equal(typeof tool.description, "string");
+      assert.ok(tool.description.length > 0, `${tool.name} says what it does`);
+      const schema = tool.inputSchema as { type?: unknown; properties?: unknown };
+      assert.equal(schema.type, "object", `${tool.name} takes an object`);
+      assert.equal(typeof schema.properties, "object");
+    }
+
+    // What the person said, in their own words and unfiltered: whether a name matches a file is
+    // the directory's answer, and a catalogue that promised a particular track would be promising
+    // something it cannot know.
+    const play = musicTools("/srv/music")[0]!;
+    assert.ok((play.inputSchema as { properties: Record<string, unknown> }).properties["query"]);
+  });
+});
+
+describe("playing a track through the device's speaker", () => {
+  it("hands the whole track over as one bracket, numbered from zero", () => {
+    const { sentences, finishes, speaker } = recordingSpeaker();
+    const track = { path: "/srv/music/A Tone.mp3", sampleRate: 44100, samples: tone(44100 * 25) };
+
+    playTrack(speaker, track);
+
+    assert.deepEqual(sentences.map((sentence) => sentence.index), [0, 1, 2], "in order, from zero");
+    assert.equal(finishes(), 1, "and one bracket, closed once");
+
+    // Each chunk is a WAV this bridge's own speaker path takes — the same container the platform's
+    // sentences arrive in — and between them they hold **all** of the track. The length is the
+    // assertion, because a chunk quietly dropped is a track with a hole in it and nothing says so.
+    const parts = sentences.map((sentence) => parseWavAudio(sentence.audio!));
+    assert.ok(
+      parts.every((part) => part.sampleRate === 44100 && part.channels === 1),
+      "at the file's own rate and in mono, exactly as the module decoded it"
+    );
+    assert.equal(parts.reduce((n, part) => n + part.pcm.length / 2, 0), track.samples.length, "all of it");
+
+    // The screen names what is playing rather than numbering chunks.
+    assert.ok(sentences.every((sentence) => sentence.text === "A Tone"));
+  });
+
+  it("plays a track shorter than one chunk as a single one", () => {
+    const { sentences, finishes, speaker } = recordingSpeaker();
+
+    playTrack(speaker, { path: "/srv/music/Short.mp3", sampleRate: 44100, samples: tone(4410) });
+
+    assert.deepEqual(sentences.map((sentence) => sentence.index), [0]);
+    assert.equal(finishes(), 1);
+  });
+
+  it("closes the bracket even for a track with nothing in it", () => {
+    // `decodeTrack` refuses a file that decodes to no samples, so this is the case a caller
+    // reaches by skipping that check — and the one that must not strand a device in `Speaking`,
+    // where it discards whatever the person says next.
+    const { sentences, finishes, speaker } = recordingSpeaker();
+
+    playTrack(speaker, { path: "/srv/music/Empty.mp3", sampleRate: 44100, samples: new Int16Array(0) });
+
+    assert.deepEqual(sentences, [], "nothing is spoken");
+    assert.equal(finishes(), 1, "and the bracket is still closed");
+  });
+});

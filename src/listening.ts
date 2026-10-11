@@ -81,6 +81,10 @@ export interface VadState {
   voiced: number;
   /** The loudest of them, which is what a person's voice measured at. */
   peak: number;
+  /** Every voiced frame since this window opened, and the loudest of them — the two
+   *  the sliding window above has forgotten by the time a window is given up on. */
+  voicedEver: number;
+  peakEver: number;
   /** The room's estimated floor, from the quiet frames alone. */
   floor: number;
   /** The gate this frame was judged against, `max(vadMinRms, floor × vadFloorRatio)`. */
@@ -102,7 +106,7 @@ export function createVad(now: number): VadState {
   // not an estimate of the room. Seeding the room with it would make the opening
   // gate `vadMinRms × vadFloorRatio` — 18750 with the shipped defaults — and nothing
   // would be heard until enough quiet frames arrived to correct it.
-  return { speechMs: 0, silenceMs: 0, voiced: 0, peak: 0, floor: 0, gate: 0, quiet: [], hist: [], t0: now };
+  return { speechMs: 0, silenceMs: 0, voiced: 0, peak: 0, voicedEver: 0, peakEver: 0, floor: 0, gate: 0, quiet: [], hist: [], t0: now };
 }
 
 /**
@@ -137,6 +141,18 @@ export function vadStep(v: VadState, rms: number, config: EndpointerConfig): boo
     if (h.rms > v.peak) v.peak = h.rms;
   }
   v.speechMs = v.voiced * config.frameMs;
+
+  // The window above is what the decision is made from and what the turn-side log
+  // describes, and it is amnesiac. A window is held open for up to `vadNoSpeechMs`,
+  // and a transient that crossed the gate ages out of it long before the giveup is
+  // reached — so at the moment a window is discarded, `peak` and `voiced` read 0 and
+  // the line that reports the discard says nothing about what it discarded. These two
+  // do not age out, because the question the giveup log answers is "what did this
+  // window hold?", which is a different question from "what does it hold now?".
+  if (voiced) {
+    v.voicedEver += 1;
+    if (rms > v.peakEver) v.peakEver = rms;
+  }
 
   if (voiced) {
     v.silenceMs = 0;
@@ -292,7 +308,9 @@ export function createListening(config: EndpointerConfig, clock: () => number = 
       } else if (verdict === "giveup") {
         info(
           `no speech in ${(config.vadNoSpeechMs / 1000).toFixed(0)}s ` +
-            `(floor ${Math.round(vad.floor)}) — closing the window with no turn`
+            `(loudest ${Math.round(vad.peakEver)}, floor ${Math.round(vad.floor)}) ` +
+            `at gate ${Math.round(vad.gate)}, ${vad.voicedEver} frame(s) over it ` +
+            `— closing the window with no turn`
         );
       }
       return verdict;

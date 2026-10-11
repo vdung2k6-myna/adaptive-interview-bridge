@@ -228,8 +228,8 @@ whole of what 1.4 can be checked against from the device's side.
 
 ```
 I (677)  WifiStation: Scanning saved channel 5
-I (797)  WifiStation: Found AP: HomeNet, BSSID: a4:2b:b0:1c:2d:3e, RSSI: -9, Channel: 5
-I (977)  wifi:connected with HomeNet, aid = 2, channel 5, BW20
+I (797)  WifiStation: Found AP: ExampleNet, BSSID: 00:00:5e:00:53:0a, RSSI: -9, Channel: 5
+I (977)  wifi:connected with ExampleNet, aid = 2, channel 5, BW20
 I (4317) WifiStation: Got IP: 192.168.1.50
 I (4417) Ota: Current version: 2.5.1
 I (6507) HttpClient: Established new connection to chat.example.com:443 protocol=https cost=2090
@@ -253,7 +253,7 @@ that reply and moved on. A device outside `BRIDGE_ALLOWED_DEVICES` is refused wi
 happened for a board the bridge does not know.
 
 **The flash did not cost the provisioning.** The device still scans `channel 5`, still
-finds `HomeNet`, and still gets its old address `192.168.1.50`. The flash wrote the
+finds `ExampleNet`, and still gets its old address `192.168.1.50`. The flash wrote the
 bootloader, the partition table, `ota_data`, the app and the assets, and left `nvs` at
 0x9000 alone — which is where the Wi-Fi credentials and `board/uuid` live.
 

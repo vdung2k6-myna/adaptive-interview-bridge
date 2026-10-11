@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { describeCommand, matchCommand, type GadgetCommand } from "../src/commands.js";
+import {
+  describeCommand,
+  matchCommand,
+  type GadgetCommand,
+  type SpokenCommand,
+} from "../src/commands.js";
 import type { TurnLanguage } from "../src/turn.js";
 
 /**
@@ -19,26 +24,40 @@ import type { TurnLanguage } from "../src/turn.js";
  * (3.2).
  */
 
-const VOLUME_UP: GadgetCommand = { setting: "volume", change: { kind: "raise" } };
-const VOLUME_DOWN: GadgetCommand = { setting: "volume", change: { kind: "lower" } };
-const BRIGHT_UP: GadgetCommand = { setting: "brightness", change: { kind: "raise" } };
-const BRIGHT_DOWN: GadgetCommand = { setting: "brightness", change: { kind: "lower" } };
-const THEME_DARK: GadgetCommand = { setting: "theme", theme: "dark" };
-const THEME_LIGHT: GadgetCommand = { setting: "theme", theme: "light" };
-const volumeAt = (value: number): GadgetCommand => ({ setting: "volume", change: { kind: "set", value } });
-const brightnessAt = (value: number): GadgetCommand => ({ setting: "brightness", change: { kind: "set", value } });
+/** The gadget's own, wrapped: `matchCommand` now says which half of the bridge answers it, and
+ *  the tables below are written in terms of what the *gadget* was asked for. */
+const gadget = (command: GadgetCommand): SpokenCommand => ({ decider: "gadget", command });
+
+const VOLUME_UP = gadget({ setting: "volume", change: { kind: "raise" } });
+const VOLUME_DOWN = gadget({ setting: "volume", change: { kind: "lower" } });
+const BRIGHT_UP = gadget({ setting: "brightness", change: { kind: "raise" } });
+const BRIGHT_DOWN = gadget({ setting: "brightness", change: { kind: "lower" } });
+const THEME_DARK = gadget({ setting: "theme", theme: "dark" });
+const THEME_LIGHT = gadget({ setting: "theme", theme: "light" });
+const volumeAt = (value: number): SpokenCommand => gadget({ setting: "volume", change: { kind: "set", value } });
+const brightnessAt = (value: number): SpokenCommand => gadget({ setting: "brightness", change: { kind: "set", value } });
+
+/** The bridge's own, which is music and nothing else yet. `query` is what the person named, in
+ *  the folded form the grammar works in — whether a file answers to it is the directory's. */
+const playMusic = (query = ""): SpokenCommand => ({ decider: "bridge", command: { task: "play-music", query } });
+const STOP_MUSIC: SpokenCommand = { decider: "bridge", command: { task: "stop-music" } };
 
 /** What a matched command is, for the message on a row that failed — the same naming
  *  the log line uses, so a row that fails reads the way the session would have. */
-function say(command: GadgetCommand | null): string {
+function say(command: SpokenCommand | null): string {
   return command === null ? "nothing" : describeCommand(command);
 }
 
 /** A table, read both ways: every row's utterance against what the bridge should make
- *  of it. `null` is "no command here". */
-function read(language: TurnLanguage, rows: Array<[string, GadgetCommand | null]>): void {
+ *  of it. `null` is "no command here". `options` is what the deployment is: music forms are
+ *  recognised only where there is a directory to play from. */
+function read(
+  language: TurnLanguage,
+  rows: Array<[string, SpokenCommand | null]>,
+  options: { music?: boolean } = {}
+): void {
   for (const [utterance, expected] of rows) {
-    const heard = matchCommand(language, utterance);
+    const heard = matchCommand(language, utterance, options);
     assert.deepEqual(
       heard,
       expected,
@@ -315,5 +334,69 @@ describe("a command in the language the gadget is not set for", () => {
       ["set the volume to 50", null],
       ["dim the screen", null],
     ]);
+  });
+});
+
+describe("the bridge's own commands, which are music", () => {
+  it("recognises asking for music, and asking for it by name", () => {
+    read(
+      "vietnamese",
+      [
+        ["phát nhạc", playMusic()],
+        ["mở nhạc", playMusic()],
+        ["bật nhạc", playMusic()],
+        // The frame comes off before the forms are read, so this arrives as "nghe nhac".
+        ["cho tôi nghe nhạc", playMusic()],
+        ["mở bài diễm xưa", playMusic("diem xua")],
+        ["phát bài Diễm Xưa nhé", playMusic("diem xua")],
+        ["cho tôi nghe bài Trịnh Công Sơn", playMusic("trinh cong son")],
+      ],
+      { music: true }
+    );
+  });
+
+  it("recognises asking it to stop", () => {
+    read("vietnamese", [["dừng nhạc", STOP_MUSIC], ["tắt nhạc đi", STOP_MUSIC], ["đừng phát nữa", STOP_MUSIC]], {
+      music: true,
+    });
+  });
+
+  it("is not a command when the words are inside something else", () => {
+    // The whole-utterance rule is what keeps the grammar safe, and these are the neighbours that
+    // decide whether it earns its keep: a remark about listening to music, and a remark about a
+    // song, are answers to whatever was asked.
+    read(
+      "vietnamese",
+      [
+        ["tôi thường nghe nhạc khi làm việc", null],
+        ["bài này hay đấy", null],
+        ["mở bài", null],
+        ["nhạc", null],
+      ],
+      { music: true }
+    );
+  });
+
+  it("recognises none of it where there is nothing to play", () => {
+    // A deployment with no directory answers these as the ordinary utterances they look like to
+    // everything else, rather than recognising them and then having nothing to play.
+    read("vietnamese", [["phát nhạc", null], ["mở bài diễm xưa", null], ["dừng nhạc", null]]);
+  });
+
+  it("says the same things in the other language, by the same shapes", () => {
+    read(
+      "english",
+      [
+        ["play music", playMusic()],
+        ["put on some music", playMusic()],
+        ["play the song Yesterday", playMusic("yesterday")],
+        ["stop the music", STOP_MUSIC],
+        // And the noun is what keeps "play the game" an answer to a question rather than a
+        // request to play a file called "the game".
+        ["play the game", null],
+        ["start the track", null],
+      ],
+      { music: true }
+    );
   });
 });

@@ -1,7 +1,13 @@
 import type { GadgetCommand } from "./commands.js";
 import type { BridgeConfig } from "./config.js";
 import { info, log, warn } from "./log.js";
-import { createMcpClient, type McpOptions, type McpSocket } from "./protocol/mcp.js";
+import {
+  createMcpClient,
+  type McpCall,
+  type McpOptions,
+  type McpSocket,
+  type McpTool,
+} from "./protocol/mcp.js";
 
 /**
  * What the gadget is, and what the bridge may do to it.
@@ -104,10 +110,22 @@ export interface Gadget {
   /** What to append to the turn's system prompt, or `null` when the gadget has
    *  reported nothing — in which case the turn is asked for exactly as it is today. */
   condition(): string | null;
+  /** The gadget's own report of what it can be asked to do, in the order it gave it, for
+   *  the turn to carry onward. Empty for a gadget that reported nothing — which is a turn
+   *  asked with no tools, and every turn this bridge sent before this existed. */
+  tools(): readonly McpTool[];
   /** Carry out one command, reading the gadget for whatever the command left
    *  unsaid. Never throws, and never leaves the gadget half-changed: a call that
    *  fails is a line in the log and the setting where it was. */
   apply(command: GadgetCommand): Promise<CommandOutcome>;
+  /**
+   * Ask the gadget for one thing by name, for a call the platform's model asked for.
+   *
+   * The name is the platform's, so it may be one this gadget never reported — the gadget's own
+   * catalog refuses it, and that refusal is the answer rather than something to prevent here.
+   * Never throws, for the reason `apply` does not: what happened is a report the model reads.
+   */
+  call(name: string, args: Record<string, unknown>): Promise<McpCall>;
 }
 
 /**
@@ -171,6 +189,16 @@ export function createGadget(
 
     condition(): string | null {
       return condition;
+    },
+
+    call(name: string, args: Record<string, unknown>): Promise<McpCall> {
+      return mcp.call(name, args);
+    },
+
+    tools(): readonly McpTool[] {
+      // Read through on every turn rather than held: the catalogue is the session's, and a
+      // copy of it here would be a second place for the same answer to live and to go stale.
+      return mcp.tools();
     },
 
     async apply(command: GadgetCommand): Promise<CommandOutcome> {

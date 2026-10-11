@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createConnection } from "node:net";
+import { fileURLToPath } from "node:url";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -47,6 +49,9 @@ const CATALOG = [
 ];
 
 const RATE = ENDPOINTER_DEFAULTS.deviceRate;
+/** The directory of tracks the bridge plays from, where a test gives it one. Empty in the
+ *  default config, which is a deployment with no music at all. */
+const MUSIC = fileURLToPath(new URL("./fixtures/music", import.meta.url));
 const FRAME_MS = 60;
 const SAMPLES_PER_FRAME = (RATE * FRAME_MS) / 1000;
 /** One frame, as the device sends it: Opus payload, then the framing header. */
@@ -85,8 +90,15 @@ interface PlatformRequest {
 /** A platform that answers the catalog and, per call, a scripted reply stream. */
 async function stubPlatform(
   reply: (res: ServerResponse, call: number) => void | Promise<void>
-): Promise<{ url: string; requests: PlatformRequest[]; stop(): void }> {
+): Promise<{
+  url: string;
+  requests: PlatformRequest[];
+  /** What the bridge reported back about the gadget tools a turn asked for, in order. */
+  toolResults: Array<Record<string, unknown>>;
+  stop(): void;
+}> {
   const requests: PlatformRequest[] = [];
+  const toolResults: Array<Record<string, unknown>> = [];
   let calls = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
@@ -98,6 +110,14 @@ async function stubPlatform(
         res.end(JSON.stringify(CATALOG));
         return;
       }
+      // The turn holding its stream open for a gadget call answers here, and is not one of the
+      // turn's own requests: it carries no audio and the scripted `reply` has nothing to say to it.
+      if ((req.url ?? "").includes("/tool-result")) {
+        toolResults.push(JSON.parse(body.toString("utf8")) as Record<string, unknown>);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ settled: true }));
+        return;
+      }
       requests.push({ path: req.url ?? "", body });
       void reply(res, calls++);
     });
@@ -106,6 +126,7 @@ async function stubPlatform(
   if (!server.address()) await once(server, "listening");
   return {
     requests,
+    toolResults,
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     stop() {
       server.closeAllConnections();
@@ -114,7 +135,7 @@ async function stubPlatform(
   };
 }
 
-function configFor(platformUrl: string): BridgeConfig {
+function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   return {
     otaPort: 0,
     wsPort: 0,
@@ -128,9 +149,12 @@ function configFor(platformUrl: string): BridgeConfig {
     serverRate: 24000,
     frameMs: FRAME_MS,
     ...ENDPOINTER_DEFAULTS,
+    sessionIdleMs: 60000,
+    musicDir: "",
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    ...overrides,
   };
 }
 
@@ -142,14 +166,30 @@ interface Session {
   messages: string[];
   binaries: Buffer[];
   until(predicate: () => boolean, what: string, ms?: number): Promise<void>;
+  /** The code the bridge's end of the socket closed with, or null while it is open.
+   *  A bridge that ends the session itself closes with 1000; a test tearing the socket
+   *  down sees 1006. Without the code the two are the same event, and "the session was
+   *  ended" would pass on a test that ended it. */
+  closeCode(): number | null;
+  /** Resolves with that code once the socket closes, whoever closed it. */
+  closed: Promise<number>;
+  /** One frame, as the device sends it, for a test that needs the uplink alive over
+   *  wall-clock time — which is what the endpointer's own clocks measure against. */
+  raw(frame: Buffer): void;
   stop(): void;
 }
 
-async function spokenDevice(config: BridgeConfig): Promise<Session> {
-  const wss = createWsServer(config, {
-    catalog: createPersonaCatalog(config),
-    conversations: createConversations(config),
-  });
+/** What a bridge holds between sockets: the persona catalog it reads and the
+ *  conversations it keeps. Passed in so a test can hand two sessions the same ones —
+ *  which is what makes "the conversation outlives the session" a thing that can be
+ *  observed rather than assumed. */
+type BridgeServices = Parameters<typeof createWsServer>[1];
+
+async function spokenDevice(
+  config: BridgeConfig,
+  services: BridgeServices = { catalog: createPersonaCatalog(config), conversations: createConversations(config) }
+): Promise<Session> {
+  const wss = createWsServer(config, services);
   if (!wss.address()) await once(wss, "listening");
   const port = (wss.address() as AddressInfo).port;
 
@@ -167,6 +207,16 @@ async function spokenDevice(config: BridgeConfig): Promise<Session> {
     for (const wake of waiters.splice(0)) wake();
   });
 
+  let closeCode: number | null = null;
+  let onClose: (code: number) => void = () => {};
+  const closed = new Promise<number>((resolve) => {
+    onClose = resolve;
+  });
+  ws.on("close", (code) => {
+    closeCode = code;
+    onClose(code);
+  });
+
   const typed = (): Array<Record<string, unknown>> => messages.map((m) => JSON.parse(m) as Record<string, unknown>);
   const countOf = (type: string, state?: string): number =>
     typed().filter((m) => m.type === type && (state === undefined || m.state === state)).length;
@@ -175,10 +225,17 @@ async function spokenDevice(config: BridgeConfig): Promise<Session> {
     messages,
     binaries,
     send: (message) => ws.send(JSON.stringify(message)),
+    raw: (frame) => ws.send(frame, { binary: true }),
     /** One utterance: room tone, a person speaking, then the silence that closes it. */
     speak() {
+      // The shortest run of speech the endpointer will close a turn on, taken from the
+      // knob rather than written down: this file's whole subject is the path a real
+      // utterance takes, so it has to clear whatever minimum the bridge actually ships.
+      // It was a literal 6 frames, which stopped being an utterance when the minimum
+      // rose to 500 ms.
+      const speechFrames = Math.ceil(ENDPOINTER_DEFAULTS.vadMinSpeechMs / FRAME_MS);
       for (let i = 0; i < 40; i++) ws.send(ROOM, { binary: true });
-      for (let i = 0; i < 6; i++) ws.send(SPEECH, { binary: true });
+      for (let i = 0; i < speechFrames; i++) ws.send(SPEECH, { binary: true });
       for (let i = 0; i < Math.round(ENDPOINTER_DEFAULTS.vadSilenceMs / FRAME_MS); i++) {
         ws.send(ROOM, { binary: true });
       }
@@ -210,6 +267,8 @@ async function spokenDevice(config: BridgeConfig): Promise<Session> {
         setTimeout(resolve, seconds * 1000 + ENDPOINTER_DEFAULTS.drainGuardMs + 150).unref()
       );
     },
+    closeCode: () => closeCode,
+    closed,
     stop() {
       ws.terminate();
       wss.clients.forEach((client) => client.terminate());
@@ -261,13 +320,13 @@ describe("a person speaks to the gadget", () => {
       assert.equal(typed.filter((m) => m.state === "sentence_start").length, 1);
       assert.ok(device.binaries.length > 0, "and the reply's audio, inside it");
 
-      // 6.1 — the utterance, not the window it was spoken into. The window ran 61
-      // frames (3.66 s); the upload is that utterance trimmed back from the last
+      // 6.1 — the utterance, not the window it was spoken into. The window ran 64
+      // frames (3.84 s); the upload is that utterance trimmed back from the last
       // voiced frame plus the silence that closed it, which is well under two seconds.
       assert.equal(platform.requests.length, 1);
       const seconds = uploadedSeconds(platform.requests[0]!);
       assert.ok(seconds > 0.4, `${seconds}s is too short to hold the utterance`);
-      assert.ok(seconds < 3.0, `${seconds}s was uploaded out of a 3.66s window`);
+      assert.ok(seconds < 3.0, `${seconds}s was uploaded out of a 3.84s window`);
       assert.match(platform.requests[0]!.body.toString("latin1"), /filename="turn\.wav"/);
     } finally {
       device.stop();
@@ -395,23 +454,7 @@ describe("a person speaks to the gadget", () => {
       device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
       await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
 
-      // The gadget's side of the exchange, answered the way the firmware answers:
-      // by method, echoing the id it was asked with. A real board's reply arrives
-      // through the same socket this test is holding, as `{"type":"mcp","payload":…}`.
-      // Each method is asked once, so finding it by name is finding the only one.
-      const asked = (method: string): number | null => {
-        for (const raw of device.messages) {
-          const msg = JSON.parse(raw) as { type?: string; payload?: { id?: number; method?: string } };
-          if (msg.type === "mcp" && msg.payload?.method === method && typeof msg.payload.id === "number") {
-            return msg.payload.id;
-          }
-        }
-        return null;
-      };
-      const replyTo = async (method: string, result: unknown): Promise<void> => {
-        await device.until(() => asked(method) !== null, `the bridge to ask ${method}`);
-        device.send({ type: "mcp", payload: { jsonrpc: "2.0", id: asked(method), result } });
-      };
+      const { replyTo } = gadgetSide(device);
 
       await replyTo("initialize", { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "xiaozhi-s3", version: "1.0.0" } });
       await replyTo("tools/list", {
@@ -447,6 +490,368 @@ describe("a person speaks to the gadget", () => {
       assert.match(prompt, /battery 12%, not charging/);
       assert.match(prompt, /network wifi "nha", signal weak/);
       assert.ok(!/nearly flat|low battery/i.test(prompt), `the bridge added no reading of its own: ${prompt}`);
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("asks the turn with the gadget's own catalogue, schema and all", async () => {
+    // The half of D3 that only a session can show: the catalogue the model will decide from
+    // is the one this gadget reported on this socket, carried as the gadget gave it. `args`
+    // is what the bridge clamps a relative command against; the platform has no use for it,
+    // and sending it would be a second copy of what `inputSchema` already says.
+    const tool = {
+      name: "self.audio_speaker.set_volume",
+      description: "Set the volume of the audio speaker.",
+      inputSchema: { type: "object", properties: { volume: { type: "integer", minimum: 0, maximum: 100 } } },
+    };
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "toi noi gi" }));
+      res.write(sse("done", { fullText: "ok" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      const { replyTo } = gadgetSide(device);
+      await replyTo("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        serverInfo: { name: "xiaozhi-s3", version: "1.0.0" },
+      });
+      await replyTo("tools/list", { tools: [tool], nextCursor: "" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+
+      const body = platform.requests[0]!.body.toString("latin1");
+      assert.match(body, /name="tools"/, "the turn carries the gadget's catalogue");
+      assert.match(body, /self\.audio_speaker\.set_volume/, "and the entry is the gadget's own");
+      assert.match(body, /"inputSchema"/, "with the schema the gadget sent rather than one rebuilt here");
+      assert.ok(!/"args"/.test(body), "and without this bridge's reading of that schema");
+
+      // And the bridge's own tools travel in the same field, under names that say so. The platform
+      // is told nothing about the difference: it passes an array it already passed, and a call
+      // naming `bridge.` comes back to a sink that answers it here instead of forwarding it (4.2).
+      assert.match(body, /bridge\.play_music/, "the bridge's own tool sits beside the gadget's");
+      assert.match(body, /bridge\.stop_music/);
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("asks a turn with the bridge's own tools alone when the gadget has none", async () => {
+    // The scenario the requirement names: a gadget that advertised nothing is asked with the
+    // bridge's tools *rather than* with a catalogue the gadget never gave. Those tools are the
+    // bridge's own and belong to no gadget — a call naming one is answered by the bridge's sink
+    // and the gadget is neither asked nor told (4.2).
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "toi noi gi" }));
+      res.write(sse("done", { fullText: "ok" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+
+      const body = platform.requests[0]!.body.toString("latin1");
+      assert.match(body, /name="tools"/, "the field is there for the bridge's own");
+      assert.match(body, /bridge\.play_music/);
+      assert.match(body, /bridge\.stop_music/);
+      assert.ok(!/self\./.test(body), "and nothing is offered as something this gadget has");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("asks a turn with no tools at all when neither the gadget nor the bridge has any", async () => {
+    // Absent, not empty. A gadget that advertises no tool channel — which is every device this
+    // bridge served before this existed — on a bridge with no music directory: asked for exactly
+    // the turn it would have been asked for otherwise, and an empty list would be a different
+    // claim from silence.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "toi noi gi" }));
+      res.write(sse("done", { fullText: "ok" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+
+      const body = platform.requests[0]!.body.toString("latin1");
+      assert.ok(!body.includes('name="tools"'), "a turn with no tools is asked with no tools field");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  /** The one tool the tests below report, so a name that is *not* in it can be tried. */
+  const VOLUME_TOOL = {
+    name: "self.audio_speaker.set_volume",
+    description: "Set the volume of the audio speaker.",
+    inputSchema: { type: "object", properties: { volume: { type: "integer", minimum: 0, maximum: 100 } } },
+  };
+  const STATUS = { audio_speaker: { volume: 42 }, screen: { brightness: 68, theme: "dark" } };
+  /** What these tests' gadget reports: the condition the bridge reads for itself at the
+   *  handshake, and the setting the model is asked to change. Nothing else — which is what
+   *  makes a name outside it (the lamp, below) a name this gadget never said it had. */
+  const REPORTED_TOOLS = [
+    { name: "self.get_device_status", description: "…", inputSchema: { type: "object", properties: {} } },
+    VOLUME_TOOL,
+  ];
+
+  /** Answer the handshake the way the firmware does, and hand back the gadget's side of the
+   *  channel for whatever the turn asks it afterwards. */
+  async function handshakeAs(device: Session, tools: unknown[]): Promise<ReturnType<typeof gadgetSide>> {
+    const side = gadgetSide(device);
+    await side.replyTo("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      serverInfo: { name: "xiaozhi-s3", version: "1.0.0" },
+    });
+    await side.replyTo("tools/list", { tools, nextCursor: "" });
+    await side.replyTo("tools/call", {
+      content: [{ type: "text", text: JSON.stringify(STATUS) }],
+      isError: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return side;
+  }
+
+  it("makes the call the platform asked for, and reports back what the gadget did", async () => {
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "ha xuong 60 di" }));
+      // The model, and not the words, decided this — which is the whole of what the platform's
+      // half of 4.5 adds, and the reason the bridge's grammar no longer has to cover it.
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "self.audio_speaker.set_volume",
+          arguments: { volume: 60 },
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      const gadget = await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+
+      // The bridge asks the gadget, and the gadget answers the way the firmware does.
+      await gadget.replyTo("tools/call", { content: [{ type: "text", text: "true" }], isError: false });
+      await device.until(() => platform.toolResults.length === 1, "the bridge to report what the gadget did");
+
+      // The arguments are the platform's, unaltered: the bridge is the hands here, and not a
+      // second opinion about what was asked for.
+      const calls = device.messages
+        .map(
+          (raw) =>
+            JSON.parse(raw) as {
+              type?: string;
+              payload?: { method?: string; params?: { name?: string; arguments?: Record<string, unknown> } };
+            }
+        )
+        .filter((msg) => msg.type === "mcp" && msg.payload?.method === "tools/call")
+        .map((msg) => msg.payload!.params!);
+      assert.ok(
+        calls.some((params) => params.name === "self.audio_speaker.set_volume" && params.arguments?.volume === 60),
+        `the gadget was asked for what the model asked for: ${JSON.stringify(calls)}`
+      );
+
+      // And the result went back under the turn the platform named, so the turn it is holding
+      // open can be resumed rather than timing out.
+      assert.deepEqual(platform.toolResults[0], { turnId: "turn-1", index: 0, ok: true, text: "true" });
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("reports a call the gadget's own report does not carry, without asking the gadget", async () => {
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "bat den len" }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-2",
+          index: 0,
+          name: "self.lamp.turn_on",
+          arguments: {},
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      // A report carrying the condition and the volume, and nothing else: the lamp is a name
+      // this gadget never said it had.
+      await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+      await device.until(() => platform.toolResults.length === 1, "the bridge to report the refusal");
+
+      assert.equal(platform.toolResults[0]!.ok, false, "a call that cannot be made is reported as one");
+      assert.match(
+        String(platform.toolResults[0]!.message),
+        /did not report a tool named self\.lamp\.turn_on/,
+        "and the reason is the report, in the gadget's own terms"
+      );
+
+      // The gadget was never asked. The report is the whole of what is callable (D3), and the
+      // refusal belongs where the report is rather than as an `Unknown tool:` from the board.
+      assert.ok(
+        !device.messages.some((raw) => raw.includes("self.lamp.turn_on")),
+        "a name the report did not carry never reaches the gadget"
+      );
+
+      // And the turn ended in speech — the session is still here, and takes another turn.
+      assert.equal(device.closeCode(), null, "nothing about it ended the session");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("plays what the model asked the bridge for, and never asks the gadget", async () => {
+    // 4.2: the catalogue offers the bridge's own tools beside the gadget's (4.1), and a call naming
+    // one of them is answered here. The gadget never reported `bridge.play_music` and has no such
+    // tool, so forwarding it would be asking a device for something it does not have — and the
+    // refusal that came back would be an answer to a question nobody asked it.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "toi muon nghe bai Tone 440" }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "bridge.play_music",
+          arguments: { query: "Tone 440" },
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+      // Reported back rather than held: the platform is holding the turn open for exactly this, and
+      // the model speaks from it. The track is named as the file that will play, which is the answer
+      // the directory gave rather than a promise the model made.
+      await device.until(() => platform.toolResults.length === 1, "the bridge to answer the call");
+      assert.deepEqual(platform.toolResults[0], {
+        turnId: "turn-1",
+        index: 0,
+        ok: true,
+        text: "playing the track Tone 440.mp3 through the device's speaker",
+      });
+
+      // Nothing about it reached the gadget — not the call, and not a name it could be asked by.
+      assert.ok(
+        !device.messages.some((raw) => raw.includes("bridge.")),
+        "a tool of the bridge's own never reaches the gadget, in either direction"
+      );
+
+      // And the track plays, through the bracket every reply already goes out in.
+      await device.until(() => device.binaries.length > 0, "the track to play");
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(typed.filter((m) => m.type === "tts" && m.state === "start").length, 1, "one bracket");
+      assert.ok(
+        typed.some((m) => m.state === "sentence_start" && m.text === "Tone 440"),
+        "and the screen names the track, as it names a sentence"
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("reports a bridge tool it cannot answer, and asks the gadget for neither", async () => {
+    // Two ways a call to the bridge's own namespace fails, and one answer to both: the model is told
+    // what happened, because the model is who is holding the turn and who has to say something to
+    // the person. Neither reaches the gadget, which never reported either name.
+    const platform = await stubPlatform((res, call) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: call === 0 ? "bat den len" : "mo bai khong co bai nay" }));
+      res.write(
+        sse("tool_call", {
+          turnId: `turn-${call + 1}`,
+          index: 0,
+          // A name under the bridge's own prefix that the bridge does not have, and then a name it
+          // does have asking for a track the directory does not hold.
+          name: call === 0 ? "bridge.lamp_turn_on" : "bridge.play_music",
+          arguments: call === 0 ? {} : { query: "khong co bai nay" },
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.toolResults.length === 1, "the first refusal");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.toolResults.length === 2, "the second refusal");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      assert.equal(platform.toolResults[0]!.ok, false, "a name the bridge does not have is a failure");
+      assert.match(
+        String(platform.toolResults[0]!.message),
+        /this bridge has no tool named bridge\.lamp_turn_on/,
+        "said as the bridge's own answer, and not as a gadget's refusal of a call nobody made"
+      );
+      assert.equal(platform.toolResults[1]!.ok, false, "and so is a track the directory does not hold");
+      assert.match(String(platform.toolResults[1]!.message), /nothing in .* matches khong co bai nay/);
+
+      // Neither was played, and neither was asked of the gadget.
+      assert.equal(device.binaries.length, 0, "no bracket was opened for a track that does not exist");
+      assert.ok(!device.messages.some((raw) => raw.includes("bridge.")), "nor reached the gadget");
     } finally {
       device.stop();
       platform.stop();
@@ -690,6 +1095,635 @@ describe("the wake word during a reply", () => {
         new RegExp(`"role":"user","content":"${INTERRUPTED}"`),
         "the question the person was cut off asking is still in the conversation"
       );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+});
+
+/** Wait for the bridge to end the session, and fail unless it was the bridge that did it.
+ *
+ *  The close *code* is the whole of what makes this observable. `ws.close()` sends a close
+ *  frame with no status code, which the peer reports as 1005 — and that, or a 1000, is the
+ *  bridge ending a session. 1006 is a socket destroyed without a close frame, which is what
+ *  `stop()` does; and a session that is still open never resolves at all. Asserting 1000
+ *  would fail on the bridge behaving correctly, which is how this test was written first. */
+async function endedByBridge(device: Session, ms: number): Promise<void> {
+  const code = await Promise.race([
+    device.closed,
+    new Promise<null>((resolve) => {
+      setTimeout(() => resolve(null), ms).unref();
+    }),
+  ]);
+  if (code === null) throw new Error(`the session was still open after ${ms}ms`);
+  if (code === 1006) {
+    throw new Error("the socket was torn down without a close frame — that is stop(), not the bridge");
+  }
+}
+
+/** A device that completes the upgrade by hand and then never answers a close.
+ *
+ *  The `ws` client cannot be the peer that test is about: it answers a closing handshake as a
+ *  matter of course, so a bridge that waited thirty seconds for one would look exactly like a
+ *  bridge that did not. The gadget is the peer that does not answer — measured on the board,
+ *  where the old socket stayed open until the device was next woken — and this stands in for
+ *  it: enough websocket to be admitted, and then silence. */
+async function silentDevice(
+  config: BridgeConfig,
+  services: BridgeServices
+): Promise<{ gone: Promise<void>; stop(): void }> {
+  const wss = createWsServer(config, services);
+  if (!wss.address()) await once(wss, "listening");
+  const port = (wss.address() as AddressInfo).port;
+
+  const socket = createConnection(port, "127.0.0.1");
+  await once(socket, "connect");
+  socket.write(
+    `GET /xiaozhi/v1/ HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${port}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `Sec-WebSocket-Key: ${Buffer.from("0123456789abcdef").toString("base64")}\r\n` +
+      `Authorization: Bearer ${deriveToken(SECRET, BOARD)}\r\n` +
+      `device-id: ${BOARD}\r\n` +
+      `\r\n`
+  );
+  // Read and discarded, never answered: the close frame the bridge sends is left where it lands,
+  // which is the whole of what this peer is.
+  socket.resume();
+
+  return {
+    gone: new Promise<void>((resolve) => socket.once("close", () => resolve())),
+    stop() {
+      socket.destroy();
+      wss.clients.forEach((client) => client.terminate());
+      wss.close();
+    },
+  };
+}
+
+/** The gadget's side of the tool channel, answered the way the firmware answers: by method,
+ *  echoing the id it was asked with. A real board's reply arrives through the same socket
+ *  these tests are holding, as `{"type":"mcp","payload":…}`. Each method is asked once, so
+ *  finding it by name is finding the only one. */
+function gadgetSide(device: Session): {
+  asked(method: string): number | null;
+  replyTo(method: string, result: unknown): Promise<void>;
+} {
+  // The first request of that method the bridge has not been answered on. A session asks
+  // `tools/call` more than once — the status at the handshake, then whatever the platform's
+  // model asked for — so "the first one" would keep handing back the same id.
+  const answered = new Set<number>();
+  const asked = (method: string): number | null => {
+    for (const raw of device.messages) {
+      const msg = JSON.parse(raw) as { type?: string; payload?: { id?: number; method?: string } };
+      if (
+        msg.type === "mcp" &&
+        msg.payload?.method === method &&
+        typeof msg.payload.id === "number" &&
+        !answered.has(msg.payload.id)
+      ) {
+        return msg.payload.id;
+      }
+    }
+    return null;
+  };
+  return {
+    asked,
+    async replyTo(method, result) {
+      await device.until(() => asked(method) !== null, `the bridge to ask ${method}`);
+      const id = asked(method)!;
+      answered.add(id);
+      device.send({ type: "mcp", payload: { jsonrpc: "2.0", id, result } });
+    },
+  };
+}
+
+describe("a session nobody is speaking into", () => {
+  // The idle window is the one thing here measured in wall clock, so these configure it
+  // small rather than waiting a minute for the shipped 60000. Everything else is the
+  // shipped endpointer: what runs is the real path — a real timer, a real socket — and
+  // not a shortened stand-in for it.
+  const reply = (res: ServerResponse, text: string): void => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(sse("user", { text }));
+    res.write(sse("sentence", { index: 0, text: "vang", audioData: sentenceAudio(REPLY_SECONDS) }));
+    res.write(sse("done", { fullText: "vang" }));
+    res.end();
+  };
+
+  it("ends it, and sends no turn for it", async () => {
+    const platform = await stubPlatform((res) => reply(res, "khong ai noi gi"));
+    const device = await spokenDevice(configFor(platform.url, { sessionIdleMs: 150 }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      device.send({ type: "listen", state: "start", mode: "manual" });
+
+      // Then nothing at all: no speech, no verdict, nothing a person was behind.
+      await endedByBridge(device, 4_000);
+      assert.equal(platform.requests.length, 0, "and no turn was sent for a session nobody spoke into");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("ends it while frames are still arriving, which a giveup must not prevent", async () => {
+    // The correction the design had to make. The endpointer gives up on a window
+    // `vadNoSpeechMs` after it opens and the bridge opens the next one, so an empty room
+    // produces a `giveup` every few frames for as long as the device is listening. Were a
+    // giveup evidence of a person, the window below would never fire — so this passing at
+    // all is the assertion, and the frames have to keep coming for it to mean anything.
+    const platform = await stubPlatform((res) => reply(res, "khong ai noi gi"));
+    const device = await spokenDevice(
+      configFor(platform.url, { sessionIdleMs: 400, vadNoSpeechMs: 120 })
+    );
+    const ticking = setInterval(() => device.raw(ROOM), FRAME_MS);
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      device.send({ type: "listen", state: "start", mode: "manual" });
+
+      await endedByBridge(device, 4_000);
+      assert.equal(platform.requests.length, 0, "and a room nobody spoke in produced no turn");
+    } finally {
+      clearInterval(ticking);
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("does not end one a person is taking turns in", async () => {
+    // The window resets on a turn and on the reply that follows it, so two turns inside
+    // one window leave the session open — which is the difference between a person and a
+    // room with a fan in it.
+    const platform = await stubPlatform((res, call) =>
+      reply(res, call === 0 ? "cau tra loi mot" : "cau tra loi hai")
+    );
+    const device = await spokenDevice(configFor(platform.url, { sessionIdleMs: 4_000 }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the first turn");
+
+      await device.played(REPLY_SECONDS);
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the second turn");
+
+      assert.equal(device.closeCode(), null, "two turns inside the window left the session open");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("does not end one the bridge is playing a track into", async () => {
+    // Found on the board 2026-10-11: a 152-second track was cut off after 61 seconds. The window is
+    // measured from what a *person* did, and a person sitting and listening does nothing at all — so
+    // the longest track this bridge could finish was one shorter than the window, which is the one
+    // thing a track is not. A track the person asked for is theirs for as long as it plays, and the
+    // end of the bridge's own audio is where the window runs from instead.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "phát bài Long Tone" }));
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(
+      configFor(platform.url, { sessionIdleMs: 400, musicDir: MUSIC, language: "vietnamese" })
+    );
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the track to start"
+      );
+
+      // A 400ms window and a twelve-second track: whole windows go by with nobody saying anything,
+      // which is the state the window exists for and the one that must not end this.
+      await device.played(3);
+      assert.equal(device.closeCode(), null, "the music is the person, and the session is still here");
+
+      // Nor is the window merely suspended: once the track has played out it runs from there, so the
+      // person gets the whole of their track and a window after it rather than neither.
+      await device.played(11);
+      await endedByBridge(device, 4_000);
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("finishes a close the peer never answers, rather than waiting out ws's thirty seconds", async () => {
+    // Measured on the board: the gadget leaves the old socket open until it is next woken, so
+    // the closing handshake goes unanswered and `ws` would spend its own `closeTimeout` — thirty
+    // seconds — on it. For that long the bridge holds a session, and a decoder, for a device it
+    // has already finished with, and a wake word inside the window would open a second session
+    // beside it. Nothing else in this file can show this: the `ws` client answers a close as a
+    // matter of course, so it never reaches the grace. This peer does not answer.
+    const platform = await stubPlatform((res) => reply(res, "khong ai noi gi"));
+    const config = configFor(platform.url, { sessionIdleMs: 400 });
+    const services: BridgeServices = {
+      catalog: createPersonaCatalog(config),
+      conversations: createConversations(config),
+    };
+
+    const at = Date.now();
+    const silent = await silentDevice(config, services);
+    try {
+      await silent.gone;
+      const waited = Date.now() - at;
+      assert.ok(
+        waited < 5_000,
+        `${waited}ms — the socket outlived the grace the bridge gives a closing handshake`
+      );
+    } finally {
+      silent.stop();
+      platform.stop();
+    }
+  });
+
+  it("leaves the conversation for the session after it", async () => {
+    // The close ends a connection, not a conversation. History is held per device
+    // (`conversation.ts`), so what the person said before the gap is in the turn they
+    // take after it — which is what makes ending a session a thing a deployment can do
+    // at all, rather than a thing that costs the person everything they had said.
+    const platform = await stubPlatform((res, call) =>
+      reply(res, call === 0 ? "cau hoi thu nhat" : "cau hoi thu hai")
+    );
+    const config = configFor(platform.url, { sessionIdleMs: 150 });
+    const services: BridgeServices = {
+      catalog: createPersonaCatalog(config),
+      conversations: createConversations(config),
+    };
+
+    const first = await spokenDevice(config, services);
+    try {
+      first.send({ type: "hello", version: 3, transport: "websocket" });
+      await first.until(() => first.messages.some((m) => m.includes('"hello"')), "the first hello");
+      first.send({ type: "listen", state: "start", mode: "manual" });
+      first.speak();
+      await first.until(() => platform.requests.length === 1, "the first turn");
+      await endedByBridge(first, 4_000);
+    } finally {
+      first.stop();
+    }
+
+    const second = await spokenDevice(config, services);
+    try {
+      second.send({ type: "hello", version: 3, transport: "websocket" });
+      await second.until(() => second.messages.some((m) => m.includes('"hello"')), "the second hello");
+      second.send({ type: "listen", state: "start", mode: "manual" });
+      second.speak();
+      await second.until(() => platform.requests.length === 2, "the second turn");
+
+      assert.match(
+        platform.requests[1]!.body.toString("latin1"),
+        /"role":"user","content":"cau hoi thu nhat"/,
+        "the turn after the gap still carries what was said before it"
+      );
+    } finally {
+      second.stop();
+      platform.stop();
+    }
+  });
+});
+
+describe("music the bridge plays itself", () => {
+  /** A platform that transcribes whatever the test wants heard, and then has nothing more to say.
+   *  A command is knowable only from the transcript (D12), so every one of these starts here. */
+  const hears = (said: string) =>
+    stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: said }));
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+
+  /** Bring a device up, say one thing to it, and let the turn close.
+   *
+   *  Vietnamese, because that is the language these forms are for and the one the person in front
+   *  of the gadget speaks. The English forms are the same grammar in other words, and the pair is
+   *  asserted in `commands.test.ts`; what is being pinned here is the path from an utterance to a
+   *  track, and it is not improved by pinning it in a language nobody in the room is using. */
+  async function ask(platform: Awaited<ReturnType<typeof stubPlatform>>, said: string, musicDir = MUSIC) {
+    const device = await spokenDevice(configFor(platform.url, { musicDir, language: "vietnamese" }));
+    device.send({ type: "hello", version: 3, transport: "websocket" });
+    await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+    device.send({ type: "listen", state: "start", mode: "manual" });
+    device.speak();
+    await device.until(() => platform.requests.length === 1, "the turn to be served");
+    return device;
+  }
+
+  it("plays the track the person asked for, and asks the platform nothing", async () => {
+    const platform = await hears("phát nhạc");
+    const device = await ask(platform, "phát nhạc");
+    try {
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the bracket to open around the track"
+      );
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(typed.filter((m) => m.type === "tts" && m.state === "start").length, 1, "one bracket");
+      assert.ok(device.binaries.length > 0, "and the track's own audio, inside it");
+
+      // The screen names what is playing, which is the one place a person can read it. "phát nhạc"
+      // names no track, so the first by name is what plays — `Long Tone.mp3`, the fixtures' names
+      // ordering that way for the same reason a deployment would order its own.
+      const announced = typed.find((m) => m.state === "sentence_start");
+      assert.equal(announced?.text, "Long Tone");
+
+      // One request for the turn, and nothing asked of the model about the command: the decision
+      // was the grammar's, and the playing is the bridge's.
+      assert.equal(platform.requests.length, 1, "no second turn, and no tool call");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("judges nothing while a track plays, and takes the next turn once it has ended", async () => {
+    // The measurement this change exists for (2026-10-11): judged frames of the bridge's own
+    // *speech* land below the gate and are harmless, where a room playing music is not — so a
+    // listened-to track would close turn after turn on its own sound and the gadget would answer
+    // it. What holds the window shut is the drain deadline, and it covers a whole track because a
+    // track is handed over whole: `turnMs` is the audio the turn *reserved*, which for a track is
+    // all of it, where for a reply it is the one sentence on the stream so far.
+    //
+    // The utterance sent over the track is a whole one — speech, and then the silence that closes
+    // a turn — because an utterance that never closes into silence would close no turn with the
+    // window wide open either, and "no turn closed" would then hold for the wrong reason.
+    const platform = await hears("phát nhạc");
+    const device = await ask(platform, "phát nhạc");
+    try {
+      await device.until(() => device.binaries.length > 0, "the track to start playing");
+
+      device.speak();
+      // Long enough for the endpointer to have closed a turn on it had it been judging — measured
+      // at 3.3s of frames, plus the walk from the verdict to the platform.
+      await device.played(3);
+      assert.equal(platform.requests.length, 1, "no turn closed on the bridge's own music");
+
+      // Twelve seconds of track and a 400ms guard: once that is behind us the room is the person's
+      // again, which is what says the window was shut for the track rather than broken for good.
+      await device.played(13);
+      // The device is listening again — on the board that is its own `listen start`, sent when its
+      // speaker stops, and the only thing that opens the next window. A test that skipped it would be
+      // relying on a `listen start` the *bridge* sent itself, and there is only one reason the bridge
+      // ever did: a music turn was wrongly reported as one that opened no bracket.
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the next turn to be served");
+      assert.equal(device.binaries.length > 0, true, "and the track played on through all of it");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("plays nothing, and says why, for a name nothing answers to", async () => {
+    const platform = await hears("mở bài không có bài này");
+    const device = await ask(platform, "mở bài không có bài này");
+    // The refusal is a log line and not a bracket, so the log is where it has to be read: the
+    // device is sent nothing either way, and silence on the wire cannot tell a track that was
+    // refused from an utterance the bridge never took for a command at all.
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...a: unknown[]): void => void lines.push(a.map(String).join(" "));
+    try {
+      await device.until(
+        () => lines.some((line) => line.includes("command not carried out")),
+        "the refusal to be reported"
+      );
+
+      // Nothing was played: playing the wrong track is worse than playing none, because the person
+      // hears something they did not ask for and has no way to tell that is what happened — the
+      // directory is the whole of what may be played.
+      assert.equal(
+        device.messages.filter((m) => m.includes('"tts"')).length,
+        0,
+        "no bracket was opened for a track that does not exist"
+      );
+      assert.equal(device.binaries.length, 0, "and no audio went out unqualified by one");
+    } finally {
+      console.log = original;
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("stops on the wake word the way a reply stops", async () => {
+    // The second transcript is an ordinary thing to say, so that the turn after the stop is asked
+    // as a turn rather than recognised as the command again — which is the half of this that says
+    // the stop left the session able to carry on.
+    let served = 0;
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: served++ === 0 ? "phát bài Long Tone" : "thế còn bài kia thì sao" }));
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await ask(platform, "phát bài Long Tone");
+    try {
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the track to start"
+      );
+
+      // The wake word, which the firmware sends from wherever it detected it — and a track is what
+      // was playing, so what stops is the track (`Speaker.stop()`).
+      device.send({ type: "abort", reason: "wake_word_detected" });
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the bracket to close"
+      );
+
+      const framesAtStop = device.binaries.length;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      // A twelve-second track, stopped in its first second: what the schedule was still holding —
+      // most of the track — never reaches the device.
+      assert.ok(
+        device.binaries.length - framesAtStop < 20,
+        `${device.binaries.length - framesAtStop} frame(s) arrived after the stop`
+      );
+
+      // And the device is listening again, as it is after every wake word: the turn after the one
+      // the track was stopped in is taken as any turn is.
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      await device.played(1.5);
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the next turn to be served");
+      assert.equal(served, 2);
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("answers what the grammar knows itself, and asks the model only for the rest", async () => {
+    // The two deciders and their one order (D8). Both turns of this session are the same person
+    // asking for the same track; what differs is whether the bridge already knows what the words
+    // are. The grammar reads the whole utterance and, when it recognises one, answers it and drops
+    // the turn before the platform's model has said anything — so the model is not asked to decide,
+    // though it was offered the tools to decide with. Only a phrasing the grammar has no form for
+    // reaches it, and what comes back is a call the bridge answers itself (4.2).
+    const platform = await stubPlatform((res, call) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: call === 0 ? "phát nhạc" : "tôi muốn nghe bài Long Tone" }));
+      if (call > 0) {
+        res.write(
+          sse("tool_call", {
+            turnId: "turn-2",
+            index: 0,
+            name: "bridge.play_music",
+            arguments: { query: "Long Tone" },
+          })
+        );
+      }
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      // The first turn: recognised, and nothing about it goes to the model.
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the track to play"
+      );
+      assert.equal(platform.toolResults.length, 0, "the model decided nothing, because it was not asked");
+      // And it was not kept in the dark to get that: the catalogue went up with the turn, the
+      // bridge's own tool among it. What made the decision was the order, not the tools' absence.
+      assert.match(platform.requests[0]!.body.toString("latin1"), /bridge\.play_music/);
+
+      // A twelve-second track, and the window shut for every second of it (2.2): the second turn is
+      // taken once the track has played out, as any turn after a track is. Waited out with a margin
+      // rather than to the millisecond — the deadline is the track *plus* its guard, and on the board
+      // it is the device's own continuous stream that ends the drain; a test that sent its utterance
+      // in the last hundred milliseconds of it would be racing the guard rather than checking it.
+      await device.played(13);
+      const before = device.binaries.length;
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the second turn to be served");
+
+      // These words are not one of the grammar's forms, so they are the model's to answer — and the
+      // model reaches for the tool the bridge offered it rather than being told what to do.
+      await device.until(() => platform.toolResults.length === 1, "the bridge to answer the call");
+      assert.equal(platform.toolResults[0]!.ok, true);
+      assert.match(String(platform.toolResults[0]!.text), /playing the track Long Tone\.mp3/);
+
+      await device.until(() => device.binaries.length > before, "the second track to play");
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(
+        typed.filter((m) => m.type === "tts" && m.state === "start").length,
+        2,
+        "one track asked for through the grammar, one through the model, each in its own bracket"
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("answers the words it recognises, even when the model's call is in the same read", async () => {
+    // The one shape where the order could break: a fast platform, both events in one chunk. The
+    // transcript is read first, the bridge recognises it and drops the turn — and the rest of what
+    // came in that same read has already been parsed and handed over, so the read is abandoned
+    // rather than finished (`turn.ts`). Two deciders carrying out one utterance is a track played
+    // twice, and the second one is the track nobody asked for.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // One write, and therefore one chunk: the check being pinned is the one that looks at each
+      // event, not the one that tears the connection down, which would pass this test for a
+      // different reason.
+      res.write(
+        sse("user", { text: "phát nhạc" }) +
+          sse("tool_call", {
+            turnId: "turn-1",
+            index: 0,
+            name: "bridge.play_music",
+            arguments: { query: "Tone 440" },
+          }) +
+          sse("done", { fullText: "" })
+      );
+      res.end();
+    });
+    const device = await ask(platform, "phát nhạc");
+    try {
+      await device.until(() => device.binaries.length > 0, "the track to play");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      assert.equal(platform.toolResults.length, 0, "the call that came with the transcript was not answered");
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(
+        typed.filter((m) => m.type === "tts" && m.state === "start").length,
+        1,
+        "one bracket, and not a second track from the call beside the transcript"
+      );
+      // And the one that played is the grammar's answer, not the model's: the bare request names no
+      // track, so the first by name plays rather than the one the call asked for.
+      assert.ok(
+        typed.some((m) => m.state === "sentence_start" && m.text === "Long Tone"),
+        "the track that played is the one the bridge chose"
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("hears the words after a turn that said nothing, with no listen start to help it", async () => {
+    // Found on the board 2026-10-11, and it deafened a whole run: a command turn speaks nothing, so no
+    // bracket opens, so the device never leaves `Listening` and never sends the `listen start` that
+    // would open the next window — the bridge has to reopen it itself (requirement 4). It did not,
+    // because the answer it read was the turn before's. Everything said after that was counted and not
+    // judged, in silence, until the session ended.
+    //
+    // Nothing sends a `listen start` between the second turn and the third, because on the board
+    // nothing does either. The third turn being served is the whole of the assertion.
+    let served = 0;
+    const heard = ["phát bài Tone 440", "dừng nhạc", "hôm nay thế nào"];
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: heard[served++] ?? "hôm nay thế nào" }));
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await ask(platform, "phát bài Tone 440");
+    try {
+      await device.until(() => device.binaries.length > 0, "the track to play");
+      // Past the track and its drain guard (2.2), and the device listening again — which is what clears
+      // the bridge's own idea that a track is playing.
+      await device.played(2);
+
+      // The command: heard, recognised, answered, and nothing spoken for it.
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 2, "the command to be answered");
+
+      // And then, with no help from the device at all, an ordinary turn.
+      device.speak();
+      await device.until(() => platform.requests.length === 3, "the turn after the command");
+      assert.equal(served, 3, "three turns, the last of them heard into a window the bridge reopened");
     } finally {
       device.stop();
       platform.stop();

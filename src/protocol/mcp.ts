@@ -84,6 +84,11 @@ export interface McpTool {
   name: string;
   description: string;
   args: readonly McpArgument[];
+  /** The gadget's own `inputSchema`, kept as it was sent. `args` above is this parsed for
+   *  the one thing the bridge itself clamps against; a model is given tools as a schema,
+   *  and a schema rebuilt from `args` would be a second version of a shape the gadget has
+   *  already stated once. */
+  inputSchema: unknown;
 }
 
 export type McpCall =
@@ -323,6 +328,7 @@ function readTool(raw: unknown): McpTool | null {
     name,
     description: typeof description === "string" ? description : "",
     args: readArgs(inputSchema),
+    inputSchema,
   };
 }
 

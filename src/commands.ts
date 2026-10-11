@@ -41,6 +41,30 @@ export type GadgetCommand =
   | { setting: "volume" | "brightness"; change: NumericChange }
   | { setting: "theme"; theme: "light" | "dark" };
 
+/**
+ * A command the bridge carries out itself, rather than through a tool of the gadget's.
+ *
+ * Music is the first of these and the reason the type exists: it is the bridge's own audio, not
+ * a setting of the device's, so there is no tool to call and nothing on the gadget to change.
+ * `query` is whatever the person named, unfiltered — whether it matches a file is the directory's
+ * answer and not the grammar's (`music.ts`).
+ */
+export type BridgeCommand =
+  | { task: "play-music"; query: string }
+  | { task: "stop-music" };
+
+/**
+ * What a whole utterance turned out to be — and, because there are now two things that can answer
+ * one, which of them it is.
+ *
+ * The name is `decider` rather than `owner` on purpose: what a caller has to do with the answer
+ * is decide *who carries it out*, and the two are carried out by different code in different
+ * places. A caller that read only the command would have to guess.
+ */
+export type SpokenCommand =
+  | { decider: "gadget"; command: GadgetCommand }
+  | { decider: "bridge"; command: BridgeCommand };
+
 /** One form of a command, matched against the whole utterance. */
 interface Rule {
   /** Anchored at both ends by the matcher, so a rule can never match a part of
@@ -63,6 +87,20 @@ interface Grammar {
     readonly test: RegExp;
     readonly setting: "volume" | "brightness";
   }[];
+  /**
+   * The bridge's own commands, in the same three shapes the settings have: a form that asks for
+   * music, forms that name a track, and forms that ask for it to stop.
+   *
+   * A track is always named *through a noun* — `bài`, "song", "track" — and never by the bare
+   * verb. "play the game" as an answer to a question is a whole utterance that begins with the
+   * same word, and a form without the noun would eat it.
+   */
+  readonly music: {
+    readonly play: readonly RegExp[];
+    /** Each carries the track's name in a group named `query`. */
+    readonly named: readonly RegExp[];
+    readonly stop: readonly RegExp[];
+  };
 }
 
 /**
@@ -73,7 +111,11 @@ interface Grammar {
  * utterance this bridge does not understand, which is the same as any other phrase
  * it does not cover.
  */
-export function matchCommand(language: TurnLanguage, utterance: string): GadgetCommand | null {
+export function matchCommand(
+  language: TurnLanguage,
+  utterance: string,
+  options: { music?: boolean } = {}
+): SpokenCommand | null {
   const grammar = GRAMMARS[language];
   if (grammar === undefined) return null;
 
@@ -87,13 +129,33 @@ export function matchCommand(language: TurnLanguage, utterance: string): GadgetC
     const match = stated.test.exec(rest);
     if (match) {
       const value = Number(match.groups?.value);
-      if (Number.isFinite(value)) return { setting: stated.setting, change: { kind: "set", value } };
+      if (Number.isFinite(value)) {
+        return { decider: "gadget", command: { setting: stated.setting, change: { kind: "set", value } } };
+      }
     }
   }
 
   for (const rule of grammar.rules) {
-    if (rule.test.test(rest)) return rule.command;
+    if (rule.test.test(rest)) return { decider: "gadget", command: rule.command };
   }
+
+  // The bridge's own forms last, so that nothing a setting's grammar already answers changes
+  // hands — and only where the bridge has music at all. A deployment with no directory answers
+  // "phát nhạc" as the ordinary utterance it looks like to everything else, rather than
+  // recognising it and then having nothing to play.
+  if (options.music === true) {
+    for (const form of grammar.music.play) {
+      if (form.test(rest)) return { decider: "bridge", command: { task: "play-music", query: "" } };
+    }
+    for (const form of grammar.music.named) {
+      const query = (form.exec(rest)?.groups?.query ?? "").trim();
+      if (query !== "") return { decider: "bridge", command: { task: "play-music", query } };
+    }
+    for (const form of grammar.music.stop) {
+      if (form.test(rest)) return { decider: "bridge", command: { task: "stop-music" } };
+    }
+  }
+
   return null;
 }
 
@@ -105,10 +167,18 @@ export function matchCommand(language: TurnLanguage, utterance: string): GadgetC
  * it then came to. Both are lines in the same log, and an operator reading a command
  * that did not take has to be able to see which one was asked for.
  */
-export function describeCommand(command: GadgetCommand): string {
-  if (command.setting === "theme") return `the ${command.theme} theme`;
-  if (command.change.kind === "set") return `the ${command.setting} to ${command.change.value}`;
-  return `a ${command.change.kind === "raise" ? "higher" : "lower"} ${command.setting}`;
+export function describeCommand(command: SpokenCommand): string {
+  if (command.decider === "bridge") {
+    if (command.command.task === "stop-music") return "the music to stop";
+    return command.command.query === ""
+      ? "some music"
+      : `the track ${JSON.stringify(command.command.query)}`;
+  }
+
+  const gadget = command.command;
+  if (gadget.setting === "theme") return `the ${gadget.theme} theme`;
+  if (gadget.change.kind === "set") return `the ${gadget.setting} to ${gadget.change.value}`;
+  return `a ${gadget.change.kind === "raise" ? "higher" : "lower"} ${gadget.setting}`;
 }
 
 /**
@@ -127,8 +197,14 @@ export function describeCommand(command: GadgetCommand): string {
  * utterance has to be one of the forms below. `toi hon` folds onto the dimmer
  * command, and a complete Vietnamese utterance that folds onto `toi hon` while
  * meaning something else is not a thing a person says.
+ *
+ * Exported because `music.ts` compares a *file name* the same way, and one fold for this
+ * service's Vietnamese text is better than two that would drift. The caveat above does not
+ * travel with it unscathed: `tối` and `tôi` fold together, so a search for one can find a file
+ * named the other. That is the forgiving direction for a name, and the guard above is the one
+ * that is not asked to hold there.
  */
-function fold(utterance: string): string {
+export function fold(utterance: string): string {
   return utterance
     .toLowerCase()
     .normalize("NFD")
@@ -223,6 +299,12 @@ const VIETNAMESE: Grammar = {
     { test: new RegExp(`^(dat |de |chinh |doi |cho )?am luong (thanh )?${COUNT}$`), setting: "volume" },
     { test: new RegExp(`^(dat |de |chinh |doi )?do sang (thanh )?${COUNT}$`), setting: "brightness" },
   ],
+  // "cho tôi nghe nhạc" arrives here as "nghe nhac": the frames `cho toi` is stripped by, above.
+  music: {
+    play: [/^(phat|mo|bat|nghe) nhac$/],
+    named: [/^(phat|mo|bat|nghe) bai (?<query>.+)$/],
+    stop: [/^(dung|tat) nhac$/, /^dung phat nua$/],
+  },
 };
 
 /**
@@ -252,6 +334,11 @@ const ENGLISH: Grammar = {
     { test: new RegExp(`^(set |change |put )?(the )?volume (to |at )?${COUNT}$`), setting: "volume" },
     { test: new RegExp(`^(set |change )?(the )?brightness (to |at )?${COUNT}$`), setting: "brightness" },
   ],
+  music: {
+    play: [/^(play|put on|start) (some |the )?music$/],
+    named: [/^(play|put on|start) (the )?(song|track) (?<query>.+)$/],
+    stop: [/^(stop|turn off) (the )?music$/, /^stop playing$/],
+  },
 };
 
 const GRAMMARS: Partial<Record<TurnLanguage, Grammar>> = {

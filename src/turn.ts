@@ -1,6 +1,7 @@
 import type { BridgeConfig } from "./config.js";
 import { platformAuthHeaders } from "./platform.js";
 import type { AnswerMode } from "./personas.js";
+import { warn } from "./log.js";
 
 /**
  * One turn, sent to the platform's voice-agent endpoint, and the stream it
@@ -33,24 +34,26 @@ export type TurnLanguage = "english" | "vietnamese";
 export type TurnEngine = "kokoro" | "piper" | "supertonic";
 
 /**
- * The engine to ask for, since the bridge has no voice preference of its own —
- * a persona carries no voice field (D3) and the browser never picks a default
- * either. This is the platform's own answer for a caller that expressed none:
- * its resolver falls back to Piper for English "since kokoro only has
- * Vietnamese voices", and to Kokoro for Vietnamese.
+ * The engine to ask for: this deployment's, stated once, for every language.
  *
- * The fallback cannot be reached by leaving the field out. `validateEngine` folds
- * anything unrecognized — `undefined` included — to `"kokoro"` *before* the
- * language is consulted, so an omitted field is not "no preference"; it is a
- * request for Kokoro, and on an English turn that is a request for a Vietnamese
- * voice to read English. The browser always sends a value, which is why the
- * unreachable branch has never been noticed. Sending this value is therefore how
- * the bridge asks for the answer the endpoint already means to give, and 4.5
- * records what that comes out as.
+ * It is sent rather than left out. `validateEngine` folds anything it does not
+ * recognize — `undefined` included — to `"kokoro"` *before* the language is
+ * consulted, so an omitted field is not "no preference"; it is a request for
+ * Kokoro. Naming the engine is the only way to ask for another one, and the
+ * platform's own per-language fallback stays unreachable until that fold is
+ * removed (the design's non-goal).
+ *
+ * This value used to mirror that fallback — Piper for English, Kokoro for
+ * Vietnamese — because a mirror is right while the fallback is what the
+ * deployment wants. It no longer is: the API's own `DEFAULT_TTS_ENGINE` is
+ * Supertonic, with a cloned Vietnamese style installed beside its built-ins,
+ * and the gadget was the last caller still asking for the engine the deployment
+ * had left. So the mirror is gone and the language no longer selects anything:
+ * one engine is what this deployment speaks through. The *voice* still varies
+ * with the language, and is still the platform's to resolve from this engine and
+ * the turn's language — the bridge names no voice, only the engine.
  */
-export function engineForLanguage(language: TurnLanguage): TurnEngine {
-  return language === "english" ? "piper" : "kokoro";
-}
+export const TURN_ENGINE: TurnEngine = "supertonic";
 
 /**
  * The endpoint's own error is not worth inventing here: the platform takes
@@ -58,6 +61,20 @@ export function engineForLanguage(language: TurnLanguage): TurnEngine {
  * the same vocabulary `parseCatalog` validates, carried through unchanged.
  */
 export type { AnswerMode };
+
+/**
+ * A tool a turn carries, which is what the model is given and nothing more.
+ *
+ * A gadget's catalogue has more in it than this (`McpTool`): `args` is this bridge's reading of
+ * the schema, which it clamps a relative command against and the platform has no use for. So
+ * this is the shape a turn carries rather than the shape a gadget reports — and it is the shape
+ * the bridge's *own* tools are written in, which are not a gadget's and are not asked of one.
+ */
+export interface TurnTool {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+}
 
 /** One earlier turn, as the platform's `history` field carries it. */
 export interface TurnMessage {
@@ -85,6 +102,18 @@ export interface TurnRequest {
    */
   language: TurnLanguage;
   history: readonly TurnMessage[];
+  /**
+   * What this turn may be asked to do, exactly as it was reported: the gadget's own catalogue,
+   * and beside it whatever tools the bridge answers for itself. The platform's model decides
+   * from this and from nothing else, so the gadget's half is the gadget's own words rather than
+   * a list this project keeps (D3) — and the bridge's half is named so that a reader can tell
+   * which of the two answers a name.
+   *
+   * Absent for a turn with neither, and then the field is left off the request rather than sent
+   * empty: a turn with no tools is one the model answers without them, which is what every turn
+   * was before this existed.
+   */
+  tools?: readonly TurnTool[];
   /** The person's input: an audio file, text, or neither on an opening turn. */
   audio?: TurnAudio;
   text?: string;
@@ -101,6 +130,19 @@ export interface TurnNotice {
   code?: string;
   message: string;
 }
+
+/** A gadget tool the platform's model asked for, as the platform named it — the turn it
+ *  belongs to, which call of that turn it is, and what to call it with. */
+export interface ToolCallRequest {
+  turnId: string;
+  index: number;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/** What happened when the bridge made that call. A failure is an outcome and not an
+ *  exception: the turn goes on to say what could not be done rather than ending. */
+export type ToolCallOutcome = { ok: true; text: string } | { ok: false; message: string };
 
 /**
  * What the caller does with the stream as it arrives. Every method may return a
@@ -119,6 +161,15 @@ export interface TurnSink {
   onNotice?(notice: TurnNotice): void | Promise<void>;
   /** The platform's refusal or failure (4.4). */
   onError?(message: string): void | Promise<void>;
+  /**
+   * The platform's model has asked for a gadget tool to be called (4.5).
+   *
+   * The bridge makes the call, because the gadget's tool channel is inside the gadget's own
+   * socket and nothing else can reach it, and answers with what happened — which the bridge
+   * then reports back so the turn can carry on and say what was done. A sink that leaves this
+   * out is a session with no gadget to call, and the turn is told so rather than left waiting.
+   */
+  onToolCall?(call: ToolCallRequest): ToolCallOutcome | Promise<ToolCallOutcome>;
 }
 
 export interface TurnOutcome {
@@ -138,15 +189,26 @@ export interface TurnOutcome {
 export function turnForm(request: TurnRequest): FormData {
   const form = new FormData();
   form.append("language", request.language);
-  // Derived rather than configured: see `engineForLanguage`, which is where the
+  // Stated once rather than derived: see `TURN_ENGINE`, which is where the
   // choice and its reason live. The platform resolves the voice from this and the
   // language; the bridge does not name a voice.
-  form.append("engine", engineForLanguage(request.language));
+  form.append("engine", TURN_ENGINE);
   form.append("systemPrompt", request.systemPrompt);
   form.append(
     "history",
     JSON.stringify(request.history.map((message) => ({ role: message.role, content: message.content })))
   );
+  // The gadget's own record, projected rather than sent whole: `args` is this bridge's
+  // reading of `inputSchema`, and the platform has no use for a second copy of what the
+  // schema already says. Omitted rather than sent empty, for the reason the topics are.
+  if (request.tools !== undefined && request.tools.length > 0) {
+    form.append(
+      "tools",
+      JSON.stringify(
+        request.tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
+      )
+    );
+  }
   // Omitted rather than sent empty, as the browser omits it: a request with no
   // topics is a turn that searches nothing, and an empty JSON array says the same
   // thing in a way the fold then has to be trusted to read.
@@ -217,13 +279,20 @@ export async function runTurn(
     throw new Error(`POST ${TURN_PATH} answered ${response.status} ${response.statusText}`);
   }
 
-  return consumeStream(response.body, sink, signal);
+  return consumeStream(config, response.body, sink, signal);
 }
 
 const TURN_PATH = "/api/voice-agent/stream";
+/** Where a tool call's result goes back, to the turn that is holding its stream open for it. */
+const TOOL_RESULT_PATH = "/api/voice-agent/tool-result";
+/** How long the bridge waits on the platform accepting a result. The turn it belongs to has a
+ *  bound of its own and will give up without this; a bridge that hung here would hold the
+ *  session's reader on a request nobody needs the answer to. */
+const TOOL_RESULT_TIMEOUT_MS = 5_000;
 
 /** Read the reply's events, in arrival order, and report how it ended. */
 async function consumeStream(
+  config: BridgeConfig,
   body: ReadableStream<Uint8Array>,
   sink: TurnSink,
   signal?: AbortSignal
@@ -256,9 +325,16 @@ async function consumeStream(
         const event = parseSseBlock(block);
         if (!event) continue;
         if (event.name === "done" || event.name === "error" || event.name === "notice") settled = true;
-        const reported = await dispatch(event, sink);
+        const reported = await dispatch(config, event, sink);
         if (event.name === "done") replyText = reported ?? replyText;
-        else if (event.name === "text" && reported !== null) replyText += reported;
+        else if (event.name === "text" && reported !== null) {
+          // Joined with a space, because a `text` event carries one *segment* of
+          // the reply — the splitter's chunk — and those are trimmed, so
+          // concatenating them would fuse the last word of one to the first of
+          // the next. The accumulation only ever stands on its own when the
+          // platform sends no `done`; normally `done.fullText` replaces it.
+          replyText += (replyText ? " " : "") + reported;
+        }
       }
     }
   } catch (error) {
@@ -308,7 +384,11 @@ function parseSseBlock(block: string): SseEvent | null {
 }
 
 /** Hand one event to the sink. Returns the reply text when the event carried it. */
-async function dispatch(event: SseEvent, sink: TurnSink): Promise<string | null> {
+async function dispatch(
+  config: BridgeConfig,
+  event: SseEvent,
+  sink: TurnSink
+): Promise<string | null> {
   const { name, payload } = event;
 
   if (name === "user") {
@@ -342,6 +422,22 @@ async function dispatch(event: SseEvent, sink: TurnSink): Promise<string | null>
   if (name === "done") {
     return asString(payload.fullText);
   }
+  if (name === "tool_call") {
+    const call = readToolCall(payload);
+    if (call === null) {
+      warn("the platform asked for a tool call this bridge could not read — it names no tool");
+      return null;
+    }
+    // The model asked for this mid-turn and the platform is holding its stream open for the
+    // answer, so both halves matter: the call is made here, where the gadget is, and what came
+    // of it goes back so the turn can be resumed and say what was done (4.5).
+    const outcome: ToolCallOutcome = (await sink.onToolCall?.(call)) ?? {
+      ok: false,
+      message: "this session has no gadget whose tools could be called",
+    };
+    await reportToolResult(config, call, outcome);
+    return null;
+  }
   // An event this service does not model is not an error. A newer endpoint may add
   // one, and a bridge that treated it as a failure would stop answering turns the
   // platform had already served.
@@ -350,6 +446,59 @@ async function dispatch(event: SseEvent, sink: TurnSink): Promise<string | null>
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/** The platform's request that a gadget tool be called, or `null` for a payload that is not
+ *  one. A call with no turn to be matched to is not a call this bridge can answer. */
+function readToolCall(payload: Record<string, unknown>): ToolCallRequest | null {
+  const name = asString(payload.name);
+  const turnId = asString(payload.turnId);
+  if (name === "" || turnId === "") return null;
+  const args = payload.arguments;
+  return {
+    turnId,
+    index: typeof payload.index === "number" ? payload.index : 0,
+    name,
+    arguments: typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {},
+  };
+}
+
+/**
+ * Tell the turn what its call came to.
+ *
+ * Best-effort, and deliberately not fatal. The platform holds the turn open for exactly this
+ * and gives up on its own bound, so a report that does not arrive costs the reply and not the
+ * session — which is why the failure is a line in the log rather than an error up the turn.
+ * What was actually done to the gadget has already happened either way.
+ */
+async function reportToolResult(
+  config: BridgeConfig,
+  call: ToolCallRequest,
+  outcome: ToolCallOutcome
+): Promise<void> {
+  try {
+    const response = await fetch(`${config.platformUrl}${TOOL_RESULT_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...platformAuthHeaders(config) },
+      body: JSON.stringify({
+        turnId: call.turnId,
+        index: call.index,
+        ...(outcome.ok ? { ok: true, text: outcome.text } : { ok: false, message: outcome.message }),
+      }),
+      signal: AbortSignal.timeout(TOOL_RESULT_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      warn(
+        `the platform did not take the result of ${call.name} (${response.status}) — ` +
+          `the turn will give up on its own bound and the person will hear about the change secondhand`
+      );
+    }
+  } catch (error) {
+    warn(
+      `could not report the result of ${call.name}: ` +
+        `${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 /** The sentence's audio, base64, or null — which is the endpoint's own way of

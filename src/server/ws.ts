@@ -1,16 +1,20 @@
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
-import { describeCommand, matchCommand, type GadgetCommand } from "../commands.js";
+import { basename } from "node:path";
+import { describeCommand, matchCommand, type BridgeCommand, type SpokenCommand } from "../commands.js";
+import { BRIDGE_TOOL_PREFIX, chooseTrack, decodeTrack, musicCommand, musicTools, playTrack } from "../music.js";
+import type { Track } from "../music.js";
 import { takeTurn, type Conversations } from "../conversation.js";
 import { authorizeDevice, describeDenial } from "../credentials.js";
-import { createGadget } from "../gadget.js";
+import { createGadget, type CommandOutcome } from "../gadget.js";
 import { createListening } from "../listening.js";
 import { err, info, log, section, warn } from "../log.js";
 import type { PersonaCatalog } from "../personas.js";
 import { advertisesTools } from "../protocol/mcp.js";
 import { isAbort, isHello, isListen, isMcp, parseClientMessage, serverHello } from "../protocol/messages.js";
 import { createSpeaker } from "../speech.js";
+import type { ToolCallOutcome, ToolCallRequest, TurnTool } from "../turn.js";
 
 /**
  * The device's socket.
@@ -43,6 +47,18 @@ import { createSpeaker } from "../speech.js";
 /** 1 === OPEN, checked as a literal rather than through the socket's own constants,
  *  so this file reads the same number `speech.ts` does. */
 const OPEN = 1;
+
+/**
+ * How long a closing handshake is given before the socket is finished off.
+ *
+ * `ws.close()` waits out its own `closeTimeout` — thirty seconds by default — when the peer
+ * does not answer, and the gadget has been seen to leave the old socket open until it is next
+ * woken. That is a window in which the bridge holds two sessions for one device, since the
+ * next wake opens a new socket, and the teardown this session owes is put off just as long.
+ * A second is long enough for a peer that means to answer, and short enough that neither
+ * happens.
+ */
+const IDLE_CLOSE_GRACE_MS = 1_000;
 
 interface DeviceRequest extends IncomingMessage {
   /** Set by the upgrade check, read by the session. The authenticated identity. */
@@ -138,6 +154,92 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
     // Whether the previous frame was dropped as the device's own echo, so the
     // endpointer's clock can be restarted when that window ends (6.6).
     let draining = false;
+    // Whether this bridge is playing a track of its own — which is not the same question as whether
+    // its bracket is open, and is asked in two places the bracket cannot answer: whether a stop has
+    // anything to stop, and whether a play should first stop what is already going. It is cleared
+    // when the device says it is listening again, which is when its speaker has finished.
+    let playing = false;
+    // When something last happened that a person was behind, and the timer that ends the
+    // session when nothing has for `sessionIdleMs`. Not a clock on the bytes: a window is
+    // held open while the device is Listening, and the device streams Opus whether or not
+    // anyone is speaking, so a byte-clock would mean a room with a fan in it never let a
+    // session end. What resets it is a closed turn, the turn that followed ending, and the
+    // wake word — each of them evidence of a person, and none of them produced by an empty
+    // room. A `giveup` is deliberately not among them: the endpointer produces one every
+    // `vadNoSpeechMs` in a room nobody is in, so counting it would stop the window firing
+    // at all (design.md).
+    let lastPersonAt = clock();
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    // Armed only while a close is in flight — see `fireIdleWindow`.
+    let closeGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** Arm the window for `remainingMs`, replacing whatever was armed. */
+    function armIdleWindow(remainingMs: number): void {
+      if (config.sessionIdleMs === 0) return;
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = setTimeout(fireIdleWindow, Math.max(remainingMs, 1));
+      // A session's window is not a reason for the process to stay up: the servers are.
+      // Without this a bridge asked to shut down waits out the longest window it armed.
+      idleTimer.unref();
+    }
+
+    /** A person did something. Start the window again, whole. */
+    function sawPerson(): void {
+      lastPersonAt = clock();
+      armIdleWindow(config.sessionIdleMs);
+    }
+
+    /**
+     * The window ran out: nothing has happened that a person was behind for the whole of
+     * it. End the session, which is what leaves the device in Idle — its microphone closed,
+     * its wake word armed again, and the one state the firmware's own power management can
+     * run from (`CanEnterSleepMode`, and `src/config.ts` on `sessionIdleMs`).
+     *
+     * Nothing is sent to the device to do it. Its websocket path has no handler for the
+     * vendor's `goodbye`, so a message would be logged and dropped; on this transport
+     * closing the socket is the lever (design.md).
+     */
+    function fireIdleWindow(): void {
+      // A reply being spoken outlasts the window by design — `maxTurnMs` is longer than
+      // `sessionIdleMs` — and a turn is a person. Re-arm for the whole window rather than
+      // for the remainder, which is already spent.
+      if (turning) {
+        armIdleWindow(config.sessionIdleMs);
+        return;
+      }
+      // The bridge's own audio is the person's, and it outlasts them: a track was asked for and is being
+      // listened to, so the last frame the bridge has to play is a thing a person was behind, and the
+      // window is measured from whichever came later — what a person did, or what the bridge is still
+      // saying. Without this the session ends in the middle of the music: measured on the board
+      // 2026-10-11, a 152-second track started at 76s and the session was closed at 137s, so a track
+      // longer than the window could never be heard past it — which is the whole of what a track is for
+      // (`voice-gadget`: the window is open again once the track has ended).
+      //
+      // `drainingUntil` is a deadline and not a flag: it is always the end of the last audio handed to
+      // the device, and `stop()` moves it back to what was actually delivered. A window held by a
+      // deadline cannot be held forever by anything a device does. The `idleMs` below goes negative
+      // while a track plays, which the re-arm reads as "longer than the whole window" — that is, the
+      // rest of the track *and* a window after it — and it converges on the end of the audio.
+      const since = Math.max(lastPersonAt, speaker.drainingUntil() ?? 0);
+      const idleMs = clock() - since;
+      if (idleMs < config.sessionIdleMs) {
+        armIdleWindow(config.sessionIdleMs - idleMs);
+        return;
+      }
+      log(
+        `no person in ${(config.sessionIdleMs / 1000).toFixed(0)}s — closing the session ` +
+          `(${session.frames} frame(s), ${session.bytes} B, ${session.heard} turn(s) heard); ` +
+          `the device is left Idle and needs its wake word again`
+      );
+      ws.close();
+      // The closing handshake is a courtesy on this transport — nothing on the device reads
+      // the code — and a peer that does not answer it must not be able to keep the session,
+      // or the decoder it holds, alive for `ws`'s own thirty seconds.
+      closeGraceTimer = setTimeout(() => ws.terminate(), IDLE_CLOSE_GRACE_MS);
+      closeGraceTimer.unref();
+    }
+
+    armIdleWindow(config.sessionIdleMs);
 
     section("device connected");
     log(`session ${session.id} device ${deviceId} path ${req.url}`);
@@ -157,6 +259,63 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
      * — so what arrives here is a WAV built from samples the bridge has held since
      * they arrived, and no part of the window is decoded twice (6.1, 6.7).
      */
+    /**
+     * Carry out a command the bridge answers itself, which is music and nothing else yet.
+     *
+     * Answers in the same shape `gadget.apply` does, because the reporting that follows it is one
+     * place and one line: a command that did not take leaves the room as it was, which is where the
+     * person already was, and the line is what an operator has to act on.
+     */
+    async function carryOutMusic(command: BridgeCommand): Promise<CommandOutcome> {
+      if (command.task === "stop-music") {
+        // A person asking a silent gadget to stop has been answered. Nothing playing is not a
+        // failure, and there is no bracket to close — `stop()` says so itself.
+        if (!playing) return { ok: true, detail: "nothing was playing" };
+        playing = false;
+        speaker.stop();
+        return { ok: true, detail: "the music stopped" };
+      }
+
+      const chosen = await chooseMusic(command.query);
+      if (!chosen.ok) return { ok: false, detail: chosen.detail };
+
+      // Whatever was playing goes first: two tracks at once are two streams into one speaker, and
+      // the person asked for this one rather than for both. Safe here, and only here, because this
+      // turn spoke nothing — a command's turn is dropped before the platform answers it (4.1) — so
+      // whatever bracket is open belongs to the track rather than to a reply.
+      if (playing) speaker.stop();
+      startTrack(chosen.track);
+      return { ok: true, detail: `the track ${basename(chosen.track.path)}` };
+    }
+
+    /** The file a request names, decoded, or the reason there is none. */
+    async function chooseMusic(query: string): Promise<{ ok: true; track: Track } | { ok: false; detail: string }> {
+      const choice = await chooseTrack(config.musicDir, query);
+      if (!choice.ok) return { ok: false, detail: choice.detail };
+      const track = await decodeTrack(choice.path);
+      if (track === null) {
+        return { ok: false, detail: `${choice.path} is not a track this bridge can play` };
+      }
+      return { ok: true, track };
+    }
+
+    /**
+     * Hand a track to the device's speaker.
+     *
+     * What is recorded here is that the bridge has music of its own playing — which is what the
+     * wake word stops and what the device's next `listen start` clears. The bracket, the pacing and
+     * the title on the display are the speaker's (`playTrack`), and they are the same for a track
+     * as for a reply.
+     */
+    function startTrack(track: Track): void {
+      playing = true;
+      log(
+        `playing ${basename(track.path)} — ${(track.samples.length / track.sampleRate).toFixed(1)}s ` +
+          `at ${track.sampleRate}Hz, in one bracket (4.5)`
+      );
+      playTrack(speaker, track);
+    }
+
     async function serveTurn(upload: { wav: Buffer | null; seconds: number; failed: number }): Promise<void> {
       if (!upload.wav) {
         // Every frame in the utterance failed to decode, so there is no audio to send
@@ -171,6 +330,10 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       }
 
       turning = true;
+      // A turn begins here, and this is the only place that says so: `spokeThisTurn` is an answer
+      // about a turn, and a turn that opens no bracket — a command, dropped before the platform
+      // answers it — would otherwise be told the turn before it spoke (4.1, requirement 4).
+      speaker.beginTurn();
       const controller = new AbortController();
       turn = controller;
       /**
@@ -181,7 +344,22 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
        * has no recogniser of its own (D12) — and read after the turn has unwound, by
        * which point there is nothing left to say and a setting to change (4.1).
        */
-      let commanded: GadgetCommand | null = null;
+      // What the person's utterance turned out to be, if it was a command at all. A holder rather
+      // than a `let`: it is written from inside the turn's own callbacks and read once the turn
+      // has unwound, and TypeScript follows a `let` no further than its initialiser — every later
+      // read of one is `null`, and the branch that uses it is `never`.
+      const taken: { command: SpokenCommand | null } = { command: null };
+      /**
+       * The track the model asked for in this turn, held until the turn has unwound.
+       *
+       * A call arrives while the platform is still streaming the reply, and the speaker is holding
+       * one bracket for the turn: a track handed over inside the call would be minutes of audio
+       * scheduled under sentences that have not been sent yet. Deciding here and playing afterwards
+       * is what leaves the turn's own bracket to the turn — and the track starts as the reply's last
+       * sentence does, since a track is handed to the same speaker that is already saying it.
+       */
+      const wanted: { track: Track | null } = { track: null };
+
       log(
         `turn from speech: ${upload.seconds.toFixed(2)}s of the person's own voice` +
           `${upload.failed ? `, ${upload.failed} frame(s) undecodable` : ""}`
@@ -212,7 +390,53 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         // reported nothing is asked for exactly the turn it would have been asked for
         // had none of this existed (2.2).
         const condition = gadget.condition();
-        const result = await takeTurn(
+        // The gadget's own catalogue, read per turn like the condition above and for the same
+        // reason: it belongs to this session and is remembered nowhere, and a gadget that
+        // reported none is asked for exactly the turn it would have been asked for otherwise.
+        // The bridge's own tools sit beside it — its own, not the gadget's, and named so that the
+        // model and the bridge's sink can both tell which of the two a name belongs to.
+        const tools: TurnTool[] = [...gadget.tools(), ...musicTools(config.musicDir)];
+
+    /**
+     * Answer a call naming a tool the bridge owns, rather than forwarding it to the gadget.
+     *
+     * The answer is a `ToolCallOutcome` and not a `CommandOutcome`, because it is not going into
+     * the log: it goes back to the platform as the result of the call, and the model speaks from it.
+     * So a failure here is not a silent line for an operator — it is what lets the model say that
+     * the track was not there instead of confidently announcing one that never plays.
+     */
+    async function answerMusicCall(call: ToolCallRequest): Promise<ToolCallOutcome> {
+      const command = musicCommand(call.name, call.arguments);
+      // A name under the bridge's own prefix that the bridge does not have. Reported rather than
+      // passed down: the gadget never reported it, so asking the gadget would be asking it for
+      // something it never said it had — and its refusal would be an answer to a different question.
+      if (command === null) return { ok: false, message: `this bridge has no tool named ${call.name}` };
+
+      if (command.task === "stop-music") {
+        // Deliberately not `carryOutMusic`'s stop, which is `speaker.stop()`: that abandons the
+        // frames of the *current* turn, and mid-call the current turn is this reply, still being
+        // spoken. Nothing reaches here with a track actually playing — a track holds the listening
+        // window shut, so the only utterance that opens a turn under one is the wake word, and that
+        // has stopped it already (6.5) — and the flag is cleared rather than acted on.
+        const stopped = playing;
+        playing = false;
+        return { ok: true, text: stopped ? "the music is stopped" : "nothing was playing" };
+      }
+
+      // Decided now, played once the turn has unwound. The answer the model is given has to be the
+      // truth about the file, and handing the track over now would open a bracket that outlives the
+      // reply — a track is minutes, and the sentences the platform has still to send have to be
+      // spoken *into* the bracket the turn already owns rather than into a second one underneath it.
+      const chosen = await chooseMusic(command.query);
+      if (!chosen.ok) return { ok: false, message: chosen.detail };
+      wanted.track = chosen.track;
+      return {
+        ok: true,
+        text: `playing the track ${basename(chosen.track.path)} through the device's speaker`,
+      };
+    }
+
+    const result = await takeTurn(
           config,
           services.catalog,
           services.conversations,
@@ -221,6 +445,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
             language: config.language,
             audio: { filename: "turn.wav", contentType: "audio/wav", data: upload.wav },
             ...(condition !== null ? { gadgetCondition: condition } : {}),
+            ...(tools.length > 0 ? { tools } : {}),
           },
           {
             onUser: (said) => {
@@ -240,16 +465,41 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
               // stream before it produces a reply, so nothing of its answer is spoken,
               // and the speaker's `finish()` will find a bracket that was never opened
               // (4.1, D8). The change itself is made once the turn has unwound, below.
-              const command = matchCommand(config.language, said);
+              const command = matchCommand(config.language, said, { music: config.musicDir !== "" });
               if (command === null) return;
-              commanded = command;
+              taken.command = command;
               log(
                 `the person's words are a command — asked for ${describeCommand(command)}; ` +
-                  `answering it on the gadget and dropping the turn`
+                  `answering it here and dropping the turn`
               );
               controller.abort();
             },
             onSentence: (sentence) => speaker.speak(sentence),
+            // The platform's model asked for a gadget tool (4.5). The call is made here, over the
+            // channel the handshake opened, and the answer is what the platform is holding its
+            // stream open for. Nothing about it is fatal: a name the gadget never reported and a
+            // gadget that does not answer are both a report the model can speak about, which is
+            // what leaves the turn ending in speech rather than in silence.
+            onToolCall: async (call) => {
+              // The bridge's own tools first, and by the namespace rather than by a list of names:
+              // a call the model makes to `bridge.*` is one no gadget reported and no gadget may be
+              // asked for, including a name this bridge does not have — which is answered as the
+              // failure it is, so the model can say so rather than being told the gadget refused it.
+              if (call.name.startsWith(BRIDGE_TOOL_PREFIX)) {
+                info(`platform asked for ${call.name}(${JSON.stringify(call.arguments)}) — the bridge's own`);
+                const outcome = await answerMusicCall(call);
+                if (outcome.ok) info(`${call.name}: ${outcome.text}`);
+                else warn(`${call.name} was not answered: ${outcome.message}`);
+                return outcome;
+              }
+              info(
+                `platform asked for ${call.name}(${JSON.stringify(call.arguments)}) — calling the gadget`
+              );
+              const outcome = await gadget.call(call.name, call.arguments);
+              if (outcome.ok) info(`gadget did ${call.name}: ${outcome.text}`);
+              else warn(`gadget did not do ${call.name}: ${outcome.message}`);
+              return outcome;
+            },
             // The platform's remark about a turn it did not act on. Surfaced, and said
             // to the device rather than left in the log: an operator reading a log is
             // not who asked the question (4.4). The turn still ends in `finally`, which
@@ -269,13 +519,21 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
           controller.signal
         );
 
-        if (commanded !== null) {
+        // A track the model asked for is handed over here, once the turn's own sentences have been
+        // spoken into the bracket the turn owns. Nothing is reported after it: whether the music was
+        // found was the answer to a call, and it has already been given (4.2).
+        if (wanted.track !== null) startTrack(wanted.track);
+
+        if (taken.command !== null) {
           // Requirement 2, and the only place in the session where a command is carried
           // out. Reported either way: a command that did not take leaves the gadget as it
           // was, which is where the person already was, and the line is what an operator
           // has to act on (D7). The turn ends with it rather than beside it, so the log
           // reads as one exchange and not as a turn followed by an unrelated change.
-          const outcome = await gadget.apply(commanded);
+          const outcome =
+            taken.command.decider === "gadget"
+              ? await gadget.apply(taken.command.command)
+              : await carryOutMusic(taken.command.command);
           if (outcome.ok) log(`command carried out: ${outcome.detail}`);
           else warn(`command not carried out: ${outcome.detail}`);
         } else if (!result.served) {
@@ -301,6 +559,10 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         speaker.finish();
         if (turn === controller) turn = null;
         turning = false;
+        // The reply has just stopped being heard, which is the likeliest moment for the
+        // person to speak again. The window starts again from here rather than from when
+        // the utterance closed, which may have been a long reply ago.
+        sawPerson();
         // A turn the bridge said nothing for leaves the device exactly where it was: no
         // bracket was opened, so it never left `Listening`, and being already in the
         // state it would come back to, it never sends the `listen start` that opens the
@@ -384,6 +646,10 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
 
         const verdict = listening.frame(wire);
         if (verdict === "turn") {
+          // The unambiguous evidence of a person: the endpointer heard an utterance and
+          // closed it. A `giveup` is not the same thing and is deliberately not counted —
+          // an empty room produces one every `vadNoSpeechMs` (see the idle window above).
+          sawPerson();
           // Snapshot, then clear, then act — in that order and all of it synchronously.
           // `open()` is what stops the decision re-firing: a state left reading `turn`
           // re-fires on every frame that follows, once per 60 ms for as long as the
@@ -433,6 +699,14 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
 
       if (isListen(msg)) {
         if (msg.state === "start") {
+          // The device says it is listening again, which in `mode: auto` is the moment after its
+          // speaker stopped — so a track that was playing has finished, or was stopped. This is the
+          // only signal that says so, and it arrives because the bracket closed rather than because
+          // anyone decided anything.
+          if (playing) {
+            playing = false;
+            log("the device is listening again — the track has finished");
+          }
           session.listening = true;
           // A window opens from nothing: the frames, the verdicts and the endpointer
           // together, or the previous window's decisions are judged against this one's
@@ -466,6 +740,17 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         // the turn's own `finally` rather than by a second writer here.
         log(`abort (reason=${msg.reason ?? "none"}) — cancelling the turn${turn ? "" : " (nothing in flight)"}`);
         turn?.abort();
+        // What is playing may be a track rather than a turn, and it is stopped the same way: the
+        // frames already on the clock are abandoned and the device is told to stop (`speech.ts`).
+        // A no-op for a reply, whose own turn is what was just cancelled.
+        if (playing) {
+          playing = false;
+          speaker.stop();
+          log("the wake word stopped the music");
+        }
+        // The wake word is a person saying something, and it is the one act that reaches
+        // here without a turn to carry it.
+        sawPerson();
         // The wake word's own Opus is streamed *before* the abort (the firmware's
         // `docs/websocket.md` says so), and a short voiced burst closing into silence is
         // exactly what the endpointer closes a turn on — so the window the wake word was
@@ -497,6 +782,8 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       );
       // The window goes with the socket, WASM memory and all (6.7).
       listening.close();
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      if (closeGraceTimer !== null) clearTimeout(closeGraceTimer);
     });
     ws.on("error", (e) => err(`socket: ${e.message}`));
   });

@@ -38,6 +38,8 @@ const config: BridgeConfig = {
   serverRate: RATE,
   frameMs: FRAME_MS,
   ...ENDPOINTER_DEFAULTS,
+  sessionIdleMs: 60000,
+  musicDir: "",
   historyTurns: 20,
   commandStep: 10,
   language: "english",
@@ -103,6 +105,34 @@ const runNow: SpeakerSchedule = (run) => run();
 
 const speakerFor = (socket: SpeakerSocket, clock?: () => number) =>
   createSpeaker(socket, config, clock, runNow);
+
+/** A clock and a scheduler that move only when the test says so. A turn's frames are on a real
+ *  clock, and the assertions about where one goes are about a moment that has to be reachable
+ *  without waiting for it. */
+function timers(start: number) {
+  let now = start;
+  const pending: { at: number; run: () => void }[] = [];
+  return {
+    clock: () => now,
+    schedule: (run: () => void, delayMs: number) => {
+      pending.push({ at: now + delayMs, run });
+    },
+    /** Run everything due within `ms`, in due order, and land on the far side. */
+    advance(ms: number) {
+      const until = now + ms;
+      for (;;) {
+        pending.sort((a, b) => a.at - b.at);
+        const next = pending[0];
+        if (next === undefined || next.at > until) break;
+        pending.shift();
+        now = next.at;
+        next.run();
+      }
+      now = until;
+    },
+    pending: () => pending.length,
+  };
+}
 
 describe("the bracket around a reply", () => {
   it("opens before the first frame and closes at the end of the turn", () => {
@@ -347,32 +377,6 @@ describe("what the device is told to display (5.4)", () => {
 });
 
 describe("the pace of the downlink (D16)", () => {
-  /** A clock and a scheduler that move only when the test says so. */
-  function timers(start: number) {
-    let now = start;
-    const pending: { at: number; run: () => void }[] = [];
-    return {
-      clock: () => now,
-      schedule: (run: () => void, delayMs: number) => {
-        pending.push({ at: now + delayMs, run });
-      },
-      /** Run everything due within `ms`, in due order, and land on the far side. */
-      advance(ms: number) {
-        const until = now + ms;
-        for (;;) {
-          pending.sort((a, b) => a.at - b.at);
-          const next = pending[0];
-          if (next === undefined || next.at > until) break;
-          pending.shift();
-          now = next.at;
-          next.run();
-        }
-        now = until;
-      },
-      pending: () => pending.length,
-    };
-  }
-
   it("sends the lead at once and the rest no faster than realtime", () => {
     // The device decodes from a queue of 20 frames — 1.2s — and drops a frame it has
     // no room for without a line in either log, so a turn must not be written out as
@@ -431,5 +435,168 @@ describe("the pace of the downlink (D16)", () => {
       "frame",
       "frame",
     ]);
+  });
+});
+
+describe("stopping what a turn is playing", () => {
+  /** A schedule that holds every frame it is given, standing in for a timer that has not fired.
+   *  What a track hands over is thousands of these at once, which is why a stop has to mean "none
+   *  of them go" rather than "no more are handed over". */
+  function holding(): { held: Array<() => void>; schedule: SpeakerSchedule } {
+    const held: Array<() => void> = [];
+    return { held, schedule: (run) => void held.push(run) };
+  }
+
+  it("closes the bracket at once, and the frames it was holding say nothing", () => {
+    const socket = fakeSocket();
+    const { held, schedule } = holding();
+    const speaker = createSpeaker(socket, config, undefined, schedule);
+
+    // Ten frames, not four: the first `PACE_LEAD_FRAMES` are due the moment the bracket opens —
+    // that lead is what puts something in the device's pipeline — so a turn has to be longer than
+    // the lead before the schedule is holding anything at all.
+    speaker.speak(sentence(0, wav(10)));
+    assert.ok(held.length > 0, "the schedule is holding frames, which is what a track is made of");
+
+    speaker.stop();
+
+    assert.deepEqual(
+      jsonOf(socket.sent[socket.sent.length - 1]!),
+      { type: "tts", state: "stop" },
+      "the device is told to stop now, rather than at the last frame's slot"
+    );
+    assert.equal(speaker.spokeThisTurn(), true, "and the turn still counts as one that spoke");
+
+    const before = framesOf(socket.sent).length;
+    held.splice(0).forEach((run) => run());
+    assert.equal(
+      framesOf(socket.sent).length,
+      before,
+      "and not one of the frames it was holding is heard after the stop"
+    );
+  });
+
+  it("measures the deadline from what was sent, not from what the turn reserved", () => {
+    // A track reserves minutes and delivers them a frame at a time. Counting the reservation would
+    // distrust the microphone for the length of the whole track, none of which the device is
+    // playing — and the microphone being shut is how a person is not heard.
+    let now = 1_000;
+    const socket = fakeSocket();
+    const { schedule } = holding();
+    const speaker = createSpeaker(socket, config, () => now, schedule);
+
+    speaker.speak(sentence(0, wav(400)));
+    speaker.stop();
+
+    const until = speaker.drainingUntil();
+    assert.ok(until !== null, "a turn that spoke arms a deadline even when it is stopped");
+    assert.ok(
+      until! - now < 2_000,
+      `the deadline is seconds away rather than the turn's whole 24s: ${until! - now}ms`
+    );
+  });
+
+  it("stops a bracket that finish() has already closed the turn of", () => {
+    // The shape a track actually has, and the one the tests above miss: a caller hands over
+    // everything it has and calls `finish()` in the same breath, so the turn is over — `speaking`
+    // is false and the close is booked for the end of the audio — from long before anyone says
+    // stop. A stop keyed on the turn would find nothing to do and let the track play out, which is
+    // the defect this case exists to keep out.
+    const t = timers(1_000);
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, t.clock, t.schedule);
+
+    speaker.speak(sentence(0, wav(100))); // six seconds, as a track arrives
+    speaker.finish();
+    assert.equal(
+      socket.sent.filter((s) => !s.binary && jsonOf(s).state === "stop").length,
+      0,
+      "the close is booked for the end of the audio, and has not gone out"
+    );
+
+    t.advance(1_000);
+    speaker.stop();
+
+    assert.equal(
+      jsonOf(socket.sent.at(-1)!).state,
+      "stop",
+      "the device is told to stop now rather than six seconds from now"
+    );
+
+    const framesAtStop = framesOf(socket.sent).length;
+    t.advance(10_000);
+    assert.equal(framesOf(socket.sent).length, framesAtStop, "and the rest of the track is abandoned");
+    assert.equal(
+      socket.sent.filter((s) => !s.binary && jsonOf(s).state === "stop").length,
+      1,
+      "one close, and not a second one where the track would have ended"
+    );
+  });
+
+  it("does not unsay a turn that spoke, when the turn's own finish arrives after it", () => {
+    // Found on the board: a music turn reported `no bracket was opened for that turn`, and opened a
+    // listening window it should not have. `playTrack` hands the track over and closes its bracket in
+    // one act, and the turn's own `finish()` follows in the `finally` — which read `spoke` off a
+    // bracket that was already closed and answered "it said nothing".
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.beginTurn();
+    speaker.speak(sentence(0, wav(2)));
+    speaker.finish();
+    assert.equal(speaker.spokeThisTurn(), true, "the track was spoken");
+
+    speaker.finish();
+    assert.equal(speaker.spokeThisTurn(), true, "and the turn's own finish does not unsay it");
+  });
+
+  it("answers afresh for a bracket opened after a turn that said nothing", () => {
+    // The other order, which the command path takes: the turn is dropped before the platform answers
+    // it, so its `finish()` runs with no bracket, and the track is handed over afterwards.
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.beginTurn();
+    speaker.speak(sentence(0, null));
+    speaker.finish();
+    assert.equal(speaker.spokeThisTurn(), false, "a turn with nothing speakable in it opened nothing");
+
+    speaker.speak(sentence(1, wav(2)));
+    speaker.finish();
+    assert.equal(speaker.spokeThisTurn(), true, "and the bracket that follows is this turn's answer");
+  });
+
+  it("answers for a turn that says nothing, after a turn whose track was stopped", () => {
+    // The board again, in the order it happened: a model turn played a track, the wake word stopped it
+    // (so this speaker's last answer was "it spoke"), and then a person's command — heard, recognised,
+    // and answered with no audio at all — was told that *it* had opened the bracket the track had.
+    // The window it should have reopened was never reopened, and every word said afterwards was
+    // counted and not judged. A turn answers for itself, which is what `beginTurn` is for.
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.beginTurn();
+    speaker.speak(sentence(0, wav(10)));
+    speaker.finish();
+    speaker.stop();
+    assert.equal(speaker.spokeThisTurn(), true, "the turn with the track in it spoke");
+
+    speaker.beginTurn();
+    speaker.finish();
+    assert.equal(
+      speaker.spokeThisTurn(),
+      false,
+      "and the command after it, which said nothing, says so — the device never left Listening"
+    );
+  });
+
+  it("does nothing at all for a turn that never spoke", () => {
+    const socket = fakeSocket();
+    const speaker = speakerFor(socket);
+
+    speaker.stop();
+
+    assert.deepEqual(socket.sent, [], "there is no bracket to close, and none is opened to close");
+    assert.equal(speaker.spokeThisTurn(), false);
   });
 });

@@ -83,19 +83,49 @@ export interface SpeakerSocket {
 }
 
 export interface Speaker {
+  /**
+   * A turn begins: nothing has been said for it yet.
+   *
+   * Called by the caller that serves a turn, and by nothing else, because a turn is the caller's
+   * idea and not this module's: a turn that says nothing calls no other method here until
+   * `finish()`, so the speaker cannot see one begin. What makes it necessary rather than tidy is
+   * that `spokeThisTurn` is an answer *about a turn* — and a turn that opens no bracket has to
+   * answer for itself rather than inherit the turn before it, which is how a command spoken after a
+   * track stopped by the wake word came to report a bracket it never opened. The window it should
+   * have reopened was not reopened, and every word the person said afterwards was counted and not
+   * judged. Measured on the board 2026-10-11.
+   */
+  beginTurn(): void;
   /** Speak one sentence of the reply (5.2, 5.3). Safe to call for every event. */
   speak(sentence: TurnSentence): void;
   /** Close the bracket if it is open. Idempotent, and safe on a turn with no speech. */
   finish(): void;
   /**
-   * Whether the turn `finish()` was last called for opened a bracket — that is, whether
-   * the device was ever put into `Speaking` for it at all (D4). `finish()` is where the
-   * answer is fixed, because it is the one call every turn makes, and the caller reads
-   * it straight after that call.
+   * Stop what this turn is playing — now — and close its bracket.
    *
-   * A turn that said nothing never opened a bracket, so the device never left
-   * `Listening` for it and will not send the `listen start` that would open the next
-   * window — which leaves the caller to reopen it (requirement 4).
+   * The counterpart of `finish()` for a caller that is not waiting for the turn to run out: a
+   * reply the person has interrupted, and a track being played, which is minutes of audio rather
+   * than seconds and is the case that made this a verb of its own.
+   *
+   * Everything this turn has not yet played is abandoned. The frames already on the clock are the
+   * schedule's, and a schedule hands back no handle to cancel one with, so they are left to find
+   * themselves unwanted rather than taken off it.
+   *
+   * Works on a turn that `finish()` has already closed the *turn* of — a track is handed over and
+   * then finished in the same breath, and the bracket it is playing in outlives both. What it does
+   * nothing for is a turn that never opened a bracket at all, which is a turn with nothing to stop.
+   */
+  stop(): void;
+  /**
+   * Whether the device was ever put into `Speaking` during the turn `beginTurn` opened — that is,
+   * whether a bracket was opened for it at all (D4). The answer is fixed where the bracket opens, and
+   * read by the caller straight after `finish()`, which is the one call every turn makes.
+   *
+   * A turn that said nothing never opened a bracket, so the device never left `Listening` for it and
+   * will not send the `listen start` that would open the next window — which leaves the caller to
+   * reopen it (requirement 4). A turn that handed a track over and closed it in the same breath
+   * answers `true`, because the device did leave `Listening`: the bracket outlives the turn that
+   * opened it, and the caller must not open a second window under one the device is still inside.
    */
   spokeThisTurn(): boolean;
   /** How much audio has been sent to this device over the life of the socket, in ms
@@ -124,9 +154,18 @@ export function createSpeaker(
   // pipeline has something in it. See `PACE_LEAD_FRAMES`.
   const paceLead = PACE_LEAD_FRAMES * config.frameMs;
   let speaking = false;
-  // The same fact as `speaking`, held past the point `speaking` is cleared: the turn's
-  // own answer, for a caller that has to know whether the device was ever taken out of
-  // `Listening` for it. See `spokeThisTurn`.
+  // `speaking` with the turn's own end taken out of it: the device has been told to start and has
+  // not been told to stop. The two part company at `finish()`, which stops the turn taking frames
+  // while the close it booked still waits behind the audio ahead of it — and for a track that is
+  // minutes, where a reply's tail is a second. `stop()` keys on this rather than on `speaking`
+  // because of exactly that gap: a track is handed over whole and then finished, so by the time
+  // anyone says stop every one of its frames has been scheduled and `speaking` has long been
+  // false. Keyed on `speaking`, a stop would do nothing at all and the track would play to its
+  // end — which is what the first version of this did.
+  let bracketOpen = false;
+  // Whether the device has been taken out of `Listening` during this turn: set where the bracket
+  // opens, cleared where a turn begins, and read by the caller that has to know whether the device
+  // will open its own next window. See `spokeThisTurn`.
   let spoke = false;
   let sent = 0;
   // The per-turn trio (6.6, D16): when this turn's bracket opened, how many frames
@@ -143,6 +182,17 @@ export function createSpeaker(
   // discovering the same close and warning about it.
   let gone = false;
   let turnMs = 0;
+  // Bumped whenever a bracket opens and whenever one is stopped, and captured by each frame as it
+  // is scheduled. The schedule hands back no handle to cancel with (`SpeakerSchedule` returns
+  // nothing), so a frame that is no longer wanted is *abandoned* rather than cancelled: it finds
+  // itself from an older generation and says nothing. `finish()` does not bump it — the frames of
+  // a turn that ended are still due to be played, which is what `finish()` is for.
+  let generation = 0;
+  // The audio actually handed to the socket this turn, as against `turnMs`, which is the audio the
+  // turn *reserved*. The two part company only when a turn is stopped: what is still to be heard
+  // is then what was sent and not yet played, and that is what the deadline after a stop is
+  // measured from.
+  let deliveredMs = 0;
   // `null` is "no deadline", and only ever before a turn on this socket has spoken:
   // a sentinel timestamp would be a value the clock could legitimately return, and
   // the one thing this must never do is claim the device is playing when it is not.
@@ -160,6 +210,11 @@ export function createSpeaker(
   };
 
   return {
+    beginTurn(): void {
+      // Both are per-turn, and this is the only place a turn is known to start.
+      spoke = false;
+    },
+
     speak(sentence: TurnSentence): void {
       // A sentence the platform could not synthesize arrives with no audio at all
       // (5.5), and one with nothing speakable in it is a sentence to skip rather
@@ -191,6 +246,11 @@ export function createSpeaker(
       if (!speaking) {
         if (!sendJson({ type: "tts", state: "start" })) return;
         speaking = true;
+        bracketOpen = true;
+        // The moment the answer becomes true, and the only place it can: the device is out of
+        // `Listening` from here, and it is the caller reading `spokeThisTurn` after the turn that has
+        // to know it. Set here rather than at `finish()`, which a track's own close reaches first.
+        spoke = true;
         // The turn's clock starts here, not at the first frame below and not at
         // `finish()`: the deadline 6.6 computes is anchored on the moment the device
         // was told to start playing, which is the earliest this turn's audio can be
@@ -201,6 +261,8 @@ export function createSpeaker(
         turnFrames = 0;
         lastDue = turnStart;
         turnMs = 0;
+        deliveredMs = 0;
+        generation += 1;
       }
 
       // What the device's display shows while this sentence is heard (5.4). One
@@ -229,7 +291,11 @@ export function createSpeaker(
         const due = turnStart + turnFrames * config.frameMs - paceLead;
         turnFrames += 1;
         lastDue = due;
+        const at = generation;
         const deliver = (): void => {
+          // Stopped since this frame was scheduled: it is no longer wanted, and the device has
+          // already been told to stop, so sending it would be audio played after the stop.
+          if (at !== generation) return;
           if (gone) return;
           if (socket.readyState !== OPEN) {
             gone = true;
@@ -238,6 +304,7 @@ export function createSpeaker(
           }
           socket.send(frame(packet, config.framing), { binary: true });
           sentHere += 1;
+          deliveredMs += config.frameMs;
         };
         // A slot already reached is filled at once, which is always true of the first
         // frames of a turn: the lead is what makes frame 0 leave with the bracket,
@@ -253,15 +320,10 @@ export function createSpeaker(
     },
 
     finish(): void {
-      // Read before the early return rather than after it: a turn that said nothing is
-      // the one the caller has to be told about, and it is the one that gets there.
-      // Assigned rather than left standing, so a silent turn does not report the turn
-      // before it (requirement 4).
-      spoke = speaking;
-      // A turn that spoke nothing never opened the bracket and leaves the previous
-      // deadline standing — there is no audio of its own to distrust the microphone
-      // for. That is the rig's behaviour too, and it is the right one: the device
-      // cannot be playing this turn's silence.
+      // The bracket and nothing else. `spoke` was fixed where the bracket opened, and whether the
+      // turn opened one is not this call's to decide — a turn whose audio was handed over and closed
+      // in one act (a track, `music.ts`) arrives here with `speaking` already false, and reading the
+      // answer off that closed bracket would report the turn as one that said nothing.
       if (!speaking) return;
       // Flipped before the send, so a socket that throws on the way out cannot
       // leave the bracket believed open — the next turn must start a fresh one.
@@ -278,7 +340,13 @@ export function createSpeaker(
       // would truncate the reply to however much had been sent by the time the
       // platform finished producing it, which is the defect the pacing fixes.
       const closesAt = lastDue + config.frameMs;
+      const at = generation;
       const close = (): void => {
+        // Stopped since this close was booked, so the device has already been told: `stop()`
+        // closes the bracket itself, and a second `tts stop` would be a close for one that is
+        // already closed.
+        if (at !== generation) return;
+        bracketOpen = false;
         // A device that has already gone took the bracket with it: the state lives
         // in its socket, and the close is logged where it happened. Warning here
         // would report the same drop twice, once as a failure to say "stop" to
@@ -293,6 +361,33 @@ export function createSpeaker(
       const wait = closesAt - clock();
       if (wait > 0) schedule(close, wait);
       else close();
+    },
+
+    stop(): void {
+      // The bracket, not the turn: what is left to stop when a track is interrupted is a bracket
+      // the device is still in and frames still on the clock, and the turn that handed both over
+      // was finished minutes ago.
+      if (!bracketOpen) return;
+      // This turn did take the device out of `Listening`, and it is settled here rather than left to
+      // `finish()`: a caller reading `spokeThisTurn` afterwards has to be told so.
+      spoke = true;
+      speaking = false;
+      bracketOpen = false;
+      // Out from under every frame scheduled for this turn, and before the stop goes out: the
+      // device is told to stop and the frames are told to say nothing, and taking either half
+      // first would leave the other untrue for a moment.
+      generation += 1;
+      // What is still to be heard is what was *sent* and has not yet played — the same deadline
+      // `finish()` computes, but measured from `deliveredMs`: the rest of this turn was reserved
+      // and will now never leave, so counting it would distrust the microphone for minutes of
+      // silence no device is playing.
+      drainUntil = turnStart + deliveredMs + config.drainGuardMs;
+      if (socket.readyState !== OPEN) return;
+      socket.send(JSON.stringify({ type: "tts", state: "stop" }));
+      info(
+        `tts stop (stopped after ${(deliveredMs / 1000).toFixed(2)}s of ${(turnMs / 1000).toFixed(2)}s) — ` +
+          `microphone distrusted for another ${((drainUntil - clock()) / 1000).toFixed(2)}s`
+      );
     },
 
     spokeThisTurn(): boolean {

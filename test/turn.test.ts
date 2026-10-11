@@ -5,8 +5,10 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import type { McpTool } from "../src/protocol/mcp.js";
+import { musicTools } from "../src/music.js";
 import {
-  engineForLanguage,
+  TURN_ENGINE,
   runTurn,
   turnForm,
   type TurnRequest,
@@ -46,6 +48,8 @@ function configFor(platformUrl: string): BridgeConfig {
     serverRate: 24000,
     frameMs: 60,
     ...ENDPOINTER_DEFAULTS,
+    sessionIdleMs: 60000,
+    musicDir: "",
     historyTurns: 20,
     commandStep: 10,
     language: "english",
@@ -141,14 +145,70 @@ const REQUEST: TurnRequest = {
   text: "hôm nay thế nào",
 };
 
+describe("what a turn tells the platform the gadget can do", () => {
+  // The catalogue the model decides from is the gadget's own report, and it travels as the
+  // gadget gave it: the raw `inputSchema`, not this bridge's reading of it. `args` is what
+  // the bridge clamps a relative command against and the platform has no use for it, so it
+  // is projected away rather than sent as a second copy of what the schema already says.
+  const TOOL: McpTool = {
+    name: "self.audio_speaker.set_volume",
+    description: "Set the volume of the audio speaker.",
+    args: [{ name: "volume", type: "integer", min: 0, max: 100 }],
+    inputSchema: {
+      type: "object",
+      properties: { volume: { type: "integer", minimum: 0, maximum: 100 } },
+    },
+  };
+
+  it("carries the gadget's own report, and nothing at all when there is none", () => {
+    assert.deepEqual(JSON.parse(turnForm({ ...REQUEST, tools: [TOOL] }).get("tools") as string), [
+      {
+        name: "self.audio_speaker.set_volume",
+        description: "Set the volume of the audio speaker.",
+        inputSchema: {
+          type: "object",
+          properties: { volume: { type: "integer", minimum: 0, maximum: 100 } },
+        },
+      },
+    ]);
+
+    // Absent, not empty. A gadget that reported nothing is a turn the model answers with no
+    // tools, which is what every turn was before this existed — and an empty array is a
+    // different claim from that silence.
+    assert.equal(turnForm(REQUEST).get("tools"), null);
+    assert.equal(turnForm({ ...REQUEST, tools: [] }).get("tools"), null);
+  });
+
+  it("carries the bridge's own tools in the same field, and does not say which is which", () => {
+    // One field, two catalogues, and the platform is told nothing about the difference — it
+    // passes a `tools` array it already passed and emits a `tool_call` it already emitted
+    // (proposal, Non-goals). What tells them apart is the name, and only the two ends that have
+    // to route on it read it that way.
+    const ours = musicTools("/srv/music");
+    const sent = JSON.parse(turnForm({ ...REQUEST, tools: [...ours] }).get("tools") as string) as {
+      name: string;
+    }[];
+
+    assert.deepEqual(sent.map((tool) => tool.name), ["bridge.play_music", "bridge.stop_music"]);
+    assert.ok(sent.every((tool) => !/^self\./.test(tool.name)), "and none of them as something the gadget has");
+
+    // A gadget that reported nothing is a turn asked with the bridge's own tools *alone* — the
+    // field is present for them where it used to be absent for everything.
+    assert.deepEqual(
+      JSON.parse(turnForm({ ...REQUEST, tools: [...ours, TOOL] }).get("tools") as string).length,
+      3
+    );
+  });
+});
+
 describe("which engine a turn asks for", () => {
-  it("asks for the engine the platform's own no-preference answer names", () => {
-    // Kokoro's installed voices are Vietnamese, so an English turn that asks for it
-    // is an English sentence read by a Vietnamese voice. The endpoint's resolver
-    // means to fall back to Piper here, and cannot be reached by leaving the field
-    // out — `validateEngine` folds `undefined` to `"kokoro"` first.
-    assert.equal(engineForLanguage("english"), "piper");
-    assert.equal(engineForLanguage("vietnamese"), "kokoro");
+  it("asks for this deployment's engine, the same one for every language", () => {
+    // `validateEngine` folds an omitted field to `"kokoro"` before the language is
+    // consulted, so the bridge must name the engine it wants. It names this
+    // deployment's, and that no longer varies with the language — the voice still
+    // does, and stays the platform's to resolve.
+    assert.equal(TURN_ENGINE, "supertonic");
+    assert.equal(turnForm(REQUEST).get("engine"), "supertonic");
   });
 });
 
@@ -156,7 +216,7 @@ describe("the turn request", () => {
   it("carries the persona's three fields, the language and the engine", async () => {
     const form = turnForm(REQUEST);
     assert.equal(form.get("language"), "vietnamese");
-    assert.equal(form.get("engine"), "kokoro");
+    assert.equal(form.get("engine"), "supertonic");
     assert.equal(form.get("systemPrompt"), REQUEST.systemPrompt);
     assert.equal(form.get("answerMode"), "generate");
     assert.deepEqual(JSON.parse(form.get("enabledTopics") as string), ["Truyện cười"]);
@@ -209,13 +269,16 @@ describe("the turn request", () => {
 
 describe("reading the reply's stream", () => {
   it("hands every event to the sink in arrival order, and reports the reply", async () => {
+    // The platform's `text` event carries one *segment* of the reply — the
+    // chunk it is about to speak — alongside its index, so the accumulated
+    // fallback has to be joined rather than concatenated: segments are trimmed.
     const platform = await stubPlatform(
       streamSse([
         ["user", { text: "hôm nay thế nào", messageId: "m1" }],
         ["sentence", { index: 0, text: "Chào bạn.", audioData: Buffer.from("A").toString("base64") }],
-        ["text", { text: "Chào bạn." }],
+        ["text", { index: 0, text: "Chào bạn." }],
         ["sentence", { index: 1, text: "Tôi khỏe.", audioData: null }],
-        ["text", { text: " Tôi khỏe." }],
+        ["text", { index: 1, text: "Tôi khỏe." }],
         ["done", { messageId: "m2", fullText: "Chào bạn. Tôi khỏe." }],
       ])
     );
@@ -228,7 +291,7 @@ describe("reading the reply's stream", () => {
         "sentence:0",
         "text:Chào bạn.",
         "sentence:1",
-        "text: Tôi khỏe.",
+        "text:Tôi khỏe.",
       ]);
       assert.equal(outcome.replyText, "Chào bạn. Tôi khỏe.");
       assert.equal(outcome.settled, true);
@@ -315,6 +378,28 @@ describe("reading the reply's stream", () => {
       const outcome = await runTurn(configFor(platform.url), REQUEST, sink);
       assert.equal(outcome.replyText, "half an answer");
       assert.equal(outcome.settled, false, "a cut-off turn and a finished one are not the same thing");
+    } finally {
+      platform.stop();
+    }
+  });
+
+  it("joins a chunk-split reply that never got a done event", async () => {
+    // The platform announces one segment at a time, and a segment is trimmed, so
+    // these three events are three pieces of one sentence. Without the separating
+    // space the fallback would read "một haibavà ba" — which is what the device
+    // would then put in the conversation's history.
+    const platform = await stubPlatform(async (res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("text", { index: 0, text: "một hai" }));
+      res.write(sse("text", { index: 1, text: "ba và" }));
+      res.write(sse("text", { index: 2, text: "bốn" }));
+      res.end();
+    });
+    try {
+      const { sink } = recordingSink();
+      const outcome = await runTurn(configFor(platform.url), REQUEST, sink);
+      assert.equal(outcome.replyText, "một hai ba và bốn");
+      assert.equal(outcome.settled, false, "there was still no done event");
     } finally {
       platform.stop();
     }

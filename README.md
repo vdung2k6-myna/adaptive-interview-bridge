@@ -158,14 +158,14 @@ someone who never spoke it (D12). Measured on one utterance taken from the devic
 by the rig, the same bytes came back as `"ao"` with `language=vietnamese`, as
 `"Oh."` with `language=english`, and as `"哦。"` with the language left to detection.
 
-`engine` is derived from that language rather than configured — Piper for English,
-Kokoro for Vietnamese — which is the platform's own answer for a caller with no
-voice preference of its own. A persona carries no voice field (D3), and the bridge
-does not name one; leaving the field out would *not* express "no preference",
-because the endpoint folds an absent engine to Kokoro before it consults the
-language. The bridge sends the value that branch would have produced, and names no
-voice beyond it — which voice that turns out to be is the platform's to resolve,
-and "What a gadget sounds like" below is where the deployment's answer is recorded.
+`engine` is stated once, rather than derived from the language: it is this
+deployment's synthesis engine, the same for either language. The bridge still names
+no voice — a persona carries no voice field (D3) — but it must name the engine,
+because leaving the field out would *not* express "no preference": the endpoint
+folds an absent engine to Kokoro before it consults the language, so an omitted
+field asks for the engine this deployment has left. Which voice that engine
+resolves to, per language, stays the platform's — "What a gadget sounds like" below
+is where the deployment's answer is recorded.
 
 The reply is a stream of server-sent events — `user`, `sentence`, `text`, `notice`,
 `error`, `done` — and it is read as one. The endpoint emits each sentence's audio as
@@ -180,21 +180,23 @@ A persona decides *what* is said, never *who* says it. It carries no voice field
 `resolveVoice(engine, language)` in `adaptive-interview-api`'s
 `src/lib/audio/text-processing.ts`, which reads a configured name and falls back
 to `DEFAULT_VOICE` only when that name is empty. The bridge supplies the engine and
-nothing else, through `engineForLanguage`.
+nothing else — `TURN_ENGINE` in `src/turn.ts` — and names no voice.
 
 So the voice is the **platform's** configuration, not this service's, and this
 deployment resolves to:
 
 | The gadget speaks | Engine | Voice | Set by |
 | --- | --- | --- | --- |
-| English | Piper | `bryce` | `PIPER_VOICE_ENGLISH` |
-| Vietnamese | Kokoro | `diem_trinh` | `KOKORO_VOICE_VIETNAMESE` |
+| English | Supertonic | `M1` | `SUPERTONIC_VOICE_ENGLISH` |
+| Vietnamese | Supertonic | `example_m2` | `SUPERTONIC_VOICE_VIETNAMESE` |
 
-Read from `adaptive-interview-api`'s `.env` on 2026-10-06; the defaults in
+Read from `adaptive-interview-api`'s `.env` on 2026-10-09; the defaults in
 `src/lib/config/` are different values, so a deployment that sets none of these
-sounds like neither of the rows above. To change what a gadget sounds like, change
-that file — the bridge has no voice setting and does not want one, because a voice
-it could name would be a second place for the same decision to live.
+sounds like neither of the rows above. A gadget's **voice** is that file's to
+change, and this service has no voice setting by design — a voice it could name
+would be a second place for the same decision to live. Its **engine** is this
+service's to state, in `TURN_ENGINE` (`src/turn.ts`), because the platform's own
+fallback is unreachable: a turn that omitted the field would ask for Kokoro.
 
 **Two gadgets in one language sound identical.** The binding distinguishes who
 answers and in what character; it does not distinguish voices, and nothing in
@@ -207,9 +209,12 @@ platform decision this change does not make.
 One hazard worth knowing, because it fails quietly rather than loudly. An empty
 voice name does not error — `resolveVoice` returns `DEFAULT_VOICE` instead — and
 this deployment does not set `DEFAULT_VOICE`, so it falls to the code default
-`F1`. That is a *Supertonic* voice name, reached from a Kokoro or Piper turn.
-Clearing `KOKORO_VOICE_VIETNAMESE` does not silence the gadget or name it as
-misconfigured; it hands the wrong engine a voice from a different catalogue.
+`F1`. With the engine now Supertonic, `F1` is a name of the right catalogue, so
+clearing `SUPERTONIC_VOICE_VIETNAMESE` does not fail the turn; it answers in `F1`
+instead of the deployment's own voice, with nothing in the log to say so. While the
+bridge asked for Kokoro the same fallback was worse — a Supertonic name handed to
+another engine's catalogue — and that is what it would become again if `TURN_ENGINE`
+were moved back.
 
 ### The conversation
 
@@ -255,7 +260,7 @@ stamp as every line in its log.
 | Network | device on Wi-Fi at `192.168.1.50` → the bridge at `192.168.1.100:8001`, one LAN; bridge → the platform at `127.0.0.1:4000`. This deployment's `.env` sets `WS_PORT`, and `8001` is what it chose — the banner above and the address section are the default `8000` |
 | Model | `deepseek-v4.1-flash:cloud` through Ollama — a cloud model, so the reply leg leaves this machine |
 | Speech in | `stt` on audiocpp |
-| Speech out | Kokoro, Vietnamese — the engine `engineForLanguage` picks for `language=vietnamese`, voice `diem_trinh` |
+| Speech out | Supertonic, Vietnamese — `TURN_ENGINE` in `src/turn.ts`, voice `example_m2` (`SUPERTONIC_VOICE_VIETNAMESE`); English resolves `M1` |
 
 Two anchors, because neither end of this is logged directly. The endpointer closes a
 turn 900 ms after the person's last word, so **the end of speech is the turn's close
