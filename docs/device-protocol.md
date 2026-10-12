@@ -102,8 +102,24 @@ listening again, and the `listen start` after an `abort` is its own. But that wa
 arrived while the device was **Listening**, not `Speaking`: the turn had ended a minute
 earlier and the bridge had nothing in flight, so nothing was interrupted and no
 `tts sentence_start` was left narrating. The case 6.5 exists for — the wake word landing
-mid-reply, where the failure is a display naming a sentence nobody hears — still has no
-observation, and 6.5 remains unverified on the device.
+mid-reply, where the failure is a display naming a sentence nobody hears — still had no
+observation after that day, and 6.5 remained unverified on the device.
+
+**Observed, 2026-10-12 — and the failure was the one predicted.** Reported from the
+deployment: the wake word fired during a reply, the gadget stopped speaking and returned
+to listening, and the display **went on filling** with sentences the person never heard.
+The mechanism, read off this same firmware: `sentence_start` is the one `tts` message
+§2's handler does not gate on the device being in `Speaking` — its neighbour `stop`
+checks `GetDeviceState()` at `main/application.cc:631` and `sentence_start` checks
+nothing at `main/application.cc:639` — so a name that keeps arriving keeps moving the
+display from `Listening`. The bridge was sending those names because its own cancel
+reached the turn's **source** and stopped there: the sentences the platform had still to
+send were never produced, and the sentence already handed over, whose name travels with
+its own first frame, was still due and still announced. It now stops the speaker as well
+(`src/server/ws.ts`, the abort handler), so the cancel abandons what the turn had already
+handed over — the half of 6.5 that had no observation, and the half this document said to
+expect. What the 2026-10-06 note leaves standing is its own subject: the device does not
+go to Idle after an `abort`, and the `listen start` that follows is its own.
 
 ## 3. `tts stop` does nothing once the device has left `Speaking`
 

@@ -1325,6 +1325,67 @@ describe("the wake word during a reply", () => {
       platform.stop();
     }
   });
+
+  it("names nothing that was already on the clock when the wake word fired", async () => {
+    // The half the test above cannot see, and the defect a person reported on 2026-10-12: cancelling
+    // the turn's *source* ends the sentences the platform has still to send, and does nothing about
+    // the ones already handed over. That test releases its second sentence *after* the abort; here
+    // both are handed over up front — a platform faster than realtime, which is the ordinary case —
+    // and the abort arrives with the second sentence's audio still due.
+    //
+    // Its name travels with its own first frame (`speech.ts`), so without the speaker being stopped
+    // that name arrives after the person has interrupted, and the device shows it: `sentence_start`
+    // is the one `tts` message the firmware does *not* gate on the device being in `Speaking`
+    // (`main/application.cc:639`), where its neighbour `stop` is gated. That is why the display went
+    // on filling after a wake word, and why this is asserted over a socket rather than by calling
+    // `speaker.stop()` — the path a wake word takes is the thing that was wrong.
+    //
+    // Two seconds a sentence rather than `REPLY_SECONDS`, so the second sentence's due time is far
+    // enough ahead to abort before it: at 0.3 s its first frame is due 60 ms into the turn.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "ke cho toi mot cau chuyen" }));
+      res.write(sse("sentence", { index: 0, text: "Ngay xua...", audioData: sentenceAudio(2) }));
+      res.write(sse("sentence", { index: 1, text: "va roi...", audioData: sentenceAudio(2) }));
+      res.write(sse("done", { fullText: "Ngay xua... va roi..." }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => device.binaries.length > 0, "the first sentence's audio to reach the device");
+
+      // Both sentences are handed over by now; the second one's audio is still to come.
+      device.send({ type: "abort", reason: "wake_word_detected" });
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the cancelled turn's bracket to close"
+      );
+      const atStop = device.binaries.length;
+      // Long enough that the second sentence's audio has come due — which is when its name would
+      // have arrived, and the whole of what this is about.
+      await device.played(2);
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.deepEqual(
+        typed.filter((m) => m.state === "sentence_start").map((m) => m.text),
+        ["Ngay xua..."],
+        "the sentence that was still due was never named"
+      );
+      assert.equal(
+        device.binaries.length,
+        atStop,
+        "and its frames stopped with its name, rather than the display stopping first"
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
 });
 
 /** Wait for the bridge to end the session, and fail unless it was the bridge that did it.

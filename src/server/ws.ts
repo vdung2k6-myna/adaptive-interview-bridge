@@ -810,24 +810,33 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       }
 
       if (isAbort(msg)) {
-        // The wake word cancelled the turn (6.5). What is cancelled is the **source**:
-        // the signal reaches the platform request, so a turn still being produced stops,
-        // and a reply mid-speech stops being transcribed into frames. What is deliberately
-        // *not* done is anything to the device — the firmware sends this from
-        // `HandleWakeWordDetectedEvent` and leaves `Speaking` itself, gating incoming
-        // audio on that state, so it has already silenced its own speaker. There is no
-        // `tts stop` to send into a state the device has left, and `turning` is cleared by
-        // the turn's own `finally` rather than by a second writer here.
+        // The wake word cancelled the turn (6.5). Two halves are cancelled, and the second one is
+        // below: the **source** — the signal reaches the platform request, so a turn still being
+        // produced stops — and what the turn had already handed to the speaker. What is deliberately
+        // *not* done is anything to the device that it would act on: the firmware sends this from
+        // `HandleWakeWordDetectedEvent` and leaves `Speaking` itself, gating incoming audio on that
+        // state, so it has already silenced its own speaker. The `tts stop` the speaker sends on the
+        // way out falls on a device that has left that state and is ignored — the firmware gates its
+        // `stop` handler on `Speaking` — and `turning` is cleared by the turn's own `finally` rather
+        // than by a second writer here.
         log(`abort (reason=${msg.reason ?? "none"}) — cancelling the turn${turn ? "" : " (nothing in flight)"}`);
         turn?.abort();
-        // What is playing may be a track rather than a turn, and it is stopped the same way: the
-        // frames already on the clock are abandoned and the device is told to stop (`speech.ts`).
-        // A no-op for a reply, whose own turn is what was just cancelled.
-        if (playing) {
-          playing = false;
-          speaker.stop();
-          log("the wake word stopped the music");
-        }
+        // And the **speaker** is stopped, for a track and for a reply alike. Cancelling the turn
+        // reaches its source — the sentences the platform has still to send — and nothing else. The
+        // frames already on the clock are the speaker's to abandon, and so are the names that travel
+        // with them now that an announcement goes out with its own sentence's first frame: `finish()`
+        // deliberately keeps them, because a turn that ends by *running out* will be heard, and a
+        // cancelled one will not. The device does not save us here — `sentence_start` is the one
+        // `tts` message the firmware does not gate on the device being in `Speaking`
+        // (`main/application.cc:639`), where its neighbour `stop` is gated — so a name that keeps
+        // arriving keeps moving the display after the person has interrupted.
+        //
+        // `playing` is left as the log line it still deserves: whether a track was interrupted is
+        // worth saying, and whether anything was abandoned is not this flag's business any more.
+        const wasPlaying = playing;
+        playing = false;
+        speaker.stop();
+        if (wasPlaying) log("the wake word stopped the music");
         // The wake word is a person saying something, and it is the one act that reaches
         // here without a turn to carry it.
         sawPerson();
