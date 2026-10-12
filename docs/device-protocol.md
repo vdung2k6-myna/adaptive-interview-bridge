@@ -13,9 +13,10 @@ the board was attached and sessions captured, and each delta now says which of t
 two it rests on; on 2026-10-12 it was attached again and the case delta 2's first half
 had been waiting on was at last fired. **Confirmed on the wire** are delta 1, delta 5
 and both halves of delta 2 — the second on 2026-10-06, the first on 2026-10-12, when
-the wake word landed mid-reply and again mid-track. **Reported, and read off the
+the wake word landed mid-reply and again mid-track. **Observed, and read off the
 source** is delta 4: the person's account is what moved it off the source alone, and
-what the fix did to the display is the half still unobserved. **Still source-read
+it was watched after the fix the same night — five sentences' text already at the
+bridge and not one of them named — and nothing further was named. **Still source-read
 only** are deltas 3, 6 and 7: delta 3 is now *reached* on every abort — the bridge
 sends a `tts stop` into a device that has left `Speaking` — but what the device does
 with it is not visible from this side, and delta 7 describes a direction the bridge
@@ -121,9 +122,12 @@ display from `Listening`. The bridge was sending those names because its own can
 reached the turn's **source** and stopped there: the sentences the platform had still to
 send were never produced, and the sentence already handed over, whose name travels with
 its own first frame, was still due and still announced. It now stops the speaker as well
-(`src/server/ws.ts`, the abort handler), so the cancel abandons what the turn had already
-handed over — the half of 6.5 that had no observation, and the half this document said to
-expect. What the 2026-10-06 note leaves standing is its own subject: the device does not
+(`src/server/ws.ts`, the abort handler), so the cancel abandons what the turn had
+**reserved and not yet handed over** — 19.44 s of a 29.46 s reply in the run that was
+watched, five of whose seven sentences had their text already at the bridge and none
+of them yet named — and the display stops where the interruption landed. That is the
+half of 6.5 that had no observation, and the half this document said to expect. What
+the 2026-10-06 note leaves standing is its own subject: the device does not
 go to Idle after an `abort`, and the `listen start` that follows is its own.
 
 ## 3. `tts stop` does nothing once the device has left `Speaking`
