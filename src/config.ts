@@ -157,6 +157,27 @@ export interface BridgeConfig {
    */
   musicDir: string;
   /**
+   * The level a track is played at, as a **difference** in dB from the file — negative for quieter,
+   * and nought for the file as it is. Read from `BRIDGE_MUSIC_GAIN_DB`.
+   *
+   * The one knob in this file that may be negative or nought, because it is not a level: it is the
+   * subtraction between two of them. The figure the requirement asks for is a measurement — a
+   * track's RMS sits **10.4 dB** above the voice this deployment speaks with (three tracks in its
+   * own library, six synthesis draws, 2026-10-12) — and playing music at that much less is what
+   * leaves the person an opening to be heard over it.
+   *
+   * A setting rather than a constant, for the reason `commandStep` is one: whether the music is now
+   * too quiet, or still too loud for the wake word to be heard over, is settled by ear and by
+   * whether the wake word fires — and that is only possible if it is not a literal that would have
+   * to be rebuilt to try another figure.
+   *
+   * **A deployment that sets nothing is not leaving things as they were.** The default is the
+   * measured figure, so music plays about 10 dB quieter than it did before this existed; a
+   * deployment that wants the previous level sets nought and knowingly leaves the requirement
+   * unmet.
+   */
+  musicGainDb: number;
+  /**
    * The rate the **device** encodes its uplink at, in Hz. Read from
    * `BRIDGE_DEVICE_RATE`; the firmware's own declaration is 16000.
    *
@@ -281,6 +302,40 @@ function readTurnEngine(env: NodeJS.ProcessEnv): TurnEngine {
   }
   return raw;
 }
+
+/**
+ * The level a track is played at, as a difference in dB from the file.
+ *
+ * Signed, and the only reader here that accepts a negative or a nought: every other number in this
+ * file is a level, a count or a duration, where a negative is a mistake, and this one is a
+ * subtraction between two levels, where it is the ordinary case. What is still refused is a value
+ * that is not a number at all, because a typo here would play the music at the wrong level in a way
+ * nobody hears as a configuration mistake.
+ */
+function readMusicGainDb(env: NodeJS.ProcessEnv): number {
+  const raw = env.BRIDGE_MUSIC_GAIN_DB;
+  if (raw === undefined || raw === "") return MUSIC_GAIN_DB_DEFAULT;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    throw new Error(`BRIDGE_MUSIC_GAIN_DB must be a number of dB, negative to play quieter, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+/**
+ * The level a track is played at when a deployment names none, in dB from the file.
+ *
+ * Exported so a test can assert against it rather than against a second copy of the number — the
+ * same reason `ENDPOINTER_DEFAULTS` is: it is a measurement, and a figure written down twice is one
+ * that drifts the first time it is re-measured.
+ *
+ * −10 dB is the measured difference between a track of this deployment's own library and the voice
+ * it speaks with: a track's RMS sat 10.4 dB above a reply's (three tracks, six synthesis draws,
+ * 2026-10-12). At −10 the music lands within half a decibel of a reply's RMS and 3.5 dB *below* a
+ * reply's peak — one figure satisfying both measures, and erring on the quiet side on the one that
+ * is about clipping, since two of the three tracks measured peaked at 0.0 dBFS.
+ */
+export const MUSIC_GAIN_DB_DEFAULT = -10;
 
 /**
  * The secret is the only value with no default. A default here would be a
@@ -553,6 +608,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     // Empty, and unset is empty: music is something a deployment opts into, and a shipped
     // non-empty default would point every bridge at a directory that is not there on any of them.
     musicDir: (env.BRIDGE_MUSIC_DIR ?? "").trim(),
+    musicGainDb: readMusicGainDb(env),
     ...endpointer,
   };
 }

@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
-import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
 import { createConversations } from "../src/conversation.js";
 import { deriveToken } from "../src/credentials.js";
 import { createPersonaCatalog } from "../src/personas.js";
@@ -151,6 +151,7 @@ function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): 
     ...ENDPOINTER_DEFAULTS,
     sessionIdleMs: 60000,
     musicDir: "",
+    musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: 10,
     language: "english",
@@ -881,6 +882,107 @@ describe("a person speaks to the gadget", () => {
         typed.some((m) => m.state === "sentence_start" && m.text === "Tone 440"),
         "and the screen names the track, as it names a sentence"
       );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("answers a track it cannot decode with the failure, rather than promising one", async () => {
+    // Why the decode stays where the call is rather than being moved off the turn (design D1): the
+    // answer a model is given has to be the truth about the file, and the directory settling a name
+    // is not the same as the file playing. `not-audio.mp3` is in this library and is not audio, so
+    // the model is told — rather than left to announce a track that never starts.
+    //
+    // The library here is the fixtures' own directory, because the tool path is only reachable over
+    // a socket and the junk file has to be one the directory can settle a name for.
+    const library = fileURLToPath(new URL("./fixtures", import.meta.url));
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "mo bai Not Audio" }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "bridge.play_music",
+          arguments: { query: "Not Audio" },
+        })
+      );
+      res.write(sse("done", { fullText: "" }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: library }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to be served");
+      await device.until(() => platform.toolResults.length === 1, "the bridge to answer the call");
+
+      assert.equal(platform.toolResults[0]!.ok, false, "a file that will not play is reported as one");
+      assert.match(String(platform.toolResults[0]!.message), /not a track this bridge can play/);
+
+      // And a failure is not a bracket: nothing was handed to the speaker for a track that cannot
+      // be played, so the device is not left waiting for audio that never comes.
+      assert.equal(device.binaries.length, 0, "no audio for a track that cannot be played");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("delivers a track after the reply's own sentences, in the one bracket the turn opened", async () => {
+    // What the handover's yield could plausibly have disturbed, and the property the pacing rests
+    // on (design D2): the pieces are counted from the turn's own start, so a track follows the
+    // reply rather than overtaking it, and both are spoken into the bracket the turn opened rather
+    // than into a second one underneath it. Where the *close* is booked — after the track's last
+    // frame rather than at the handover — is `speech.test.ts`'s to pin, not this level's.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "mo bai Tone 440" }));
+      res.write(sse("sentence", { index: 0, text: "Duoc, minh phat ngay.", audioData: sentenceAudio(1) }));
+      res.write(
+        sse("tool_call", {
+          turnId: "turn-1",
+          index: 0,
+          name: "bridge.play_music",
+          arguments: { query: "Tone 440" },
+        })
+      );
+      res.write(sse("done", { fullText: "Duoc, minh phat ngay." }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC }));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket", features: { mcp: true, glyph_push: true } });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      await handshakeAs(device, REPORTED_TOOLS);
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the bracket to close at the end of the track"
+      );
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(typed.filter((m) => m.type === "tts" && m.state === "start").length, 1, "one bracket");
+      assert.equal(typed.filter((m) => m.type === "tts" && m.state === "stop").length, 1, "closed once");
+
+      // The display's own order is the order they were handed over in, and each piece is announced
+      // before its frames — so the reply being named first is the reply being *heard* first.
+      const named = typed
+        .filter((m) => m.type === "tts" && m.state === "sentence_start")
+        .map((m) => m.text);
+      assert.deepEqual(
+        named,
+        ["Duoc, minh phat ngay.", "Tone 440"],
+        "the reply is named, and the track after it rather than over it"
+      );
+      assert.ok(device.binaries.length > 0, "and both of them were played");
     } finally {
       device.stop();
       platform.stop();

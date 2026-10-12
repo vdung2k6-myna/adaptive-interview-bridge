@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig, ENDPOINTER_DEFAULTS } from "../src/config.js";
+import { loadConfig, ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT } from "../src/config.js";
 
 /**
  * The configuration is where the rules that must not fail open live: an empty
@@ -298,6 +298,27 @@ describe("the rest of the configuration", () => {
       loadConfig({ ...minimal, BRIDGE_MUSIC_DIR: "/srv/music" } as NodeJS.ProcessEnv).musicDir,
       "/srv/music"
     );
+  });
+
+  it("plays a track at the measured level unless a deployment says otherwise", () => {
+    // The one knob here that may be negative or nought, because it is a *difference* between two
+    // levels rather than a level. The default is the measurement: a track of this deployment's own
+    // library sat 10.4 dB above the voice it speaks with, and playing music at that much less is
+    // what leaves the person an opening to be heard over it (design D3).
+    assert.equal(loadConfig(minimal).musicGainDb, MUSIC_GAIN_DB_DEFAULT);
+    assert.ok(MUSIC_GAIN_DB_DEFAULT < 0, "and quieter, which is the whole of what it is for");
+
+    // Nought is a deployment saying it will leave that unmet, which is a decision an operator may
+    // make and not a typo to refuse — and a positive gain is a quiet recording they mean to bring
+    // up. Only a value that is not a number at all is refused, because that one would play the
+    // music at the wrong level in a way nobody hears as a configuration mistake.
+    const at = (raw: string) => loadConfig({ ...minimal, BRIDGE_MUSIC_GAIN_DB: raw } as NodeJS.ProcessEnv);
+    assert.equal(at("0").musicGainDb, 0);
+    assert.equal(at("-6").musicGainDb, -6);
+    assert.equal(at("3.5").musicGainDb, 3.5, "a fraction of a decibel is still a decibel");
+    assert.equal(at("").musicGainDb, MUSIC_GAIN_DB_DEFAULT, "an empty value is an unnamed one");
+    assert.throws(() => at("quiet"), /BRIDGE_MUSIC_GAIN_DB must be a number/);
+    assert.throws(() => at("NaN"), /BRIDGE_MUSIC_GAIN_DB/);
   });
 
   it("reads them from the environment, floor ratio included", () => {

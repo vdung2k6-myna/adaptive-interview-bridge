@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
-import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
 import { createConversations } from "../src/conversation.js";
 import { deriveToken } from "../src/credentials.js";
 import { createPersonaCatalog } from "../src/personas.js";
@@ -45,6 +45,7 @@ const config: BridgeConfig = {
   ...ENDPOINTER_DEFAULTS,
   sessionIdleMs: 60000,
   musicDir: "",
+  musicGainDb: MUSIC_GAIN_DB_DEFAULT,
   historyTurns: 20,
   commandStep: 10,
   language: "english",

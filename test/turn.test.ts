@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
 import type { McpTool } from "../src/protocol/mcp.js";
 import { musicTools } from "../src/music.js";
 import {
@@ -50,6 +50,7 @@ function configFor(platformUrl: string): BridgeConfig {
     ...ENDPOINTER_DEFAULTS,
     sessionIdleMs: 60000,
     musicDir: "",
+    musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: 10,
     language: "english",

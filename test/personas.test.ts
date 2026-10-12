@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
 import {
   boundPersona,
   createPersonaCatalog,
@@ -46,6 +46,7 @@ function configFor(platformUrl: string): BridgeConfig {
     ...ENDPOINTER_DEFAULTS,
     sessionIdleMs: 60000,
     musicDir: "",
+    musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: 10,
     language: "english",

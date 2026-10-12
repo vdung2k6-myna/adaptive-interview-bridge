@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MUSIC_GAIN_DB_DEFAULT } from "../src/config.js";
 import { chooseTrack, decodeTrack, listTrackNames, musicTools, playTrack } from "../src/music.js";
 import { parseWavAudio } from "../src/protocol/wav.js";
 import type { TurnSentence } from "../src/turn.js";
@@ -72,6 +73,26 @@ describe("decoding a track of the bridge's own", () => {
 
   it("refuses a file it cannot read, and says so rather than throwing", async () => {
     assert.equal(await decodeTrack(MISSING), null);
+  });
+
+  it("leaves the event loop free while it decodes, which is why it is a worker", async () => {
+    // The whole point of the worker-backed decoder: a caller reaches here while the platform's
+    // reply is still streaming and still being spoken, and that reply's frames are delivered by
+    // timers. Decoding on this thread blocks them — 843 ms measured for a four-and-a-half-minute
+    // track — and the device's twenty-frame queue empties inside that block.
+    //
+    // Asserted as an ordering rather than as a duration, so it does not become a test of how fast
+    // this machine is: a timer due *during* the decode has to fire before the decode resolves.
+    let loopWasFree = false;
+    const timer = setTimeout(() => {
+      loopWasFree = true;
+    }, 1);
+
+    const track = await decodeTrack(FIXTURE);
+    clearTimeout(timer);
+
+    assert.ok(track, "the fixture still decodes");
+    assert.ok(loopWasFree, "a timer due during the decode fired before it resolved");
   });
 });
 
@@ -192,11 +213,11 @@ describe("the file a request names", () => {
 });
 
 describe("playing a track through the device's speaker", () => {
-  it("hands the whole track over as one bracket, numbered from zero", () => {
+  it("hands the whole track over as one bracket, numbered from zero", async () => {
     const { sentences, finishes, speaker } = recordingSpeaker();
     const track = { path: "/srv/music/A Tone.mp3", sampleRate: 44100, samples: tone(44100 * 25) };
 
-    playTrack(speaker, track);
+    await playTrack(speaker, track, 0);
 
     assert.deepEqual(sentences.map((sentence) => sentence.index), [0, 1, 2], "in order, from zero");
     assert.equal(finishes(), 1, "and one bracket, closed once");
@@ -222,10 +243,10 @@ describe("playing a track through the device's speaker", () => {
     );
   });
 
-  it("plays a track shorter than one chunk as a single one", () => {
+  it("plays a track shorter than one chunk as a single one", async () => {
     const { sentences, finishes, speaker } = recordingSpeaker();
 
-    playTrack(speaker, { path: "/srv/music/Short.mp3", sampleRate: 44100, samples: tone(4410) });
+    await playTrack(speaker, { path: "/srv/music/Short.mp3", sampleRate: 44100, samples: tone(4410) }, 0);
 
     assert.deepEqual(sentences.map((sentence) => sentence.index), [0]);
     assert.equal(finishes(), 1);
@@ -234,15 +255,71 @@ describe("playing a track through the device's speaker", () => {
     assert.equal(sentences[0]!.text, "Short");
   });
 
-  it("closes the bracket even for a track with nothing in it", () => {
+  it("closes the bracket even for a track with nothing in it", async () => {
     // `decodeTrack` refuses a file that decodes to no samples, so this is the case a caller
     // reaches by skipping that check — and the one that must not strand a device in `Speaking`,
     // where it discards whatever the person says next.
     const { sentences, finishes, speaker } = recordingSpeaker();
 
-    playTrack(speaker, { path: "/srv/music/Empty.mp3", sampleRate: 44100, samples: new Int16Array(0) });
+    await playTrack(speaker, { path: "/srv/music/Empty.mp3", sampleRate: 44100, samples: new Int16Array(0) }, 0);
 
     assert.deepEqual(sentences, [], "nothing is spoken");
     assert.equal(finishes(), 1, "and the bracket is still closed");
+  });
+
+  it("hands the loop back between pieces, rather than encoding a whole track in one step", async () => {
+    // The other half of the same defect (design D2): a whole track's encode is 1576 ms measured,
+    // taken in a single turn of the loop — while the platform's reply may still be due on the
+    // clock, whose delivery runs on timers. A piece is 71 ms.
+    //
+    // Asserted as an ordering and not as a duration, so it is not a test of this machine: a timer
+    // scheduled before the handover has to fire *during* it, which it can only do if the handover
+    // yields. The track is three pieces long, so there are two yields to miss.
+    const { speaker } = recordingSpeaker();
+    let loopWasFree = false;
+    const timer = setTimeout(() => {
+      loopWasFree = true;
+    }, 1);
+
+    await playTrack(speaker, { path: "/srv/music/A Tone.mp3", sampleRate: 44100, samples: tone(44100 * 25) }, 0);
+    clearTimeout(timer);
+
+    assert.ok(loopWasFree, "a timer due during the handover fired before it finished");
+  });
+
+  it("plays the track at the level the deployment records", async () => {
+    // The level the person hears (design D3). What the figure *should* be is not this test's
+    // business — it is one measurement set against another, and it lives in `config.ts` beside the
+    // number it produced. What is pinned here is the arithmetic: the frames handed over are the
+    // file's own samples, less the recorded figure, and clamped.
+    const track = await decodeTrack(FIXTURE);
+    assert.ok(track, "the fixture decodes");
+
+    const peakAt = async (gainDb: number): Promise<number> => {
+      const { sentences, speaker } = recordingSpeaker();
+      await playTrack(speaker, track, gainDb);
+      const { pcm } = parseWavAudio(sentences[0]!.audio!);
+      let peak = 0;
+      for (let at = 0; at < pcm.length; at += 2) {
+        const level = Math.abs(pcm.readInt16LE(at));
+        if (level > peak) peak = level;
+      }
+      return peak;
+    };
+
+    const asTheFileIs = await peakAt(0);
+    for (const gainDb of [MUSIC_GAIN_DB_DEFAULT, -6, 6]) {
+      const played = await peakAt(gainDb);
+      const expected = Math.round(asTheFileIs * 10 ** (gainDb / 20));
+      assert.equal(played, expected, `${gainDb} dB in the file's own terms`);
+    }
+
+    // A positive gain cannot wrap what is already at full scale: wrapping is not louder, it is a
+    // different waveform, so the samples are held at the end of the range instead.
+    const loud = { path: "/srv/music/Loud.mp3", sampleRate: 44100, samples: new Int16Array(4410).fill(32000) };
+    const { sentences, speaker } = recordingSpeaker();
+    await playTrack(speaker, loud, 6);
+    const { pcm } = parseWavAudio(sentences[0]!.audio!);
+    assert.equal(pcm.readInt16LE(0), 32767, "held at the top of the range rather than wrapped round it");
   });
 });

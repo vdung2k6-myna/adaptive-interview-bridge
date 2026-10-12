@@ -329,7 +329,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       // turn spoke nothing — a command's turn is dropped before the platform answers it (4.1) — so
       // whatever bracket is open belongs to the track rather than to a reply.
       if (playing) speaker.stop();
-      startTrack(track);
+      await startTrack(track);
       return { ok: true, detail: `the track ${basename(track.path)}` };
     }
 
@@ -352,13 +352,16 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
      * the title on the display are the speaker's (`playTrack`), and they are the same for a track
      * as for a reply.
      */
-    function startTrack(track: Track): void {
+    function startTrack(track: Track): Promise<void> {
       playing = true;
       log(
         `playing ${basename(track.path)} — ${(track.samples.length / track.sampleRate).toFixed(1)}s ` +
           `at ${track.sampleRate}Hz, in one bracket (4.5)`
       );
-      playTrack(speaker, track);
+      // Awaited by both callers, because the handover hands the event loop back between pieces
+      // (`music.ts`): it returns once the last piece is over rather than once the first is, and a
+      // caller that reports what it did — or that is the turn's own tail — has to wait for it.
+      return playTrack(speaker, track, config.musicGainDb);
     }
 
     async function serveTurn(upload: { wav: Buffer | null; seconds: number; failed: number }): Promise<void> {
@@ -599,7 +602,7 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         // A track the model asked for is handed over here, once the turn's own sentences have been
         // spoken into the bracket the turn owns. Nothing is reported after it: whether the music was
         // found was the answer to a call, and it has already been given (4.2).
-        if (wanted.track !== null) startTrack(wanted.track);
+        if (wanted.track !== null) await startTrack(wanted.track);
 
         if (taken.command !== null) {
           // Requirement 2, and the only place in the session where a command is carried

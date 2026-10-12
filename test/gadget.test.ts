@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { describeStatus, readStatus, createGadget, type GadgetStatus } from "../src/gadget.js";
-import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
+import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
 import type { McpSocket } from "../src/protocol/mcp.js";
 
 /**
@@ -100,6 +100,7 @@ function configFor(options: { commandStep?: number } = {}): BridgeConfig {
     ...ENDPOINTER_DEFAULTS,
     sessionIdleMs: 60000,
     musicDir: "",
+    musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: options.commandStep ?? 10,
     language: "english",

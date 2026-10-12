@@ -1,6 +1,6 @@
 import { readFile, readdir } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { MPEGDecoder } from "mpg123-decoder";
+import { MPEGDecoderWebWorker } from "mpg123-decoder";
 import { fold } from "./commands.js";
 import { warn } from "./log.js";
 import { buildWav } from "./protocol/wav.js";
@@ -49,10 +49,21 @@ export async function decodeTrack(path: string): Promise<Track | null> {
     return null;
   }
 
-  const decoder = new MPEGDecoder();
+  // The worker-backed decoder, and it is the whole of this change: the plain `MPEGDecoder` decodes
+  // on **this** thread, and a track is minutes — 843 ms measured for a four-and-a-half-minute one,
+  // in a single step the event loop cannot be interrupted inside. A caller reaches here while the
+  // platform's reply is still streaming *and* still being spoken, and the frames of that reply are
+  // delivered by timers: a blocked loop delivers them late, the device's twenty-frame decode queue
+  // empties, and the person hears the reply stutter while the bridge works ahead of it.
+  //
+  // The decode stays *here* rather than being deferred to after the turn, which is the other way to
+  // unpick it, because the answer a caller gives has to be the truth about the file: only a decode
+  // establishes that it plays, and deferring would have the bridge announce a track it has not yet
+  // found out it can play. The worker keeps both — the loop is free, and the answer is still earned.
+  const decoder = new MPEGDecoderWebWorker();
   try {
     await decoder.ready;
-    const { channelData, samplesDecoded, sampleRate } = decoder.decode(new Uint8Array(bytes));
+    const { channelData, samplesDecoded, sampleRate } = await decoder.decode(new Uint8Array(bytes));
     if (samplesDecoded === 0 || channelData.length === 0 || sampleRate <= 0) {
       warn(`${path} decoded to no samples — it is not an mp3 this bridge can play`);
       return null;
@@ -62,9 +73,9 @@ export async function decodeTrack(path: string): Promise<Track | null> {
     warn(`${path} could not be decoded: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   } finally {
-    // The decoder holds a WASM heap per instance, and a track is decoded once and then handed
-    // on as plain samples. Nothing here needs it afterwards.
-    decoder.free();
+    // The decoder holds a WASM heap *and a thread* per instance, and a track is decoded once and
+    // then handed on as plain samples. Nothing here needs either afterwards.
+    await decoder.free();
   }
 }
 
@@ -407,8 +418,7 @@ export interface TrackPlayer {
 const CHUNK_SECONDS = 10;
 
 /** One track as the WAV chunks a speaker takes, in order. */
-export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buffer[] {
-  const perChunk = Math.max(1, Math.round(seconds * track.sampleRate));
+export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buffer[] {  const perChunk = Math.max(1, Math.round(seconds * track.sampleRate));
   const chunks: Buffer[] = [];
   for (let at = 0; at < track.samples.length; at += perChunk) {
     chunks.push(buildWav(track.samples.subarray(at, at + perChunk), track.sampleRate, 1));
@@ -417,11 +427,43 @@ export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buff
 }
 
 /**
+ * A track's samples at the level the deployment plays them, as a gain in dB from the file.
+ *
+ * A multiplication and not a normalisation: what the person asked for is that recording, and
+ * bringing it to a level of the bridge's own choosing would change it — a quietly mastered track
+ * would come *up*, and what they hear would be the recording with the bridge's own hand on it.
+ *
+ * Rounded and **clamped**, which is what a positive gain needs: a file that already peaks at full
+ * scale cannot be made louder without wrapping, and wrapping is not louder, it is a different
+ * waveform. The clamp is the same one `toMono` applies for its own reason.
+ *
+ * Nought returns the samples themselves rather than a copy of them, because the default is the one
+ * case where a deployment has asked for the file as it is — and a track is millions of samples.
+ */
+function atLevel(samples: Int16Array, gainDb: number): Int16Array {
+  if (gainDb === 0) return samples;
+  const factor = 10 ** (gainDb / 20);
+  const gained = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    gained[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i]! * factor)));
+  }
+  return gained;
+}
+
+/**
  * Play a decoded track through the device's speaker, in one bracket.
  *
- * Nothing here paces, times or waits: the speaker schedules each frame against the device's own
- * playback and holds the bracket open until the last of them is due, so a track is the same act
- * as a long reply — handed over, and then heard.
+ * Nothing here paces or times: the speaker schedules each frame against the device's own playback
+ * and holds the bracket open until the last of them is due, so a track is the same act as a long
+ * reply — handed over, and then heard. What this does do is hand the **event loop** back between
+ * pieces, which is a different thing and is the whole reason it is asynchronous.
+ *
+ * `speak` builds and encodes the piece it is given synchronously — 71 ms measured for ten seconds
+ * of audio — and a whole track handed over in one step is 1576 ms, taken in a single turn of the
+ * loop that nothing can interrupt. A caller reaches here with the platform's reply still due on the
+ * clock: the speaker's `deliver` runs on a timer (`speech.ts`), the device's decode queue is twenty
+ * frames, and a loop held for a second and a half empties it. So the pieces go out one at a time,
+ * with one turn of the loop between them.
  *
  * **The track is named once**, on its first piece, and the pieces after it say nothing: they are
  * one thing spoken, handed over in ten-second pieces only because a WAV is built a piece at a
@@ -440,11 +482,21 @@ export function trackChunks(track: Track, seconds: number = CHUNK_SECONDS): Buff
  * skipped the decode's refusal would otherwise hand a device a bracket that never closes, and a
  * device left in `Speaking` discards whatever the person says next.
  */
-export function playTrack(player: TrackPlayer, track: Track): void {
+export async function playTrack(player: TrackPlayer, track: Track, gainDb: number): Promise<void> {
   const title = basename(track.path).replace(/\.[^.]+$/, "");
-  trackChunks(track).forEach((audio, index) => {
-    player.speak({ index, text: index === 0 ? title : null, audio });
-  });
+  // The level is applied here, where the track's samples first become audio, and nowhere else: a
+  // reply never passes through this function, so a track's level cannot reach one — which is what
+  // makes "the bridge plays nothing louder than the voice it speaks with" a property of one line
+  // rather than of a promise about every caller.
+  const chunks = trackChunks({ ...track, samples: atLevel(track.samples, gainDb) });
+  for (let index = 0; index < chunks.length; index++) {
+    player.speak({ index, text: index === 0 ? title : null, audio: chunks[index]! });
+    // One turn of the loop, so the timers that deliver the audio *already* due — a reply's tail,
+    // most of all — run before this piece's encode takes it again. A `setTimeout` of nought is
+    // enough and is the point: the timers phase is drained before this callback, so anything
+    // overdue goes out first, however many of them there are.
+    if (index + 1 < chunks.length) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
   player.finish();
 }
 
