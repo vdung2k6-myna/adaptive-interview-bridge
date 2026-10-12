@@ -297,10 +297,18 @@ export function createSpeaker(
       // The early return belongs to the send and not to the announcement: a piece with
       // nothing to announce still has frames to deliver, and delivering them is what
       // tells us the socket has gone.
+      //
+      // **Where the announcement goes out is the delivery below, and not here.** It used to be
+      // sent at this point — when the sentence was handed over — and that put the display on the
+      // platform's clock rather than on the audio's: a sentence's frames are due at
+      // `turnStart + turnFrames * frameMs - paceLead`, counted across the whole turn, so a reply
+      // whose production finished in a second or two was *announced* in that second or two while
+      // its audio took as long as it takes to hear. Every sentence after the first was named before
+      // the sentence before it had finished playing, which is the opposite of what the announcement
+      // is for. Sent from the delivery of the sentence's own first frame, the two clocks are one
+      // event: the text leaves `paceLead` ahead of the audio, which is the margin the frames
+      // themselves carry and the reason they carry it.
       const words = sentence.text;
-      if (words !== null && words.trim() !== "") {
-        if (!sendJson({ type: "tts", state: "sentence_start", text: words })) return;
-      }
 
       // The turn's slots are reserved before any of them is filled (D16). `finish()`
       // arms the deadline 6.6 reads while the tail of this turn is still on the clock,
@@ -311,11 +319,16 @@ export function createSpeaker(
       turnMs += frames.length * config.frameMs;
 
       let sentHere = 0;
-      for (const packet of frames) {
+      for (let at0 = 0; at0 < frames.length; at0++) {
+        const packet = frames[at0]!;
         const due = turnStart + turnFrames * config.frameMs - paceLead;
         turnFrames += 1;
         lastDue = due;
         const at = generation;
+        // The sentence's own first frame, which is the one the announcement travels with — and so
+        // the one that decides *when* the display is told. Every later frame of the same sentence
+        // says nothing, because they are the same thing spoken (5.4).
+        const opens = at0 === 0;
         const deliver = (): void => {
           // Stopped since this frame was scheduled: it is no longer wanted, and the device has
           // already been told to stop, so sending it would be audio played after the stop.
@@ -325,6 +338,17 @@ export function createSpeaker(
             gone = true;
             warn(`socket closed after ${sentHere} frame(s) of sentence ${sentence.index}; stopping this reply`);
             return;
+          }
+          // Ahead of this frame and in the same delivery as it, so the order the device needs —
+          // text before the audio it names (5.3) — is what this code says rather than what two
+          // timers' registration order happened to be. It also inherits this delivery's two checks
+          // above, which is what leaves an announcement for audio nobody hears unsent when a turn
+          // is stopped: a display naming something that never plays is its own failure.
+          //
+          // The socket is known open — it was checked a line up — so `sendJson`'s own answer is the
+          // same check twice and is not branched on.
+          if (opens && words !== null && words.trim() !== "") {
+            sendJson({ type: "tts", state: "sentence_start", text: words });
           }
           socket.send(frame(packet, config.framing), { binary: true });
           sentHere += 1;

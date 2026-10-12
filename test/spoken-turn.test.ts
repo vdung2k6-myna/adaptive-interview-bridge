@@ -375,6 +375,47 @@ describe("a person speaks to the gadget", () => {
     }
   });
 
+  it("names a later sentence only once the one before it has been heard", async () => {
+    // The defect the person reported, on the wire: the platform streams a whole reply in a moment,
+    // and the display used to move with *that* clock — so every sentence after the first was named
+    // before the sentence before it had played. The name now travels with the delivery of its own
+    // first frame, so a second sentence cannot be named until the first sentence's audio has gone.
+    //
+    // Counted from the device's own received frames when the second name arrives, which makes it
+    // exact rather than a matter of waiting and hoping: one second of audio at 60 ms is sixteen
+    // frames, and under the old behaviour this saw nought or one.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "ke cho toi nghe" }));
+      res.write(sse("sentence", { index: 0, text: "Ngay xua...", audioData: sentenceAudio(1) }));
+      res.write(sse("sentence", { index: 1, text: "va roi...", audioData: sentenceAudio(1) }));
+      res.write(sse("done", { fullText: "Ngay xua... va roi..." }));
+      res.end();
+    });
+    const device = await spokenDevice(configFor(platform.url));
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(
+        () =>
+          device.messages.filter((m) => JSON.parse(m).state === "sentence_start").length >= 2,
+        "the second sentence to be named"
+      );
+
+      const framesInOneSecond = Math.floor(1000 / 60);
+      assert.ok(
+        device.binaries.length >= framesInOneSecond,
+        `the second name waited for the first sentence's audio: ${device.binaries.length} frame(s) out`
+      );
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
   it("keeps the second turn its own, not a prefix grown by the first", async () => {
     // 6.1's own warning, and the rig's run 10: a window that was never cleared makes
     // every turn after the first upload everything since `listen start`, which the

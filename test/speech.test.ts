@@ -356,6 +356,65 @@ describe("what the device is told to display (5.4)", () => {
     ]);
   });
 
+  it("names a sentence when its own audio is due, not when the platform handed it over", () => {
+    // The defect this exists for: the announcement was sent where `speak` was handed the sentence,
+    // which is the *platform's* clock. A reply the platform produces faster than realtime was
+    // therefore announced faster than realtime, and every sentence after the first was named before
+    // the sentence before it had finished playing.
+    const t = timers(1_000);
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, t.clock, t.schedule);
+
+    // Eight frames of the first sentence, so the second sentence's first frame is still to come:
+    // its due time is `turnStart + 8 * frameMs - paceLead`.
+    speaker.speak(sentence(0, wav(8)));
+    speaker.speak(sentence(1, wav(1)));
+
+    assert.deepEqual(
+      socket.sent.filter((s) => !s.binary).map(jsonOf),
+      [
+        { type: "tts", state: "start" },
+        { type: "tts", state: "sentence_start", text: "sentence 0" },
+      ],
+      "the second sentence is not named while the first is still to be heard"
+    );
+
+    // Far enough for that frame and no further.
+    t.advance(FRAME_MS * 4);
+
+    // Named, and named *before* the frame it belongs to — in one delivery, so the order the device
+    // needs is what the code says rather than what two timers happened to do.
+    assert.deepEqual(spoken(socket.sent).slice(-2), [
+      { type: "tts", state: "sentence_start", text: "sentence 1" },
+      "frame",
+    ]);
+  });
+
+  it("names nothing for a sentence a stopped turn never reached", () => {
+    // The other side of the same coin: an announcement for audio that will not be played is a
+    // display naming something nobody hears. It comes free — the announcement travels in the
+    // delivery of the sentence's own first frame, and a delivery already refuses to run once the
+    // turn has been stopped.
+    const t = timers(1_000);
+    const socket = fakeSocket();
+    const speaker = createSpeaker(socket, config, t.clock, t.schedule);
+
+    speaker.speak(sentence(0, wav(8)));
+    speaker.speak(sentence(1, wav(8)));
+    speaker.stop();
+    t.advance(FRAME_MS * 32);
+
+    assert.deepEqual(
+      socket.sent.filter((s) => !s.binary).map(jsonOf),
+      [
+        { type: "tts", state: "start" },
+        { type: "tts", state: "sentence_start", text: "sentence 0" },
+        { type: "tts", state: "stop" },
+      ],
+      "the sentence the turn never reached is not named, and the one it did reach still is"
+    );
+  });
+
   it("announces nothing for a sentence the device will not speak (5.5)", () => {
     // The announcement is a claim about audio, so it is made only where audio
     // goes out. A display naming a sentence nobody hears is worse than a display
