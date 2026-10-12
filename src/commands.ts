@@ -96,6 +96,17 @@ interface Grammar {
    * same word, and a form without the noun would eat it.
    */
   readonly music: {
+    /**
+     * The words a request for music may end on, which no other command may.
+     *
+     * Read *beside* the language's own suffixes and only where a request for music is being read,
+     * because the two overlap and must not: `lên` ends "bật nhạc lên" and it also ends `to lên`,
+     * which is the volume rule above. Were it in the list the settings are read against, the
+     * strip would leave "to" — a bare adjective, which the whole-utterance rule is built to
+     * refuse — and the command a person gives most often would be lost in exchange for the one
+     * that was being repaired.
+     */
+    readonly suffixes: readonly string[];
     readonly play: readonly RegExp[];
     /** Each carries the track's name in a group named `query`. */
     readonly named: readonly RegExp[];
@@ -144,15 +155,20 @@ export function matchCommand(
   // "phát nhạc" as the ordinary utterance it looks like to everything else, rather than
   // recognising it and then having nothing to play.
   if (options.music === true) {
+    // The words this kind of request ends on, read here and not with the utterance above, so that
+    // a particle which ends a request for music *and* ends a setting's own command is only ever
+    // taken off the former (`music.suffixes`, and the volume rule `to lên`).
+    const asked = stripFrames(grammar, rest, grammar.music.suffixes);
+
     for (const form of grammar.music.play) {
-      if (form.test(rest)) return { decider: "bridge", command: { task: "play-music", query: "" } };
+      if (form.test(asked)) return { decider: "bridge", command: { task: "play-music", query: "" } };
     }
     for (const form of grammar.music.named) {
-      const query = (form.exec(rest)?.groups?.query ?? "").trim();
+      const query = (form.exec(asked)?.groups?.query ?? "").trim();
       if (query !== "") return { decider: "bridge", command: { task: "play-music", query } };
     }
     for (const form of grammar.music.stop) {
-      if (form.test(rest)) return { decider: "bridge", command: { task: "stop-music" } };
+      if (form.test(asked)) return { decider: "bridge", command: { task: "stop-music" } };
     }
   }
 
@@ -231,8 +247,13 @@ export function fold(utterance: string): string {
  * lượng nhé đi" is giving one command through three frames. Each strip shortens the
  * utterance, so this ends; and an over-strip is harmless, because what is left is
  * then matched against anchored rules and simply does not match.
+ *
+ * `extraSuffixes` is a caller's own closed list, read beside the language's and only
+ * where that caller's forms are — which is how a word that ends one command can be a
+ * frame around another (`music.suffixes`).
  */
-function stripFrames(grammar: Grammar, folded: string): string {
+function stripFrames(grammar: Grammar, folded: string, extraSuffixes: readonly string[] = []): string {
+  const suffixes = extraSuffixes.length === 0 ? grammar.suffixes : [...grammar.suffixes, ...extraSuffixes];
   let rest = folded;
   let stripped = true;
   while (stripped) {
@@ -244,7 +265,7 @@ function stripFrames(grammar: Grammar, folded: string): string {
         break;
       }
     }
-    for (const suffix of grammar.suffixes) {
+    for (const suffix of suffixes) {
       if (rest.endsWith(` ${suffix}`)) {
         rest = rest.slice(0, -(suffix.length + 1)).trim();
         stripped = true;
@@ -301,6 +322,13 @@ const VIETNAMESE: Grammar = {
   ],
   // "cho tôi nghe nhạc" arrives here as "nghe nhac": the frames `cho toi` is stripped by, above.
   music: {
+    // "lên" first, and it is the reason this list exists at all: `bật`, `mở`, `phát` and `nghe`
+    // all take it, and without it a request for music is read as a request for a track named
+    // "lên" — measured 2026-10-11, eight draws of eight heard as written and nothing played.
+    // Then the particles a person tags the same request with, and the polite phrase that may
+    // follow the *name* rather than open the sentence ("mở bài hát Diễm Xưa cho tôi"), which the
+    // prefix list cannot reach because it only comes off the front.
+    suffixes: ["len", "cho toi", "xem", "nao", "coi", "thu", "nha", "luon", "duoc", "khong"],
     play: [/^(phat|mo|bat|nghe) nhac$/],
     // The nouns a person names a track through, and **longest first**: the alternation is ordered,
     // so `bai` would take the first word of `bai hat` and leave the other one inside the track's
@@ -341,6 +369,9 @@ const ENGLISH: Grammar = {
     { test: new RegExp(`^(set |change )?(the )?brightness (to |at )?${COUNT}$`), setting: "brightness" },
   ],
   music: {
+    // Nothing the language's own suffixes do not already carry. English tags this request with
+    // "please" and "for me", which are the shared frames above, and its verb takes no particle.
+    suffixes: [],
     play: [/^(play|put on|start) (some |the )?music$/],
     named: [/^(play|put on|start) (the )?(song|track) (?<query>.+)$/],
     stop: [/^(stop|turn off) (the )?music$/, /^stop playing$/],

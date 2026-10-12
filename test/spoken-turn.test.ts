@@ -1493,6 +1493,60 @@ describe("music the bridge plays itself", () => {
     }
   });
 
+  it("plays the words a request is wrapped in, without asking a model", async () => {
+    // The utterance that used to be answered with nothing at all. "lên" is the particle this verb
+    // takes, and it was being read as the name of the track to play — measured on the deployment
+    // 2026-10-11, eight draws of eight heard as written and not one of them playing anything, so
+    // the directory was asked for a file called "lên" (1.1).
+    const platform = await hears("bật nhạc lên");
+    const device = await ask(platform, "bật nhạc lên");
+    try {
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the bracket to open around the track"
+      );
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      const announced = typed.find((m) => m.state === "sentence_start");
+      assert.equal(announced?.text, "Long Tone", "the first by name, the request having named no track");
+      assert.ok(device.binaries.length > 0, "and the track's own audio, inside it");
+
+      // The decision was the grammar's, so nothing was asked of the model about it.
+      assert.equal(platform.requests.length, 1, "one turn, and no tool call");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
+  it("plays a track the request names along with its singer", async () => {
+    // What a person says is longer than the name of a file: the singer after the title. Requiring
+    // every word of the request to be in the name is what a request that named its track correctly
+    // was failing on, 8 times in 8 (2.1).
+    //
+    // The number is what tells this track from `Long Tone.mp3`, which carries the other half of the
+    // words and none of the number — the guard that keeps "the longest run" from meaning "the
+    // nearest name", and the reason a request for one numbered sibling is never answered with
+    // another (2.2).
+    const platform = await hears("mở bài hát Tone 440 của Kenny G");
+    const device = await ask(platform, "mở bài hát Tone 440 của Kenny G");
+    try {
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "start"),
+        "the bracket to open around the track"
+      );
+
+      const typed = device.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      const announced = typed.find((m) => m.state === "sentence_start");
+      assert.equal(announced?.text, "Tone 440");
+      assert.ok(device.binaries.length > 0, "and the track's own audio, inside it");
+      assert.equal(platform.requests.length, 1, "no second turn, and no tool call");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
+
   it("names the track once, however many pieces it is handed over in", async () => {
     // On the wire, which is where the defect was: the track is cut into ten-second pieces so that
     // one WAV is built at a time, and the name used to go out with every piece. Measured on the

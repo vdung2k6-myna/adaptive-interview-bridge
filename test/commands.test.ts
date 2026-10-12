@@ -364,6 +364,43 @@ describe("the bridge's own commands, which are music", () => {
     );
   });
 
+  it("reads the words a request for music is wrapped in", () => {
+    // "lên" is the particle this verb takes, and it is the whole difference between a request for
+    // music and a request for a track called "lên" — measured on the deployment 2026-10-11: eight
+    // draws of eight heard "bật nhạc lên" as written, and every one of them played nothing, because
+    // the name the directory was asked for was the last word of the sentence.
+    read(
+      "vietnamese",
+      [
+        ["bật nhạc lên", playMusic()],
+        ["mở nhạc lên", playMusic()],
+        ["phát nhạc lên", playMusic()],
+        ["nghe nhạc đi", playMusic()],
+        ["mở nhạc xem", playMusic()],
+        ["mở nhạc nào", playMusic()],
+        ["mở nhạc luôn", playMusic()],
+        ["mở nhạc được không", playMusic()],
+        // And the frame that follows the *name* rather than the noun, which the prefix list cannot
+        // reach: it only ever comes off the front of an utterance.
+        ["mở bài hát Diễm Xưa cho tôi", playMusic("diem xua")],
+        ["mở bài hát Hey Jude nhé", playMusic("hey jude")],
+        ["mở nhạc Songbird cho tôi", playMusic("songbird")],
+        // The frame still comes off wherever it is, so the phrase it wraps is unchanged.
+        ["cho tôi nghe bài hát Diễm Xưa", playMusic("diem xua")],
+        ["dừng nhạc đi", STOP_MUSIC],
+      ],
+      { music: true }
+    );
+  });
+
+  it("does not take the volume command's own word for a frame", () => {
+    // `to lên` is the speaker and `lên` is the particle above: one word, one a command and the
+    // other a frame around one. That is why the music's frames are read only where the music's
+    // forms are — read with the language's own suffixes, the strip would leave "to", and the
+    // command a person gives most often would be lost in exchange for the one being repaired.
+    read("vietnamese", [["to lên", VOLUME_UP], ["lớn lên", VOLUME_UP], ["to hơn", VOLUME_UP]], { music: true });
+  });
+
   it("recognises asking it to stop", () => {
     read("vietnamese", [["dừng nhạc", STOP_MUSIC], ["tắt nhạc đi", STOP_MUSIC], ["đừng phát nữa", STOP_MUSIC]], {
       music: true,

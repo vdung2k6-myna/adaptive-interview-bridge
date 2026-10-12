@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { MPEGDecoder } from "mpg123-decoder";
-import { fold, type BridgeCommand } from "./commands.js";
+import { fold } from "./commands.js";
 import { warn } from "./log.js";
 import { buildWav } from "./protocol/wav.js";
 import type { TurnSentence, TurnTool } from "./turn.js";
@@ -103,9 +103,10 @@ export type TrackChoice =
  */
 export const BRIDGE_TOOL_PREFIX = "bridge.";
 
-/** The two, in one place: what the catalogue offers is what the router reads. */
+/** The three, in one place: what the catalogue offers is what the router reads. */
 const PLAY_TOOL = `${BRIDGE_TOOL_PREFIX}play_music`;
 const STOP_TOOL = `${BRIDGE_TOOL_PREFIX}stop_music`;
+const LIST_TOOL = `${BRIDGE_TOOL_PREFIX}list_music`;
 
 /**
  * What this bridge can be asked to do with music, in the shape a turn carries.
@@ -122,6 +123,12 @@ const STOP_TOOL = `${BRIDGE_TOOL_PREFIX}stop_music`;
  *
  * `query` is the person's own words, unfiltered, exactly as the grammar's `named` forms carry it —
  * whether a name matches a file is the directory's answer (`chooseTrack`) and not the catalogue's.
+ *
+ * `list_music` is what makes the other two answerable when the words do not match. What reaches
+ * the model is a transcript, and a title said inside another language comes back as something no
+ * file is called: measured on the deployment 2026-10-11, "Back in Black" came back as "Buckingham"
+ * on three draws of eight. No matcher can repair that — but a model shown the shelf can, which is
+ * why it is handed the names rather than left to compose a string that has to be exactly right.
  */
 export function musicTools(directory: string): readonly TurnTool[] {
   if (directory === "") return [];
@@ -148,34 +155,131 @@ export function musicTools(directory: string): readonly TurnTool[] {
       description: "Stop the music this bridge is playing through the device's speaker.",
       inputSchema: { type: "object", properties: {} },
     },
+    {
+      name: LIST_TOOL,
+      description:
+        "List the tracks in the music library on the machine this bridge runs on. Use it when the " +
+        "person asked for a track and what they said may not be what its file is called — a title " +
+        "spoken in another language, or a name that came back wrong — and then call " +
+        `${PLAY_TOOL} with one of the names it answers with.`,
+      inputSchema: { type: "object", properties: {} },
+    },
   ];
 }
 
 /**
  * What a call to one of the bridge's own tools asks for, or `null` for a name that is not one.
  *
+ * Wider than `BridgeCommand` by one member, and the difference is worth the second type: that one
+ * is what a *person's utterance* turned out to be, and `list-music` is never an utterance — nothing
+ * a person says asks the bridge to enumerate its files. It is a call the platform's model makes,
+ * and the answer goes back to it.
+ */
+export type MusicCall =
+  | { task: "play-music"; query: string }
+  | { task: "stop-music" }
+  | { task: "list-music" };
+
+/**
  * The other half of `musicTools`, and next to it so that the two cannot drift: the catalogue is
  * what the model is offered, this is what the sink does with what comes back, and the names are
- * built from the same two constants.
+ * built from the same three constants.
  *
  * A missing `query` is the bare request rather than a fault — "play some music" with nothing named
  * is what the tool's own description tells the model to send, and `chooseTrack` is where an unnamed
  * request is settled.
  */
-export function musicCommand(name: string, args: Record<string, unknown>): BridgeCommand | null {
+export function musicCommand(name: string, args: Record<string, unknown>): MusicCall | null {
   if (name === STOP_TOOL) return { task: "stop-music" };
+  if (name === LIST_TOOL) return { task: "list-music" };
   if (name !== PLAY_TOOL) return null;
   const query = args["query"];
   return { task: "play-music", query: typeof query === "string" ? query : "" };
 }
 
 /**
+ * The names a person would ask this directory's tracks for by, in the order the directory gives
+ * them — each file's own name, without its extension, and without the folder it was filed in,
+ * which is a thing a person does not say.
+ *
+ * Read at the call and held nowhere, so that a track added to the library is offered on the next
+ * turn rather than at the next restart. A directory that cannot be read is the answer "nothing to
+ * play" and not a fault, for the reason `chooseTrack` gives the same one.
+ */
+export async function listTrackNames(
+  directory: string
+): Promise<{ ok: true; names: readonly string[] } | { ok: false; detail: string }> {
+  if (directory === "") return { ok: false, detail: "this bridge has no music directory" };
+
+  let tracks: string[];
+  try {
+    // `chooseTrack`'s own listing, and the same `no-music` reading of one that cannot be made: the
+    // two must agree about what the library is, or the model is offered names nothing can play.
+    tracks = (await listFiles(directory)).filter((name) => name.toLowerCase().endsWith(".mp3"));
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `${directory} could not be listed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const names = tracks.map((name) => basename(name).replace(/\.[^.]+$/, ""));
+  return { ok: true, names: names.sort() };
+}
+
+/**
+ * Every file under `directory`, as a path relative to it — the directory's own, and then the files
+ * of every directory below it.
+ *
+ * Walking below the configured directory is the whole of it: a person's music is filed in folders,
+ * and reading only the top one means a track that exists is a track the bridge is silent about,
+ * which is the one thing a directory listing must not be. The relative paths are what `join` is
+ * given afterwards, so a track below the root is opened exactly as one beside it.
+ *
+ * A directory that cannot be read throws, as the root one does, rather than being skipped: the
+ * caller turns that into the same "nothing to play, and here is why" it gives for a root that is
+ * not there, which leaves an operator told rather than quietly short of half a library.
+ *
+ * A symbolic link is not followed — `Dirent.isDirectory()` is false for one — so a music folder
+ * that links back onto itself is a folder the walk does not enter.
+ */
+async function listFiles(directory: string, prefix = ""): Promise<string[]> {
+  const entries = await readdir(prefix === "" ? directory : join(directory, prefix), { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const relative = prefix === "" ? entry.name : join(prefix, entry.name);
+    if (entry.isDirectory()) files.push(...(await listFiles(directory, relative)));
+    else if (entry.isFile()) files.push(relative);
+  }
+  return files;
+}
+
+/**
  * The file a request names, or a reason it names none.
  *
- * Three answers, and the middle one is the point: a query that matches two files is *reported*
- * rather than settled by picking one. Playing the wrong track is worse than playing none — the
- * person hears something they did not ask for and has no way to tell that is what happened —
- * and the two mistakes do not cost the same.
+ * Three answers, and the middle one is the point: a request that several files answer to *equally
+ * well* is *reported* rather than settled by picking one. Playing the wrong track is worse than
+ * playing none — the person hears something they did not ask for — and the two mistakes do not
+ * cost the same.
+ *
+ * A file is a candidate on the words it **shares** with the request, and not on all of them: the
+ * longest unbroken run of the request's words the file's name carries, in order. The request is
+ * what a person said, and a person says more than a track's name — a singer after the title, a
+ * word the transcriber added — and requiring every word to be in the name is what a request that
+ * named its track correctly 8 times in 8 was failing on (measured 2026-10-11). What a file's name
+ * does *not* carry is not, by itself, a reason to find nothing.
+ *
+ * The winner is the strictly longest run; a tie is reported. The alternative — a similarity
+ * threshold, or edit distance — cannot be set from anything measured here, and it plays what a
+ * request *resembles*, which is the outcome this function exists to refuse.
+ *
+ * Two guards keep "longest" from meaning "nearest".
+ *
+ * A run is measured in **words**, so `nhac` is a word of a name and `hac` is not.
+ *
+ * And a **number in the request is carried by the file that answers it**, or that file is not a
+ * candidate at all. `nhạc không lời 3` must not be answered with `Nhac khong loi 2.mp3`, which
+ * shares every word of it but the one that tells the two apart.
  *
  * Names are compared folded (`commands.ts`), so a request typed with the tone marks a file name
  * does not carry — which is the ordinary case for Vietnamese — still finds it.
@@ -187,8 +291,7 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
 
   let names: string[];
   try {
-    const entries = await readdir(directory, { withFileTypes: true });
-    names = entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+    names = await listFiles(directory);
   } catch (error) {
     // A directory that is not there is an answer and not a failure: it is the same thing to a
     // person as a directory that is empty, which is that there is nothing to play.
@@ -221,17 +324,44 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
     return { ok: false, reason: "ambiguous", detail: `${named.length} tracks are called ${query}` };
   }
 
-  // Then those words, whole and in order, anywhere in the name — which is how "diễm xưa" finds
-  // "Trinh Cong Son - Diem Xua". Whole words rather than a substring, so that "nhac" does not
-  // match every name containing those four letters.
+  // Then the words the two share. A number the request carries is the one thing a candidate has to
+  // have exactly: it is what tells numbered siblings apart, and they differ in nothing else.
   const words = wanted.split(" ").filter((word) => word !== "");
-  const found = tracks.filter((name) => writings(name).some((writing) => holdsWords(writing, words)));
-  if (found.length === 1) return { ok: true, path: join(directory, found[0]!) };
-  if (found.length > 1) {
+  const numbers = words.filter((word) => /^\d+$/.test(word));
+  // And a run of one word answers only a request of one word. Two words are what a name is made
+  // of; one word shared with a longer request is a coincidence — "không có bài này" and
+  // "Nhạc không lời" share "không" and are not each other, and a directory that answered the first
+  // with the second's files would be reporting a match for a name it does not hold.
+  const floor = Math.min(2, words.length);
+  const scored = tracks
+    .filter((name) => numbers.every((number) => writings(name).some((writing) => hasWord(writing, number))))
+    .map((name) => ({ name, run: Math.max(...writings(name).map((writing) => longestRun(writing, words))) }))
+    .filter((candidate) => candidate.run >= floor);
+
+  const best = Math.max(0, ...scored.map((candidate) => candidate.run));
+  const winners = scored.filter((candidate) => candidate.run === best).map((candidate) => candidate.name);
+
+  if (winners.length === 1) return { ok: true, path: join(directory, winners[0]!) };
+  if (winners.length > 1) {
     return {
       ok: false,
       reason: "ambiguous",
-      detail: `${found.length} tracks match ${query}: ${found.slice(0, 4).join(", ")}`,
+      detail: `${winners.length} tracks match ${query}: ${winners.slice(0, 4).join(", ")}`,
+    };
+  }
+
+  // Nothing carried the request word for word. What is left, and the only thing that can see inside
+  // a token, is the request as it was *heard* rather than as it was spaced. A hyphen invites the
+  // transcriber to put the words back together, and it can put back only some of them: measured
+  // 2026-10-11, a request for `ao-lua-ha-dong-ngo-thuy-mien.mp3` came back as `aoluahadong`, which is
+  // a word of no writing of that name and which no whole-word search finds (D6).
+  const heard = tracks.filter((name) => containsWords(flatten(fold(name)), wanted.replace(/ /g, "")));
+  if (heard.length === 1) return { ok: true, path: join(directory, heard[0]!) };
+  if (heard.length > 1) {
+    return {
+      ok: false,
+      reason: "ambiguous",
+      detail: `${heard.length} tracks match ${query}: ${heard.slice(0, 4).join(", ")}`,
     };
   }
 
@@ -248,6 +378,10 @@ export async function chooseTrack(directory: string, query: string): Promise<Tra
  * because of a hyphen. So both writings are tried rather than either one being declared correct.
  *
  * One writing when the two are the same, which is every name without a hyphen in it.
+ *
+ * A name that comes back put together **in part** is not this and is not meant to be: this writes
+ * the whole name again, so it answers a request that is the whole name and nothing shorter.
+ * `containsWords` is what is reached for when even this finds nothing (D6).
  */
 function writings(name: string): string[] {
   const spaced = fold(name);
@@ -314,11 +448,69 @@ export function playTrack(player: TrackPlayer, track: Track): void {
   player.finish();
 }
 
-/** Whether `words` appear consecutively among the words of `haystack`, both already folded. */
-function holdsWords(haystack: string, words: readonly string[]): boolean {
-  const tokens = haystack.split(" ").filter((token) => token !== "");
-  for (let start = 0; start + words.length <= tokens.length; start++) {
-    if (words.every((word, offset) => tokens[start + offset] === word)) return true;
+/**
+ * A folded name with its separators taken out, and where its words begin in what is left. The end
+ * of the text is one of those places too, so that a request may end a name rather than only begin
+ * one.
+ */
+interface Spoken {
+  text: string;
+  /** Every index a word begins at, and the end of the text. */
+  readonly bounds: readonly number[];
+}
+
+function flatten(folded: string): Spoken {
+  let text = "";
+  const bounds: number[] = [];
+  for (const word of folded.split(" ")) {
+    if (word === "") continue;
+    bounds.push(text.length);
+    text += word;
+  }
+  return { text, bounds: [...bounds, text.length] };
+}
+
+/**
+ * Whether `needle` — a request with its separators out, as it was heard — appears in `haystack`,
+ * beginning and ending where a word of it begins or ends.
+ *
+ * The boundaries are the whole of the difference between this and a substring search, and they are
+ * why it can be reached for at all: `hac` occurs in `nhac` and is not a word of it, and neither is
+ * any other fragment (`commands.ts`, D7).
+ */
+function containsWords(haystack: Spoken, needle: string): boolean {
+  if (needle === "") return false;
+  for (let at = haystack.text.indexOf(needle); at >= 0; at = haystack.text.indexOf(needle, at + 1)) {
+    if (haystack.bounds.includes(at) && haystack.bounds.includes(at + needle.length)) return true;
   }
   return false;
+}
+
+/**
+ * The longest unbroken run of `words` that appears in `haystack`, as words, in order — 0 for none.
+ * Both already folded.
+ *
+ * A run, and not a subsequence: "diem xua" is in "trinh cong son diem xua" as four consecutive
+ * tokens, which is what a name being asked for looks like. Scoring the *longest* run rather than
+ * asking whether the whole query is one is what lets a request carry words a name does not — the
+ * singer, a word the transcriber added — without losing the file (D2).
+ */
+function longestRun(haystack: string, words: readonly string[]): number {
+  const tokens = haystack.split(" ").filter((token) => token !== "");
+  let best = 0;
+  for (let at = 0; at < tokens.length; at++) {
+    for (let from = 0; from < words.length; from++) {
+      let run = 0;
+      while (at + run < tokens.length && from + run < words.length && tokens[at + run] === words[from + run]) {
+        run++;
+      }
+      if (run > best) best = run;
+    }
+  }
+  return best;
+}
+
+/** Whether `token` is one of `haystack`'s words, both already folded. */
+function hasWord(haystack: string, token: string): boolean {
+  return haystack.split(" ").some((word) => word === token);
 }

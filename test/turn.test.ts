@@ -189,14 +189,19 @@ describe("what a turn tells the platform the gadget can do", () => {
       name: string;
     }[];
 
-    assert.deepEqual(sent.map((tool) => tool.name), ["bridge.play_music", "bridge.stop_music"]);
+    assert.deepEqual(sent.map((tool) => tool.name), [
+      "bridge.play_music",
+      "bridge.stop_music",
+      "bridge.list_music",
+    ]);
     assert.ok(sent.every((tool) => !/^self\./.test(tool.name)), "and none of them as something the gadget has");
 
     // A gadget that reported nothing is a turn asked with the bridge's own tools *alone* — the
-    // field is present for them where it used to be absent for everything.
+    // field is present for them where it used to be absent for everything. Three of the bridge's
+    // own, and the one the gadget reported alongside them: one field, both catalogues.
     assert.deepEqual(
       JSON.parse(turnForm({ ...REQUEST, tools: [...ours, TOOL] }).get("tools") as string).length,
-      3
+      4
     );
   });
 });

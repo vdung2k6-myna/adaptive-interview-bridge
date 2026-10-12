@@ -3,7 +3,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
 import { basename } from "node:path";
 import { describeCommand, matchCommand, type BridgeCommand, type GadgetCommand } from "../commands.js";
-import { BRIDGE_TOOL_PREFIX, chooseTrack, decodeTrack, musicCommand, musicTools, playTrack } from "../music.js";
+import { BRIDGE_TOOL_PREFIX, chooseTrack, decodeTrack, listTrackNames, musicCommand, musicTools, playTrack } from "../music.js";
 import type { Track } from "../music.js";
 import { takeTurn, type Conversations } from "../conversation.js";
 import { authorizeDevice, describeDenial } from "../credentials.js";
@@ -466,6 +466,15 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         const stopped = playing;
         playing = false;
         return { ok: true, text: stopped ? "the music is stopped" : "nothing was playing" };
+      }
+
+      // What the shelf holds, for a model that has to choose from it — the only answer this change
+      // has to a transcript that came back as something no file is called. Read at the call and
+      // held nowhere, so a track added to the library is offered on the next turn.
+      if (command.task === "list-music") {
+        const listed = await listTrackNames(config.musicDir);
+        if (!listed.ok) return { ok: false, message: listed.detail };
+        return { ok: true, text: `the tracks this bridge holds:\n${listed.names.join("\n")}` };
       }
 
       // Decided now, played once the turn has unwound. The answer the model is given has to be the

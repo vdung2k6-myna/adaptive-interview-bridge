@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chooseTrack, decodeTrack, musicTools, playTrack } from "../src/music.js";
+import { chooseTrack, decodeTrack, listTrackNames, musicTools, playTrack } from "../src/music.js";
 import { parseWavAudio } from "../src/protocol/wav.js";
 import type { TurnSentence } from "../src/turn.js";
 
@@ -82,13 +82,40 @@ describe("what the bridge offers the model of its own", () => {
     // The name is what tells the model which of the two catalogues it is reaching for, and what
     // lets the sink route the call back here rather than to the gadget. The gadget's own tools are
     // `self.` because they are about the gadget; these are about the bridge's machine.
-    assert.deepEqual(offered.map((tool) => tool.name), ["bridge.play_music", "bridge.stop_music"]);
+    assert.deepEqual(offered.map((tool) => tool.name), [
+      "bridge.play_music",
+      "bridge.stop_music",
+      // The shelf, and the reason the two above can be answered when what the person said is not
+      // what a file is called: a model shown the names can choose, where a matcher cannot.
+      "bridge.list_music",
+    ]);
     assert.ok(offered.every((tool) => tool.name.startsWith("bridge.")));
 
     // A tool the model can only be told "that did not work" about is worse than one it was never
     // offered: it reaches for it, and the person hears an account of a failure the bridge knew
     // about before they spoke. So this is the same gate the grammar is behind.
     assert.deepEqual(musicTools(""), []);
+  });
+
+  it("answers with the tracks it holds, read at the call rather than held", async () => {
+    // Read at the call so that a track added to the library is offered on the next turn, and
+    // without the folder it was filed in, which is not a thing a person says.
+    const dir = mkdtempSync(join(tmpdir(), "bridge-list-"));
+    writeFileSync(join(dir, "Kenny G - Songbird.mp3"), "");
+    assert.deepEqual(await listTrackNames(dir), { ok: true, names: ["Kenny G - Songbird"] });
+
+    writeFileSync(join(dir, "Nhac khong loi 2.mp3"), "");
+    mkdirSync(join(dir, "Album One"));
+    writeFileSync(join(dir, "Album One", "Deep Track.mp3"), "");
+    const again = await listTrackNames(dir);
+    assert.ok(again.ok, "a directory that can be read");
+    assert.deepEqual(again.names, ["Deep Track", "Kenny G - Songbird", "Nhac khong loi 2"]);
+
+    // Nothing to play is an answer and not a fault, as it is for a request.
+    assert.deepEqual(await listTrackNames(""), {
+      ok: false,
+      detail: "this bridge has no music directory",
+    });
   });
 
   it("describes each tool as a schema the platform can hand a model", () => {
