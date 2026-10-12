@@ -1,7 +1,7 @@
 import { normalizeDeviceId } from "./credentials.js";
 import { localIp } from "./net/local-ip.js";
 import type { FramingVersion } from "./protocol/framing.js";
-import type { TurnLanguage } from "./turn.js";
+import type { TurnEngine, TurnLanguage } from "./turn.js";
 
 /**
  * Everything the bridge reads from its environment, read once at start.
@@ -83,6 +83,39 @@ export interface BridgeConfig {
    * accepts throws, because a typo here fails silently in exactly the way above.
    */
   language: TurnLanguage;
+  /**
+   * The synthesis engine every turn is spoken through, declared on every turn —
+   * the sibling of `language`, one field over. Together they are the whole of what
+   * decides how a gadget sounds: the platform resolves a voice from this engine and
+   * this language and from nothing else, and this service names no voice.
+   *
+   * Stated rather than left out, because leaving it out is **not** "no preference".
+   * The endpoint folds an absent or unrecognized engine to `"kokoro"` *before* it
+   * consults its own default, so a turn that dropped the field would ask for an
+   * engine this deployment may never have chosen — and the platform's own
+   * per-language fallback stays unreachable for as long as that fold is there.
+   * Naming the engine is the only way to ask for another one.
+   *
+   * Read from `BRIDGE_TURN_ENGINE`; anything that is not one of the three names the
+   * endpoint accepts throws, for the reason `language` throws: the endpoint's own
+   * fold would turn an operator's typo into a different voice and say nothing about
+   * it. Unset is `supertonic` — the value this service named when it was a constant
+   * in `turn.ts` — so a deployment that sets nothing sounds exactly as it did.
+   *
+   * This value used to mirror the platform's fallback, Piper for English and Kokoro
+   * for Vietnamese, because a mirror is right while the fallback is what the
+   * deployment wants. It stopped being right when the deployment moved to
+   * Supertonic, and the language stopped selecting anything: one engine is what a
+   * deployment speaks through, and the *voice* is what still varies with the
+   * language.
+   *
+   * What it does not do is check the engine against the language. The models a
+   * deployment has installed are the platform's, and this service cannot know which
+   * engine speaks which language without hardcoding another repository's facts
+   * (design.md D5) — so that pairing is `.env.example`'s to state rather than this
+   * service's to refuse.
+   */
+  turnEngine: TurnEngine;
   /**
    * How far one relative command moves a setting — "giảm âm lượng", "sáng hơn" —
    * in the units the setting is measured in, 0 to 100 (D6). Read from
@@ -225,6 +258,26 @@ function readLanguage(env: NodeJS.ProcessEnv): TurnLanguage {
   if (raw === undefined || raw === "") return "english";
   if (raw !== "english" && raw !== "vietnamese") {
     throw new Error(`BRIDGE_LANGUAGE must be english or vietnamese, got ${JSON.stringify(raw)}`);
+  }
+  return raw;
+}
+
+/**
+ * The engine the gadget speaks through, as the endpoint's own three-word
+ * vocabulary — the same reader as `readLanguage` above, one field over, and
+ * refusing to fold for the same reason: the endpoint reads an unknown engine as
+ * `"kokoro"`, so folding here too would turn a typo into a different voice with
+ * nothing in the log to say so.
+ *
+ * `supertonic` when unset, which is what this service named when the value was a
+ * constant, so that a deployment which sets nothing is unchanged by this setting
+ * existing.
+ */
+function readTurnEngine(env: NodeJS.ProcessEnv): TurnEngine {
+  const raw = env.BRIDGE_TURN_ENGINE;
+  if (raw === undefined || raw === "") return "supertonic";
+  if (raw !== "kokoro" && raw !== "piper" && raw !== "supertonic") {
+    throw new Error(`BRIDGE_TURN_ENGINE must be kokoro, piper or supertonic, got ${JSON.stringify(raw)}`);
   }
   return raw;
 }
@@ -486,6 +539,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     frameMs: readInt(env, "BRIDGE_FRAME_MS", 60),
     historyTurns: readInt(env, "BRIDGE_HISTORY_TURNS", 20),
     language: readLanguage(env),
+    turnEngine: readTurnEngine(env),
     // Not bounded to 100: the range a setting is clamped to is the range the
     // gadget's own tool declares (D6), and this is only how far one command moves
     // it. A step past the end of that range lands on the end, which is a legal

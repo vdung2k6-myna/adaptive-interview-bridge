@@ -154,6 +154,7 @@ function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): 
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    turnEngine: "supertonic",
     ...overrides,
   };
 }
@@ -677,6 +678,48 @@ describe("a person speaks to the gadget", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return side;
   }
+
+  it("asks the turn with the engine the deployment configured, beside its language", async () => {
+    // What a deployment speaks through, and the only field of the two that this service states:
+    // the platform resolves a voice from this engine and this language together and from nothing
+    // else. It has to travel from configuration to the wire on every turn, because an absent
+    // engine is not "no preference" — the platform folds it to one of its own.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "xin chao" }));
+      res.write(sse("sentence", { index: 0, text: "Chao ban.", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: "Chao ban." }));
+      res.end();
+    });
+    // Neither the default engine nor the default language, so the turn can only carry these two
+    // if they came out of the config it was driven with.
+    const device = await spokenDevice(
+      configFor(platform.url, { turnEngine: "piper", language: "vietnamese" })
+    );
+    try {
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(() => platform.requests.length === 1, "the turn to reach the platform");
+
+      // Read out of the multipart body the way the prompt is read above, because what is under
+      // test is the request that left the process rather than anything this side kept.
+      const body = platform.requests[0]!.body.toString("utf8").replace(/\r\n/g, "\n");
+      const field = (name: string): string => {
+        const at = body.indexOf(`name="${name}"`);
+        assert.ok(at > 0, `the turn carried a ${name}`);
+        return body.slice(body.indexOf("\n\n", at) + 2, body.indexOf("\n--", at));
+      };
+
+      assert.equal(field("engine"), "piper");
+      assert.equal(field("language"), "vietnamese", "and the two are separate fields, not one");
+    } finally {
+      device.stop();
+      platform.stop();
+    }
+  });
 
   it("makes the call the platform asked for, and reports back what the gadget did", async () => {
     const platform = await stubPlatform((res) => {

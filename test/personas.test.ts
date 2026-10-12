@@ -49,6 +49,7 @@ function configFor(platformUrl: string): BridgeConfig {
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    turnEngine: "supertonic",
   };
 }
 

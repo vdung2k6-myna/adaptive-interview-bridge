@@ -103,6 +103,7 @@ function configFor(options: { commandStep?: number } = {}): BridgeConfig {
     historyTurns: 20,
     commandStep: options.commandStep ?? 10,
     language: "english",
+    turnEngine: "supertonic",
   };
 }
 

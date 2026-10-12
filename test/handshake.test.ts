@@ -48,6 +48,7 @@ const config: BridgeConfig = {
   historyTurns: 20,
   commandStep: 10,
   language: "english",
+  turnEngine: "supertonic",
 };
 
 /** The device's own hello, as the board sends it: 16000 Hz up, 60 ms frames. */

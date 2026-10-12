@@ -8,7 +8,6 @@ import { ENDPOINTER_DEFAULTS, type BridgeConfig } from "../src/config.js";
 import type { McpTool } from "../src/protocol/mcp.js";
 import { musicTools } from "../src/music.js";
 import {
-  TURN_ENGINE,
   runTurn,
   turnForm,
   type TurnRequest,
@@ -21,8 +20,9 @@ import {
  *
  * Two halves, as with the catalog. The request is checked field by field against
  * `POST /api/voice-agent/stream`, because the endpoint is stateless (D2) — whatever
- * the bridge forgets to send is a persona field silently missing from the answer,
- * or a transcriber silently pinned to the wrong language. And the stream is checked
+ * the bridge forgets to send is a persona field silently missing from the answer, a
+ * transcriber silently pinned to the wrong language, or a voice synthesized by an
+ * engine nobody chose. And the stream is checked
  * event by event against a real socket rather than a mocked `fetch`, because what
  * is being pinned is how this process reads bytes: the sentence audio has to reach
  * the caller as it arrives (D4), which is a property of a reader that keeps up, not
@@ -53,6 +53,7 @@ function configFor(platformUrl: string): BridgeConfig {
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    turnEngine: "supertonic",
   };
 }
 
@@ -141,6 +142,7 @@ const REQUEST: TurnRequest = {
   enabledTopics: ["Truyện cười"],
   answerMode: "generate",
   language: "vietnamese",
+  engine: "supertonic",
   history: [{ role: "user", content: "xin chào" }],
   text: "hôm nay thế nào",
 };
@@ -207,13 +209,23 @@ describe("what a turn tells the platform the gadget can do", () => {
 });
 
 describe("which engine a turn asks for", () => {
-  it("asks for this deployment's engine, the same one for every language", () => {
-    // `validateEngine` folds an omitted field to `"kokoro"` before the language is
-    // consulted, so the bridge must name the engine it wants. It names this
-    // deployment's, and that no longer varies with the language — the voice still
-    // does, and stays the platform's to resolve.
-    assert.equal(TURN_ENGINE, "supertonic");
-    assert.equal(turnForm(REQUEST).get("engine"), "supertonic");
+  it("asks for the engine the request carries, and the type is what makes it carried", () => {
+    // `validateEngine` folds an absent or unknown engine to `"kokoro"` before its own
+    // default is consulted, so the bridge must name the engine it wants: omitting the
+    // field is a request for a different engine rather than an absence of preference.
+    // That is why `TurnRequest.engine` is required rather than defaulted in `turnForm`
+    // — there is no value this function could supply that would be the caller's meaning.
+    assert.equal(turnForm(REQUEST).get("engine"), REQUEST.engine);
+    assert.equal(turnForm({ ...REQUEST, engine: "kokoro" }).get("engine"), "kokoro");
+  });
+
+  it("keeps the engine and the language apart, because they select different things", () => {
+    // The engine is what a deployment speaks through and does not vary with the
+    // language. The language is what the *voice* varies with, and the platform resolves
+    // the voice from the two of them together — this service names no voice.
+    const form = turnForm({ ...REQUEST, language: "english", engine: "piper" });
+    assert.equal(form.get("language"), "english");
+    assert.equal(form.get("engine"), "piper");
   });
 });
 
@@ -221,7 +233,7 @@ describe("the turn request", () => {
   it("carries the persona's three fields, the language and the engine", async () => {
     const form = turnForm(REQUEST);
     assert.equal(form.get("language"), "vietnamese");
-    assert.equal(form.get("engine"), "supertonic");
+    assert.equal(form.get("engine"), REQUEST.engine);
     assert.equal(form.get("systemPrompt"), REQUEST.systemPrompt);
     assert.equal(form.get("answerMode"), "generate");
     assert.deepEqual(JSON.parse(form.get("enabledTopics") as string), ["Truyện cười"]);

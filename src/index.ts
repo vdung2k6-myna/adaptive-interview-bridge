@@ -48,6 +48,7 @@ console.log(
     `  framing  v${config.framing}\n` +
     `  downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
     `  language ${config.language}\n` +
+    `  engine   ${config.turnEngine}\n` +
     `  devices  ${allowedDeviceCount(config)} allowed, ${config.devicePersonas.size} bound\n` +
     `  platform token held, never sent to a device\n`
 );

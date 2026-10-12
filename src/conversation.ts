@@ -193,6 +193,10 @@ export async function takeTurn(
           ? fields.systemPrompt
           : `${fields.systemPrompt}\n\n${input.gadgetCondition}`,
       language: input.language,
+      // The deployment's, read here rather than carried in beside the language: `config` is already
+      // in hand at this construction, and a second path to the same value would be a second place
+      // for one decision to live — which is the thing this service refuses about the voice.
+      engine: config.turnEngine,
       history: conversations.history(deviceId),
       ...(input.audio ? { audio: input.audio } : {}),
       ...(input.text !== undefined ? { text: input.text } : {}),

@@ -30,30 +30,19 @@ import { warn } from "./log.js";
 /** The two languages the endpoint accepts; anything else it reads as English. */
 export type TurnLanguage = "english" | "vietnamese";
 
-/** The endpoint's synthesis engines, whose voices are language-specific. */
-export type TurnEngine = "kokoro" | "piper" | "supertonic";
-
 /**
- * The engine to ask for: this deployment's, stated once, for every language.
+ * The endpoint's synthesis engines, whose voices are language-specific.
  *
- * It is sent rather than left out. `validateEngine` folds anything it does not
- * recognize — `undefined` included — to `"kokoro"` *before* the language is
- * consulted, so an omitted field is not "no preference"; it is a request for
- * Kokoro. Naming the engine is the only way to ask for another one, and the
- * platform's own per-language fallback stays unreachable until that fold is
- * removed (the design's non-goal).
- *
- * This value used to mirror that fallback — Piper for English, Kokoro for
- * Vietnamese — because a mirror is right while the fallback is what the
- * deployment wants. It no longer is: the API's own `DEFAULT_TTS_ENGINE` is
- * Supertonic, with a cloned Vietnamese style installed beside its built-ins,
- * and the gadget was the last caller still asking for the engine the deployment
- * had left. So the mirror is gone and the language no longer selects anything:
- * one engine is what this deployment speaks through. The *voice* still varies
- * with the language, and is still the platform's to resolve from this engine and
- * the turn's language — the bridge names no voice, only the engine.
+ * Which one a deployment asks for is not a value here but configuration —
+ * `BRIDGE_TURN_ENGINE`, read in `config.ts`. It is a setting rather than a
+ * constant for the reason the endpointer's thresholds and the command step are:
+ * which engine sounds right is a **feel**, settled by ear rather than by
+ * argument, and a feel cannot be settled from a literal that has to be rebuilt to
+ * change. The reason an absent engine is not "no preference" is
+ * `TurnRequest.engine`'s; the history of the mirror this replaced is
+ * `BridgeConfig.turnEngine`'s.
  */
-export const TURN_ENGINE: TurnEngine = "supertonic";
+export type TurnEngine = "kokoro" | "piper" | "supertonic";
 
 /**
  * The endpoint's own error is not worth inventing here: the platform takes
@@ -101,6 +90,22 @@ export interface TurnRequest {
    * Vietnamese gadget is worse than the bug D12 fixed, and it fails silently.
    */
   language: TurnLanguage;
+  /**
+   * The synthesis engine, **required on every turn**, and required for a reason of
+   * the same shape as the language's: `validateEngine` folds an absent or unknown
+   * engine to `"kokoro"` *before* its own default is consulted, so a turn that
+   * dropped this field would ask for an engine the deployment did not choose. It
+   * would fail silently in the way that matters — the request looks complete, and
+   * only the sound is wrong.
+   *
+   * Required in the type rather than defaulted in `turnForm`, so that "every turn
+   * names it" is a property of a turn rather than a hope about its call sites.
+   *
+   * One engine for every language. The *voice* is what varies with the language, and
+   * the platform resolves it from this and from `language` together — this service
+   * names no voice. What a deployment asks for is read from `BRIDGE_TURN_ENGINE`.
+   */
+  engine: TurnEngine;
   history: readonly TurnMessage[];
   /**
    * What this turn may be asked to do, exactly as it was reported: the gadget's own catalogue,
@@ -199,10 +204,11 @@ export interface TurnOutcome {
 export function turnForm(request: TurnRequest): FormData {
   const form = new FormData();
   form.append("language", request.language);
-  // Stated once rather than derived: see `TURN_ENGINE`, which is where the
-  // choice and its reason live. The platform resolves the voice from this and the
-  // language; the bridge does not name a voice.
-  form.append("engine", TURN_ENGINE);
+  // Stated rather than omitted, and required by the type: an absent engine is a request
+  // for the platform's own default, not an absence of preference (see
+  // `TurnRequest.engine`). The platform resolves the voice from this and the language;
+  // the bridge does not name a voice.
+  form.append("engine", request.engine);
   form.append("systemPrompt", request.systemPrompt);
   form.append(
     "history",

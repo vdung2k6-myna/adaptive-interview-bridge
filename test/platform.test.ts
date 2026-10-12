@@ -39,6 +39,7 @@ function configFor(apiAuthToken: string): BridgeConfig {
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    turnEngine: "supertonic",
   };
 }
 

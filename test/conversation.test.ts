@@ -67,6 +67,7 @@ function configFor(
     historyTurns: options.historyTurns ?? 20,
     commandStep: 10,
     language: options.language ?? "english",
+    turnEngine: "supertonic",
   };
 }
 

@@ -13,7 +13,10 @@ import { loadConfig, ENDPOINTER_DEFAULTS } from "../src/config.js";
  * that starts without the platform's credential or address only fails later, at
  * its first platform call, where the cause is far from the symptom. All four are
  * pinned here, along with the parsing an operator cannot see — and, from 3.2, the
- * rule that the allowlist and the persona bindings must name the same devices.
+ * rule that the allowlist and the persona bindings must name the same devices. The
+ * engine a gadget speaks through belongs with these rather than with the rest of
+ * the configuration: it is refused rather than folded to another one, for the
+ * reason the language is.
  */
 const BOARD = "b8:1f:3f:4a:9b:01";
 const SECRET = "s".repeat(43);
@@ -363,5 +366,58 @@ describe("the rest of the configuration", () => {
     assert.equal("token" in config, false);
     assert.equal("deviceSecret" in config, true);
     assert.equal(config.apiAuthToken, PLATFORM);
+  });
+});
+
+/**
+ * The engine, which is the language's sibling: one field over, stated on every
+ * turn for the same reason, and refused rather than folded for the same reason.
+ * The two together are all that decides how a gadget sounds, since the voice is
+ * resolved from them and named by nobody here.
+ */
+describe("the engine the gadget speaks through", () => {
+  const at = (value: string) => () => loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: value } as NodeJS.ProcessEnv);
+
+  it("speaks through supertonic when the deployment names none", () => {
+    // The value this service named when it was a constant in `turn.ts`, so a
+    // deployment that sets nothing sounds exactly as it did before the setting
+    // existed — the change opens the choice without making one.
+    assert.equal(loadConfig(minimal).turnEngine, "supertonic");
+    assert.equal(loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: "" } as NodeJS.ProcessEnv).turnEngine, "supertonic");
+  });
+
+  it("reads each of the three engines the endpoint accepts", () => {
+    for (const engine of ["kokoro", "piper", "supertonic"] as const) {
+      assert.equal(
+        loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: engine } as NodeJS.ProcessEnv).turnEngine,
+        engine
+      );
+    }
+  });
+
+  it("refuses a value that is not one of the three, rather than folding to another engine", () => {
+    // The endpoint folds an unrecognized engine to `"kokoro"`, which is why the
+    // field has to be stated at all. Folding here too would make an operator's
+    // typo a different voice with nothing said about it — the failure the language
+    // reader refuses to fold for, one field over.
+    assert.throws(at("Supertonic"), /BRIDGE_TURN_ENGINE must be kokoro, piper or supertonic/);
+    assert.throws(at("Kokoro"), /BRIDGE_TURN_ENGINE/);
+    assert.throws(at("xtts"), /BRIDGE_TURN_ENGINE/);
+  });
+
+  it("does not trim, so a stray space is a value nobody meant rather than the engine", () => {
+    // As the language reader does not trim: these are two-word and three-word
+    // vocabularies the endpoint matches exactly, and a value that is not one of
+    // them is reported rather than repaired.
+    assert.throws(at("kokoro "), /BRIDGE_TURN_ENGINE/);
+  });
+
+  it("is independent of the language, which still selects nothing", () => {
+    // One engine is what a deployment speaks through. The language is what the
+    // *voice* still varies with, and the voice is the platform's to resolve from
+    // the two of these together.
+    const config = loadConfig({ ...minimal, BRIDGE_LANGUAGE: "vietnamese", BRIDGE_TURN_ENGINE: "piper" });
+    assert.equal(config.turnEngine, "piper");
+    assert.equal(config.language, "vietnamese");
   });
 });

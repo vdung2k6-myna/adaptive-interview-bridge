@@ -39,6 +39,7 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     historyTurns: 20,
     commandStep: 10,
     language: "english",
+    turnEngine: "supertonic",
   };
 }
 
