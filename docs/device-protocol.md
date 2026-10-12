@@ -1,8 +1,9 @@
 # Where the gadget departs from its own protocol document
 
 The reference is `docs/websocket.md` in the firmware tree
-(`<esp-root>\v6.1\esp-idf\examples\xiaozhi-esp32-main`, where `<esp-root>` is wherever
-that tree is checked out). It is the document the device
+(`<esp-root>\xiaozhi-esp32-main`, where `<esp-root>` is wherever that tree is checked
+out; it sat under the ESP-IDF `examples` directory until 2026-10-12 and does not any
+more). It is the document the device
 was written against, and this service matches the device rather than the document.
 So this file carries **only the deltas** — the places where the code we hold does
 something the document does not say, or says something the code does not do.

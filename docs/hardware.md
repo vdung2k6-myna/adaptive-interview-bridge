@@ -354,13 +354,19 @@ account.
   `sdkconfig` and `sdkconfig.defaults`, `build/xiaozhi.bin` — 2,701,904 B, md5
   `e3ff49cca0a930184788e1149494f54f`, ELF SHA-256 `6f52a03ac40f715c…` — was flashed
   and all five images verified by esptool on write. The boot log's
-  `ELF file SHA256: 6f52a03ac…` matches that ELF, so the board is running this image
-  and no other. `main/assets/lang_config.h` in that same tree reads `CODE = "vi-VN"`;
-  because the ELF hash matches, that compiled string is in the running image, which is
-  as far as a document can carry the claim that the interface is Vietnamese. On this
+  `ELF file SHA256: 6f52a03ac…` matched that ELF, so the board was then running this
+  image and no other. `main/assets/lang_config.h` in that same tree reads
+  `CODE = "vi-VN"`; because the ELF hash matched, that compiled string was in the image
+  the board was running, which is as far as a document can carry the claim that the
+  interface is Vietnamese. On this
   image the device held **two turns** — `ờ có gì mới.` and `vẫn âm lượng nhỏ lại được
   không?`, answered at 180 and 204 characters — with the drain close landing at the
   usual `0.64s` margin both times.
+
+  **Since then, 2026-10-12.** The working tree's own build was flashed over it and
+  checked the same way — `ELF file SHA256: 46de1b526…` in that boot log against that
+  tree's `build/xiaozhi.elf` — so the image on the board is no longer this one. This
+  pass stands as the verification 1.1 asked for, not as the board's current firmware.
 
   What this does not cover is 1.1's own list of *what to record*: the pins. They are
   in "The pins" above, read from the board's `config.h` rather than measured on the
