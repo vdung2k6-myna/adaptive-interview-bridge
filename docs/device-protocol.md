@@ -10,12 +10,17 @@ Everything not listed here is as the document describes it.
 
 **Status.** The deltas below were read out of the firmware source. On 2026-10-06
 the board was attached and sessions captured, and each delta now says which of the
-two it rests on. **Confirmed on the wire** are delta 1, delta 5 and the second half
-of delta 2. **Still source-read only** are deltas 3, 4, 6 and 7, and the first half of
-delta 2: none of them was exercised — that half needs the wake word fired mid-reply,
-which has not happened here, and delta 7 describes a direction the bridge only gained
-after both sessions were captured. Delta 5's spike figures are not from this board and
-are marked as such; the figures added to it are.
+two it rests on; on 2026-10-12 it was attached again and the case delta 2's first half
+had been waiting on was at last fired. **Confirmed on the wire** are delta 1, delta 5
+and both halves of delta 2 — the second on 2026-10-06, the first on 2026-10-12, when
+the wake word landed mid-reply and again mid-track. **Reported, and read off the
+source** is delta 4: the person's account is what moved it off the source alone, and
+what the fix did to the display is the half still unobserved. **Still source-read
+only** are deltas 3, 6 and 7: delta 3 is now *reached* on every abort — the bridge
+sends a `tts stop` into a device that has left `Speaking` — but what the device does
+with it is not visible from this side, and delta 7 describes a direction the bridge
+only gained after both sessions were captured. Delta 5's spike figures are not from
+this board and are marked as such; the figures added to it are.
 
 1.5 also asks that four things be confirmed against the running device, and they
 were. **The connect message**, verbatim:
@@ -128,8 +133,15 @@ The `tts`/`stop` handler (`application.cc`) is guarded by
 has already left that state, so a `tts stop` sent to silence an aborted turn is a
 no-op delivered into exactly the state it is meant to fix.
 
-**The bridge:** does not send one. The aborted turn's own `finally` closes the
-bracket it opened, which is the only `tts stop` that turn gets (D15).
+**The bridge:** sends one anyway. The abort handler stops the speaker
+(`src/server/ws.ts`), which is the same call that abandons an interrupted track: it
+bumps the generation, so every frame the turn had reserved and not yet handed over is
+abandoned rather than delivered, and then sends the `tts stop` — into the state this
+delta says ignores it. What silences the device is the device, leaving `Speaking` on
+its own. The aborted turn's own `finally` still closes the bracket it opened, which is
+what a turn that *ran out* gets (D15); after a stop there is no bracket left to close.
+Measured 2026-10-12, three aborts: `tts stop (stopped after 16.74s of 49.02s)`,
+`32.70s of 204.00s` and `36.90s of 104.28s`.
 
 ## 4. `tts sentence_start` is not state-gated — binary frames are
 

@@ -810,15 +810,18 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       }
 
       if (isAbort(msg)) {
-        // The wake word cancelled the turn (6.5). Two halves are cancelled, and the second one is
-        // below: the **source** — the signal reaches the platform request, so a turn still being
-        // produced stops — and what the turn had already handed to the speaker. What is deliberately
-        // *not* done is anything to the device that it would act on: the firmware sends this from
-        // `HandleWakeWordDetectedEvent` and leaves `Speaking` itself, gating incoming audio on that
-        // state, so it has already silenced its own speaker. The `tts stop` the speaker sends on the
-        // way out falls on a device that has left that state and is ignored — the firmware gates its
-        // `stop` handler on `Speaking` — and `turning` is cleared by the turn's own `finally` rather
-        // than by a second writer here.
+        // Two acts arrive as this message, and the message says which. The **wake word** always
+        // carries `reason: wake_word_detected`, because `Protocol::SendAbortSpeaking` writes that
+        // field only for that reason (`main/protocols/protocol.cc:66-73`); the **button** sends a
+        // bare `abort`, the boot button's `ToggleChatState` reaching a handler that aborts with
+        // `kAbortReasonNone` (`main/boards/bread-compact-wifi-lcd/compact_wifi_board_lcd.cc:132` →
+        // `application.cc:816`). Both were measured in one session on 2026-10-12, so the log line
+        // below is what tells an operator which one happened. Either way the device has left
+        // `Speaking` by the time this lands — the firmware sends it from a handler that then sets
+        // its own next state — and it gates incoming audio, and its own `tts stop` handler, on that
+        // state, so nothing here needs to put it anywhere, and the `tts stop` the speaker sends on
+        // the way out is a no-op there (delta 3 of `docs/device-protocol.md`). `turning` is cleared
+        // by the turn's own `finally` rather than by a second writer here (6.6).
         log(`abort (reason=${msg.reason ?? "none"}) — cancelling the turn${turn ? "" : " (nothing in flight)"}`);
         turn?.abort();
         // And the **speaker** is stopped, for a track and for a reply alike. Cancelling the turn
