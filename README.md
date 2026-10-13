@@ -169,11 +169,65 @@ start rather than folded, so a typo is an error rather than a quieter change of
 voice. Which voice that engine resolves to, per language, stays the platform's —
 "What a gadget sounds like" below is where the deployment's answer is recorded.
 
-The reply is a stream of server-sent events — `user`, `sentence`, `text`, `notice`,
-`error`, `done` — and it is read as one. The endpoint emits each sentence's audio as
-that sentence is finished, so speech begins before the reply is complete (D4); a
-client that waited for the body would have thrown the property away, which is why
-the bridge hands each event to its caller as it arrives.
+The reply is a stream of server-sent events — `user`, `sentence`, `text`, `tool_call`,
+`music`, `notice`, `error`, `done` — and it is read as one. The endpoint emits each
+sentence's audio as that sentence is finished, so speech begins before the reply is
+complete (D4); a client that waited for the body would have thrown the property away,
+which is why the bridge hands each event to its caller as it arrives.
+
+`tool_call` is the model asking for something only this service can do — one of the
+tools the bridge declared in the turn's `tools` field — and the platform holds the turn
+open for the answer, eight seconds by default, so it is the one event here that cannot
+be left unanswered. `music` is the other library answering: a track the *platform* will
+play through its client, which this service does not model and drops in the fall-through
+that every unmodelled event takes. Both are "Two libraries, one turn" below.
+
+### Two libraries, one turn
+
+A turn is offered more than one toolkit, and the model is told which party answers each
+by the first word of a tool's name. Three prefixes are in play, and they are the whole
+of the routing:
+
+| Prefix | Whose | Answered by | Arrives here as |
+| --- | --- | --- | --- |
+| `self.` | the gadget's own controls, read off the catalog it reports | the gadget, over the device socket | a `tool_call`, which the bridge forwards |
+| `bridge.` | this service's music — `bridge.list_music`, `bridge.play_music`, `bridge.stop_music` | this service, without leaving it | a `tool_call`, which the bridge answers itself |
+| `platform.` | the platform's own music — `platform.list_music`, `platform.play_music` | the platform, inside the round that asked | **nothing**: no event is sent, because there is nobody else to ask |
+
+The last row is the one to hold on to. A `platform.*` call never reaches this service:
+the platform answers it in the round it was asked, before any event is emitted, so the
+bridge's tool handling is never consulted for one, and a bridge waiting on an event for
+it would be waiting on an event that is not coming.
+
+**And the two music libraries are two libraries.** This service reads `BRIDGE_MUSIC_DIR`
+and decodes the track itself to play it through the gadget's speaker; the platform reads
+its own `MUSIC_LIBRARY_DIR` and serves the file to whoever is on the connection. They
+are different directories, they may hold different files, and they do not have to agree
+about what a playable track is — the bridge decodes MPEG only, so a `.flac` in its
+directory is refused at the call ("it is not an mp3 this bridge can play", `src/music.ts`),
+while the platform's library admits every container its audio mount types as audio.
+Nothing reconciles the two lists, and nothing should: each library is offered under its
+own prefix, and the model chooses between them the way it chooses anything else.
+
+So one request can be heard in either of two rooms. `bridge.play_music` puts music out
+of **the gadget's** speaker, in one bracket, on the device's own clock, at the level
+`BRIDGE_MUSIC_GAIN_DB` records. `platform.play_music` sends a `music` event to the client
+that made the turn, and that client fetches the file from the platform's mount and plays
+it **there** — the browser, for a browser turn — which is why this service drops the
+event rather than handling it: what it names is not on a socket this service holds.
+Neither is a fallback for the other, and **on a device turn the platform's is the one that
+cannot be heard.** A turn this service sends carries `tools`, so the platform offers its
+own music tools *beside* these — both libraries at once, in one list — and all that
+separates them is their descriptions: this service's says "through the device's own
+speaker", the platform's says "through the person's own client". On a device turn the
+person's own client **is this service**: the `music` event arrives on the turn's own
+stream, where the handler above does not model it and drops it. A model that reaches for
+`platform.play_music` here is told the track is playing, says so in its reply, and nothing
+is heard; `bridge.play_music` is the only one of the two that reaches the gadget's
+speaker. Both descriptions are true and the choice between them is still the model's —
+what it cannot know is which one this deployment can make audible. A deployment may
+configure one library, both, or neither, and one whose bridge holds no music simply
+offers no `bridge.*` tools: no other part of the feature depends on it.
 
 ### What a gadget sounds like
 
