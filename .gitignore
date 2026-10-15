@@ -5,3 +5,9 @@ dist/
 *.log
 # A detached `npm start` writes its output here.
 .start.*
+# Regenerated wholesale by the OpenSpec CLI on every upgrade, so they are not
+# tracked. The one exception is .github/workflows/copilot-setup-steps.yml,
+# which Copilot's coding agent needs in the repository; it stays tracked and
+# the ignore below does not apply to it.
+.claude*
+.github*
