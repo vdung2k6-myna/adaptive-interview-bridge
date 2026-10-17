@@ -1,4 +1,4 @@
-import { loadConfig } from "./config.js";
+import { describeBinding, loadConfig, pairedGadgets } from "./config.js";
 import { createConversations } from "./conversation.js";
 import { allowedDeviceCount } from "./credentials.js";
 import { err, log, warn } from "./log.js";
@@ -47,8 +47,6 @@ console.log(
     `  ws       ${wsUrl}\n` +
     `  framing  v${config.framing}\n` +
     `  downlink ${config.serverRate} Hz / ${config.frameMs} ms\n` +
-    `  language ${config.language}\n` +
-    `  engine   ${config.turnEngine}\n` +
     `  devices  ${allowedDeviceCount(config)} allowed, ${config.devicePersonas.size} bound\n` +
     `  platform token held, never sent to a device\n`
 );
@@ -93,12 +91,14 @@ try {
   );
 }
 
-// The bindings, resolved against the catalog just read (3.2). One line per
-// device, because this is the whole of what a gadget's character is: which
-// persona it speaks as, and therefore which three turn fields it will carry. The
-// count of topics is printed rather than the topics themselves — the interesting
-// fact at start is whether the persona resolved and whether it scopes any search
-// at all, and a persona with no topics is a valid one that never reads material.
+// The bindings, resolved against the catalog just read (3.2). One line per device,
+// because this is the whole of what a gadget is: which persona answers it — and
+// therefore which three turn fields it will carry — and the language and engine its
+// turns are heard and spoken through, which is the pair the platform resolves a
+// voice from. The count of topics is printed rather than the topics themselves — the
+// interesting fact at start is whether the persona resolved and whether it scopes
+// any search at all, and a persona with no topics is a valid one that never reads
+// material.
 //
 // A binding the catalog does not report is a warning, not a refusal: the catalog
 // is live and this read is one moment of it, so a persona added on the platform
@@ -113,10 +113,22 @@ for (const [device, personaId] of config.devicePersonas) {
   if (persona === undefined) continue;
   const fields = turnFieldsFor(persona);
   log(
-    `NOTE device ${device} speaks as ${persona.id} (${persona.label}): ${fields.enabledTopics.length} ` +
-      `topic(s), answer mode ${fields.answerMode}`
+    `NOTE device ${device} speaks as ${persona.id} (${persona.label}) in ${describeBinding(config, device)}: ` +
+      `${fields.enabledTopics.length} topic(s), answer mode ${fields.answerMode}`
   );
 }
+// The pair, where a deployment records one (D7): the two gadgets hold a conversation, and the figure
+// printed is the whole of the silence between them — because the turn that follows has already been
+// produced by the time the other one stops speaking. Nothing is printed for a deployment that pairs
+// none, which is every deployment but one.
+const pair = pairedGadgets(config);
+if (pair.length === 2) {
+  log(
+    `NOTE devices ${pair[0]} and ${pair[1]} hold a conversation: the floor passes on the gadget's own ` +
+      `report, and the hand-over is ${config.handoverMs}ms`
+  );
+}
+
 for (const [device, personaId] of unresolvedBindings(config.devicePersonas, personas)) {
   warn(
     `NOTE device ${device} is bound to persona ${personaId}, which the catalog does not report. The ` +

@@ -1,4 +1,5 @@
 import type { BridgeConfig } from "./config.js";
+import { boundEngine, boundLanguage } from "./config.js";
 import { matchCommand } from "./commands.js";
 import type { PersonaCatalog, PersonaMissReason } from "./personas.js";
 import { describePersonaMiss, resolveBoundPersona, turnFieldsFor } from "./personas.js";
@@ -103,9 +104,12 @@ function flatten(exchanges: readonly TurnExchange[]): TurnMessage[] {
   return messages;
 }
 
-/** What a turn needs from the device: its language, and what the person said. */
+/** What a turn needs from the device: what the person said or spoke. The language it
+ *  is heard in and the engine it is spoken through are the device's own bindings and
+ *  are resolved from `config` by `takeTurn`, so a caller cannot pass a different
+ *  pair — which is what makes the two command matches and the turn's own declaration
+ *  the same answer by construction. */
 export interface DeviceTurnInput {
-  language: TurnLanguage;
   audio?: TurnAudio;
   text?: string;
   /**
@@ -140,7 +144,7 @@ export type DeviceTurnResult =
    * somebody else (D5, 3.4). `message` is the line to hand an operator; `detail`
    * says which of the three misses it was.
    */
-  | { served: false; miss: PersonaMissReason; detail: string; message: string };
+  | { served: false; miss: PersonaMissReason | "not-bound"; detail: string; message: string };
 
 /**
  * Take one turn for a device: resolve who answers it, carry the conversation in,
@@ -174,6 +178,31 @@ export async function takeTurn(
     };
   }
 
+  // What this gadget is heard and spoken as, resolved beside the persona and for the
+  // same reason: it is the gadget's rather than the deployment's, so it is read where
+  // the gadget is known — and read once, because the turn's declaration and the two
+  // command matches have to be the same answer.
+  //
+  // A started bridge binds every gadget it allows (`config.ts`), so neither can be
+  // missing here. It is still answered rather than defaulted, because the
+  // alternative is a turn spoken in a language nobody chose.
+  const language = boundLanguage(config, deviceId);
+  const engine = boundEngine(config, deviceId);
+  if (language === undefined || engine === undefined) {
+    const missing = [language === undefined ? "a language" : "", engine === undefined ? "an engine" : ""]
+      .filter((part) => part !== "")
+      .join(" and ");
+    return {
+      served: false,
+      miss: "not-bound",
+      detail: `${deviceId} is bound to no ${missing}`,
+      message:
+        `${deviceId} is bound to no ${missing}, so no turn can be asked as it — every gadget the ` +
+        `allowlist names is bound in BRIDGE_DEVICE_LANGUAGES and BRIDGE_DEVICE_ENGINES before the ` +
+        `bridge starts`,
+    };
+  }
+
   // The turn's own transcript, captured from the stream as it passes. It is the
   // only copy: the platform keeps nothing, and by the time the turn ends the
   // event that carried it is gone.
@@ -192,11 +221,10 @@ export async function takeTurn(
         input.gadgetCondition === undefined
           ? fields.systemPrompt
           : `${fields.systemPrompt}\n\n${input.gadgetCondition}`,
-      language: input.language,
-      // The deployment's, read here rather than carried in beside the language: `config` is already
-      // in hand at this construction, and a second path to the same value would be a second place
-      // for one decision to live — which is the thing this service refuses about the voice.
-      engine: config.turnEngine,
+      language,
+      // The gadget's, like the language above and read the same way — the pair is what the
+      // platform resolves a voice from, and neither is a property of the turn.
+      engine,
       history: conversations.history(deviceId),
       ...(input.audio ? { audio: input.audio } : {}),
       ...(input.text !== undefined ? { text: input.text } : {}),
@@ -225,7 +253,7 @@ export async function takeTurn(
   // repetition of it — a turn that *was* spoken for was answered, whatever its
   // transcript happens to read as, and belongs in the history as much as any other.
   const answeredByTheBridge =
-    outcome.replyText === "" && matchCommand(config.language, userText, { music: config.musicDir !== "" }) !== null;
+    outcome.replyText === "" && matchCommand(language, userText, { music: config.musicDir !== "" }) !== null;
   if (!answeredByTheBridge) {
     conversations.record(deviceId, { user: userText, agent: outcome.replyText });
   }

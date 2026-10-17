@@ -39,8 +39,10 @@ function configFor(allowedDevices: string[], secret = "s".repeat(43)): BridgeCon
     musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: 10,
-    language: "english",
-    turnEngine: "supertonic",
+    deviceLanguages: new Map(allowedDevices.map((device) => [device, "english"])),
+    deviceEngines: new Map(allowedDevices.map((device) => [device, "supertonic"])),
+    devicePartners: new Map(),
+    handoverMs: 400,
   };
 }
 

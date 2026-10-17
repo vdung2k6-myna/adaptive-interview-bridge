@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
+import { boundLanguage, describeBinding, partnerOf } from "../config.js";
 import { basename } from "node:path";
 import { describeCommand, matchCommand, type BridgeCommand, type GadgetCommand } from "../commands.js";
 import { BRIDGE_TOOL_PREFIX, chooseTrack, decodeTrack, listTrackNames, musicCommand, musicTools, playTrack } from "../music.js";
@@ -14,7 +15,7 @@ import type { PersonaCatalog } from "../personas.js";
 import { advertisesTools } from "../protocol/mcp.js";
 import { isAbort, isHello, isListen, isMcp, parseClientMessage, serverHello } from "../protocol/messages.js";
 import { createSpeaker } from "../speech.js";
-import type { ToolCallOutcome, ToolCallRequest, TurnTool } from "../turn.js";
+import type { ToolCallOutcome, ToolCallRequest, TurnSentence, TurnTool } from "../turn.js";
 
 /**
  * The device's socket.
@@ -66,6 +67,27 @@ interface DeviceRequest extends IncomingMessage {
 }
 
 /**
+ * What one session offers the other in a pair (D8).
+ *
+ * An exchange is two sessions that know nothing else about each other: one asks the other for a
+ * turn whose input is the words it has just produced, and tells it when its own audio has stopped —
+ * which is the floor (D1). Both directions are the same four calls, so neither session has to know
+ * which side of the pair the deployment wrote.
+ */
+interface PairedSession {
+  /** Ask this session for a turn whose input is `text`: produced now, spoken at the release.
+   *  The backstop for a partner that never reports is the *asker's* to arm (D5), because the
+   *  deadline it needs is the asker's own audio and the report would arrive on the asker's socket. */
+  prepareTurn(text: string): void;
+  /** The asker has finished speaking: speak what is prepared, after the hand-over (D7). */
+  releaseTurn(): void;
+  /** Drop what is prepared — the turn it answered was cancelled, so nobody is owed it (D6). */
+  dropTurn(): void;
+  /** Whether this session is taking or holding a turn, so the room is not free to listen in (D4). */
+  busy(): boolean;
+}
+
+/**
  * The rest of the service a session needs: who answers this device (3.x), and what
  * it has already been told (4.2). Passed in rather than built here, because both
  * outlive a connection — a persona catalog is read once at start, and a conversation
@@ -108,8 +130,21 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
   );
   wss.on("error", (e) => err(`ws server: ${e.message}`));
 
+  /**
+   * Who is connected, by device id, for the one pair that converses (D8).
+   *
+   * The first cross-session state in this service besides the conversations, and deliberately the
+   * smallest thing that works: a handle per session, registered once the session is built and
+   * removed at its close, so a prepared turn whose session has gone is *reported* rather than thrown
+   * at a closed socket. Empty for every deployment that pairs nothing — which is every deployment
+   * but one, and all of them are unaffected by this file's paired paths.
+   */
+  const paired = new Map<string, PairedSession>();
+
   wss.on("connection", (ws: WebSocket, req: DeviceRequest) => {
     const deviceId = req.bridgeDeviceId ?? "unknown";
+    /** The gadget this one converses with, or nothing where the deployment pairs none (D8). */
+    const partnerId = partnerOf(config, deviceId);
     /**
      * A listener that writes on this session's behalf, under the scope that names it.
      *
@@ -132,6 +167,8 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       listening: false,
       /** Frames dropped because the device was still playing the bridge's own audio. */
       drained: 0,
+      /** Frames counted and not judged because an exchange was in flight (D4). */
+      held: 0,
       /** Words the platform heard, which the device's display is told (6.2). */
       heard: 0,
     };
@@ -263,6 +300,23 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
     runWithDevice(deviceId, () => {
       section("device connected");
       log(`session ${session.id} device ${deviceId} path ${req.url}`);
+      // The one pair that converses, registered where the other side can find it (D8) — and
+      // registered *here*, inside the session's scope, so the line that says so names this gadget
+      // like every other line about it. Each method re-establishes this session's scope before it
+      // runs, which is load-bearing rather than tidy: they are called from the *other* session's
+      // closure, and the log reads the scope of the call site, not of the closure the code lives in
+      // (`log.ts`). Without that, a prepared turn's own lines — its frames, its `tts stop`, its reply
+      // — were attributed to the gadget that asked for it, and a two-gadget run was unreadable
+      // exactly where it mattered. Measured 2026-10-17, on the first live exchange this change ran.
+      if (partnerId !== undefined) {
+        paired.set(deviceId, {
+          prepareTurn: (text) => runWithDevice(deviceId, () => prepareTurn(text)),
+          releaseTurn: () => runWithDevice(deviceId, releasePrepared),
+          dropTurn: () => runWithDevice(deviceId, dropPrepared),
+          busy,
+        });
+        log(`the exchange: paired with ${partnerId} — the two take turns`);
+      }
       // The device's own identification travels on the connect headers. Logged in
       // full because they are cheap and their absence is the kind of thing that is
       // only noticed a week later — the credential itself is not, since it is
@@ -428,10 +482,22 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
        * sentence does, since a track is handed to the same speaker that is already saying it.
        */
       const wanted: { track: Track | null } = { track: null };
+      /**
+       * Whether this turn asked its partner for one (D2), so that the backstop for a partner that
+       * never reports can be armed where this gadget's own audio deadline is known — after
+       * `finish()`, which is in the `finally` below and not yet run here (D5).
+       */
+      let askedPartner = false;
 
+      // The pair this turn is declared with, on the turn's own line (design D7). It is
+      // the only evidence a live run can offer for it: the transcriber follows the audio
+      // it is given rather than the language the turn names, so two gadgets bound the
+      // other way round produce the same transcripts and the log is what has to say which
+      // one was heard as what. Read through the same lookup `takeTurn` reads.
       log(
         `turn from speech: ${upload.seconds.toFixed(2)}s of the person's own voice` +
-          `${upload.failed ? `, ${upload.failed} frame(s) undecodable` : ""}`
+          `${upload.failed ? `, ${upload.failed} frame(s) undecodable` : ""}` +
+          ` (${describeBinding(config, deviceId)})`
       );
 
       // What the turn is asked with, so that "the conversation is the one it would
@@ -520,7 +586,6 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
           services.conversations,
           deviceId,
           {
-            language: config.language,
             audio: { filename: "turn.wav", contentType: "audio/wav", data: upload.wav },
             ...(condition !== null ? { gadgetCondition: condition } : {}),
             ...(tools.length > 0 ? { tools } : {}),
@@ -543,7 +608,18 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
               // stream before it produces a reply, so nothing of its answer is spoken,
               // and the speaker's `finish()` will find a bracket that was never opened
               // (4.1, D8). The change itself is made once the turn has unwound, below.
-              const command = matchCommand(config.language, said, { music: config.musicDir !== "" });
+              // The gadget's own language, not the deployment's: what is matched here is
+              // the words a person said, and they came back in the language their gadget is
+              // bound to. The same lookup is what `takeTurn` declares the turn with and
+              // what its own recording check matches against, so the turn judged here and
+              // the turn recorded there are one decision (design D4).
+              //
+              // A binding a started bridge cannot be missing (`config.ts`); a session
+              // without one judges nothing here, and the turn it takes is reported as not
+              // served by `takeTurn` rather than being matched against another language.
+              const language = boundLanguage(config, deviceId);
+              if (language === undefined) return;
+              const command = matchCommand(language, said, { music: config.musicDir !== "" });
               if (command === null) return;
 
               // A request for music is only a command this bridge answers where its own directory
@@ -647,6 +723,18 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
               `${result.outcome.replyText.length} char(s) of reply, ` +
               `${(speaker.sessionMs() / 1000).toFixed(2)}s of audio sent this session`
           );
+          // The partner's turn follows this one (D2, D3): asked now, while this reply's audio is
+          // still being paced out, and spoken when this gadget has finished. A partner that is not
+          // connected is a line rather than a failure (D8).
+          if (partnerId !== undefined && result.outcome.replyText.trim() !== "") {
+            const handle = paired.get(partnerId);
+            if (handle === undefined) {
+              warn(`the exchange: ${partnerId} is not connected, so nothing follows this turn`);
+            } else {
+              handle.prepareTurn(result.outcome.replyText);
+              askedPartner = true;
+            }
+          }
         }
       } catch (error) {
         err(`turn failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -658,6 +746,17 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         // cleared it would be a second one, which is the shape D10 and D13 keep
         // recording.
         speaker.finish();
+        // The backstop, armed here rather than where the partner was asked (D5): the deadline is this
+        // gadget's own audio, which `finish()` has just set, and the report that would release the
+        // partner's turn arrives on *this* socket. A board that never reports — a crash, a socket that
+        // half-closed — therefore leaves the floor free at the figure the bridge already models, plus
+        // the same hand-over a report would have waited for.
+        if (askedPartner && partnerId !== undefined) {
+          const freeAt = speaker.drainingUntil();
+          if (freeAt !== null) {
+            setTimeout(() => paired.get(partnerId)?.releaseTurn(), Math.max(0, freeAt - clock())).unref();
+          }
+        }
         if (turn === controller) turn = null;
         turning = false;
         // The reply has just stopped being heard, which is the likeliest moment for the
@@ -688,6 +787,148 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       }
     }
 
+    /**
+     * The reply this session owes an exchange: asked for as soon as its partner's words were
+     * complete, and spoken only when the floor is free (D2, D3).
+     *
+     * Everything the platform produces is held — the sentences, and with them the names that travel
+     * with a sentence's first frame — because what must not happen is a turn whose audio begins while
+     * the partner is still speaking. Holding the *answer* rather than the bracket is what leaves
+     * every clock `speech.ts` keeps anchored where it always was: at the release.
+     */
+    let owing: {
+      sentences: TurnSentence[];
+      released: Promise<void>;
+      release: () => void;
+      dropped: boolean;
+    } | null = null;
+
+    /** The floor is free: the partner has reported listening, or the backstop has passed (D1, D5). */
+    function releasePrepared(): void {
+      owing?.release();
+    }
+
+    /** Nobody is owed this reply any more: the turn it answered was cancelled (D6). */
+    function dropPrepared(): void {
+      if (owing === null) return;
+      owing.dropped = true;
+      owing.release();
+    }
+
+    /** Whether this session is taking or holding a turn, so the room is not free to listen in (D4). */
+    function busy(): boolean {
+      return turning || owing !== null;
+    }
+
+    /**
+     * Whether the room is in the middle of an exchange (D4).
+     *
+     * Covers both halves — this session's own turn, and its partner's — which is the half a
+     * per-session rule could never see, and the reason a lull inside a partner's reply cannot close
+     * a turn on the gadget listening to it.
+     */
+    function roomBusy(): boolean {
+      if (busy()) return true;
+      return partnerId !== undefined && (paired.get(partnerId)?.busy() ?? false);
+    }
+
+    /**
+     * Ask this session for a turn whose input is its partner's own words (D2).
+     *
+     * Production starts now — a reply's text is complete while its audio is still being paced out,
+     * twelve to forty-four seconds early in the run of 2026-10-17 — and the answer waits for the floor.
+     */
+    function prepareTurn(text: string): void {
+      if (owing !== null) {
+        // One at a time: an exchange is turn by turn, and a second reply owed before the first was
+        // spoken is two conversations rather than one.
+        warn(`a reply is already owed to the exchange — not asking for another: ${JSON.stringify(text.slice(0, 60))}`);
+        return;
+      }
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      owing = { sentences: [], released, release, dropped: false };
+      log(
+        `the exchange: asked this gadget for a turn from its partner's ${text.length} char(s) — ` +
+          `spoken when the floor is free`
+      );
+      void serveReply(text);
+    }
+
+    /**
+     * Take the turn an exchange asked for, and speak it at the floor (D2, D3).
+     *
+     * A body of its own rather than `serveTurn`'s: this turn has no utterance to trim or transcribe
+     * and nothing to match as a command — those are words a *person* said — and its sentences are
+     * held rather than spoken as they arrive. What it shares with that body is the platform call, the
+     * persona, the conversation and the reporting, which is what `takeTurn` is.
+     */
+    async function serveReply(text: string): Promise<void> {
+      const held = owing;
+      if (held === null) return;
+      // In a turn for the whole of the wait, which is what holds this session's idle window
+      // (`fireIdleWindow`) and what keeps its own microphone out of the way (D4).
+      turning = true;
+      const controller = new AbortController();
+      turn = controller;
+      try {
+        const result = await takeTurn(
+          config,
+          services.catalog,
+          services.conversations,
+          deviceId,
+          { text },
+          {
+            onSentence: (sentence) => {
+              held.sentences.push(sentence);
+            },
+            onNotice: (notice) => warn(`platform notice on the partner's turn: ${notice.message}`),
+            onError: (message) => err(`platform refused the partner's turn: ${message}`),
+          },
+          controller.signal
+        );
+
+        if (!result.served) {
+          err(`the partner's turn was not served: ${result.message}`);
+          return;
+        }
+        info(
+          `the partner's turn was answered with ${result.outcome.replyText.length} char(s) — ` +
+            `held until the floor is free (D3)`
+        );
+
+        // The floor. Everything the platform produced is already in hand, so what is waited for here
+        // is the other gadget and not the answer (D3).
+        await held.released;
+        if (held.dropped) {
+          log(`the prepared reply was dropped — the turn it answered was cancelled (D6)`);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, config.handoverMs));
+
+        // Said from here, so the speaker's own clock — the pacing, the drain deadline and the
+        // bracket — is anchored at the moment this device starts hearing (D3).
+        speaker.beginTurn();
+        for (const sentence of held.sentences) speaker.speak(sentence);
+        log(
+          `the partner's turn was spoken: ${held.sentences.length} sentence(s), ` +
+            `${(speaker.sessionMs() / 1000).toFixed(2)}s of audio sent this session`
+        );
+      } catch (error) {
+        err(`the partner's turn failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        speaker.finish();
+        if (turn === controller) turn = null;
+        turning = false;
+        owing = null;
+        // And no `sawPerson()`: an exchange is not a person, so the idle window runs from whatever a
+        // person last did — and running out is one of the two things that ends a conversation
+        // between two gadgets (the other is the wake word, in the abort path).
+      }
+    }
+
     /** A text message to the device, from a path that has no socket of its own. */
     function sendJson(message: Record<string, unknown>): boolean {
       if (ws.readyState !== OPEN) return false;
@@ -702,6 +943,20 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         const wire = Buffer.from(data as ArrayBuffer);
         session.frames += 1;
         session.bytes += wire.length;
+
+        // D4 — an exchange in flight is not the person. While either gadget of a pair is taking or
+        // holding a turn, this one's microphone is counted and not judged: what it hears is its
+        // partner, whose words are already arriving as a turn of their own, and a lull inside them is
+        // not a person stopping. Counted apart from the drain guard's frames, because "the room is
+        // busy" and "this is my own echo" are different problems and an operator has to tell them
+        // apart. A deployment that pairs nothing reaches none of this.
+        if (partnerId !== undefined && roomBusy()) {
+          session.held += 1;
+          if (session.held === 1) {
+            info(`not judging input — an exchange is in flight in this room (D4)`);
+          }
+          return;
+        }
 
         // 6.6 — the tail of the bridge's own voice. The device reopens its microphone
         // before its speaker stops and reports that it is listening while it does, so
@@ -810,6 +1065,9 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
             playing = false;
             log("the device is listening again — the track has finished");
           }
+          // And this is the floor (D1): the gadget says it has finished speaking, and that report —
+          // not the bridge's own estimate of its audio — is what releases its partner's turn.
+          if (partnerId !== undefined) paired.get(partnerId)?.releaseTurn();
           session.listening = true;
           // A window opens from nothing: the frames, the verdicts and the endpointer
           // together, or the previous window's decisions are judged against this one's
@@ -863,6 +1121,12 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         playing = false;
         speaker.stop();
         if (wasPlaying) log("the wake word stopped the music");
+        // And the exchange ends with it (D6): the turn this gadget was answering is cancelled, so
+        // nothing is owed to it — neither the reply its partner had prepared, nor one of its own. The
+        // person who stopped the reply has taken the floor, and an answer to half a question is the
+        // exchange continuing against them.
+        dropPrepared();
+        if (partnerId !== undefined) paired.get(partnerId)?.dropTurn();
         // The wake word is a person saying something, and it is the one act that reaches
         // here without a turn to carry it.
         sawPerson();
@@ -900,6 +1164,9 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
         );
         // The window goes with the socket, WASM memory and all (6.7).
         listening.close();
+        // And so does the handle the other side of the pair was using: a prepared turn whose session
+        // has gone is reported by the asker rather than thrown at this closed socket (D8).
+        if (partnerId !== undefined) paired.delete(deviceId);
         if (idleTimer !== null) clearTimeout(idleTimer);
         if (closeGraceTimer !== null) clearTimeout(closeGraceTimer);
       })

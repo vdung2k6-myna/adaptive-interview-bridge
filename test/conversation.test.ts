@@ -67,8 +67,16 @@ function configFor(
     musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: options.historyTurns ?? 20,
     commandStep: 10,
-    language: options.language ?? "english",
-    turnEngine: "supertonic",
+    deviceLanguages: new Map([
+      ["b81f3f4a9b01", options.language ?? "english"],
+      ["aa11bb22cc33", "english"],
+    ]),
+    deviceEngines: new Map([
+      ["b81f3f4a9b01", "supertonic"],
+      ["aa11bb22cc33", "supertonic"],
+    ]),
+    devicePartners: new Map(),
+    handoverMs: 400,
   };
 }
 
@@ -273,11 +281,11 @@ describe("a device's turn, from the conversation's side", () => {
 
       await takeTurn(
         config, catalog, conversations, "b8:1f:3f:4a:9b:01",
-        { language: "english", text: "first question" }, noSink
+        { text:"first question" }, noSink
       );
       await takeTurn(
         config, catalog, conversations, "b8:1f:3f:4a:9b:01",
-        { language: "english", text: "second question" }, noSink
+        { text:"second question" }, noSink
       );
 
       const turns = platform.requests.filter((r) => r.path.includes("stream"));
@@ -312,7 +320,7 @@ describe("a device's turn, from the conversation's side", () => {
 
       await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "vietnamese", text: "something else entirely" }, noSink
+        { text:"something else entirely" }, noSink
       );
 
       assert.deepEqual(conversations.history("b81f3f4a9b01"), [
@@ -334,7 +342,7 @@ describe("a device's turn, from the conversation's side", () => {
 
       await takeTurn(
         config, catalog, createConversations(config), "b81f3f4a9b01",
-        { language: "vietnamese", text: "hi" },
+        { text:"hi" },
         { onUser: (text) => void seen.push(text) }
       );
 
@@ -354,7 +362,7 @@ describe("a device's turn, from the conversation's side", () => {
 
       const result = await takeTurn(
         config, catalog, createConversations(config), "b8:1f:3f:4a:9b:01",
-        { language: "english", text: "hello" }, noSink
+        { text:"hello" }, noSink
       );
 
       assert.equal(result.served, false);
@@ -389,7 +397,7 @@ describe("a device's turn, from the conversation's side", () => {
 
       await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "english", text: "hello" }, noSink
+        { text:"hello" }, noSink
       );
 
       assert.deepEqual(conversations.history("b81f3f4a9b01"), [
@@ -399,7 +407,7 @@ describe("a device's turn, from the conversation's side", () => {
       // answer to one turn, not a state the conversation is left in (4.4).
       const after = await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "english", text: "again" }, noSink
+        { text:"again" }, noSink
       );
       assert.equal(after.served, true);
     } finally {
@@ -430,7 +438,7 @@ describe("a command the bridge answered itself", () => {
 
       const result = await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "vietnamese", text: "anything" }, noSink
+        { text:"anything" }, noSink
       );
 
       assert.equal(result.served, true, "the turn was taken; it was the gadget that answered it");
@@ -453,7 +461,7 @@ describe("a command the bridge answered itself", () => {
 
       await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "vietnamese", text: "giảm âm lượng" }, noSink
+        { text:"giảm âm lượng" }, noSink
       );
 
       assert.deepEqual(conversations.history("b81f3f4a9b01"), [
@@ -486,7 +494,7 @@ describe("the gadget's condition, on the turn", () => {
 
       await takeTurn(
         config, catalog, createConversations(config), "b81f3f4a9b01",
-        { language: "english", text: "how are you", gadgetCondition: REPORT }, noSink
+        { text:"how are you", gadgetCondition: REPORT }, noSink
       );
 
       const [turn] = platform.requests.filter((r) => r.path.includes("stream"));
@@ -515,7 +523,7 @@ describe("the gadget's condition, on the turn", () => {
 
       await takeTurn(
         config, catalog, createConversations(config), "b81f3f4a9b01",
-        { language: "english", text: "how are you" }, noSink
+        { text:"how are you" }, noSink
       );
 
       const [turn] = platform.requests.filter((r) => r.path.includes("stream"));
@@ -537,11 +545,11 @@ describe("the gadget's condition, on the turn", () => {
 
       await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "english", text: "one", gadgetCondition: REPORT }, noSink
+        { text:"one", gadgetCondition: REPORT }, noSink
       );
       await takeTurn(
         config, catalog, conversations, "b81f3f4a9b01",
-        { language: "english", text: "two" }, noSink
+        { text:"two" }, noSink
       );
 
       const turns = platform.requests.filter((r) => r.path.includes("stream"));

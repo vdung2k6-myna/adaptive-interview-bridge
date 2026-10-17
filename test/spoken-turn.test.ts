@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocket } from "ws";
 import { ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT, type BridgeConfig } from "../src/config.js";
+import type { TurnEngine, TurnLanguage } from "../src/turn.js";
 import { createConversations } from "../src/conversation.js";
 import { deriveToken } from "../src/credentials.js";
 import { createPersonaCatalog } from "../src/personas.js";
@@ -155,6 +156,30 @@ async function stubPlatform(
   };
 }
 
+/** The two gadgets' bindings, each pair given — for the tests where the two must differ,
+ *  which is what "each gadget states its own language and engine" is about (design D6). */
+const bindSpeech = (
+  first: { language: TurnLanguage; engine: TurnEngine },
+  second: { language: TurnLanguage; engine: TurnEngine }
+): Pick<BridgeConfig, "deviceLanguages" | "deviceEngines"> => ({
+  deviceLanguages: new Map([
+    [DEVICE, first.language],
+    [SECOND_DEVICE, second.language],
+  ]),
+  deviceEngines: new Map([
+    [DEVICE, first.engine],
+    [SECOND_DEVICE, second.engine],
+  ]),
+});
+
+/** The same pair for both gadgets, which is what a one-gadget test wants, and what the
+ *  second gadget is given wherever a test does not care what it is bound to. */
+const speech = (
+  language: TurnLanguage = "english",
+  engine: TurnEngine = "supertonic"
+): Pick<BridgeConfig, "deviceLanguages" | "deviceEngines"> =>
+  bindSpeech({ language, engine }, { language: "english", engine: "supertonic" });
+
 function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   return {
     otaPort: 0,
@@ -177,8 +202,9 @@ function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): 
     musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: 10,
-    language: "english",
-    turnEngine: "supertonic",
+    ...speech(),
+    devicePartners: new Map(),
+    handoverMs: 400,
     ...overrides,
   };
 }
@@ -192,9 +218,9 @@ interface Session {
   binaries: Buffer[];
   until(predicate: () => boolean, what: string, ms?: number): Promise<void>;
   /** The code the bridge's end of the socket closed with, or null while it is open.
-   *  A bridge that ends the session itself closes with 1000; a test tearing the socket
-   *  down sees 1006. Without the code the two are the same event, and "the session was
-   *  ended" would pass on a test that ended it. */
+   *  A bridge that ends the session itself names no status code, which a peer reports as
+   *  1005; a test tearing the socket down sees 1006. Without the code the two are the same
+   *  event, and "the session was ended" would pass on a test that ended it. */
   closeCode(): number | null;
   /** Resolves with that code once the socket closes, whoever closed it. */
   closed: Promise<number>;
@@ -791,7 +817,7 @@ describe("a person speaks to the gadget", () => {
     // Neither the default engine nor the default language, so the turn can only carry these two
     // if they came out of the config it was driven with.
     const device = await spokenDevice(
-      configFor(platform.url, { turnEngine: "piper", language: "vietnamese" })
+      configFor(platform.url, speech("vietnamese", "piper"))
     );
     try {
       device.send({ type: "hello", version: 3, transport: "websocket" });
@@ -1446,10 +1472,11 @@ describe("the wake word during a reply", () => {
 /** Wait for the bridge to end the session, and fail unless it was the bridge that did it.
  *
  *  The close *code* is the whole of what makes this observable. `ws.close()` sends a close
- *  frame with no status code, which the peer reports as 1005 — and that, or a 1000, is the
- *  bridge ending a session. 1006 is a socket destroyed without a close frame, which is what
- *  `stop()` does; and a session that is still open never resolves at all. Asserting 1000
- *  would fail on the bridge behaving correctly, which is how this test was written first. */
+ *  frame with no status code, so what a peer reports is 1005 — the bridge names no code, and
+ *  seen from here it never reads 1000. That is how this test was written **second**: it
+ *  asserted 1000 first, and failed on the bridge behaving correctly. 1006 is a socket
+ *  destroyed without a close frame, which is what `stop()` does and what a gadget that drops
+ *  its connection produces; and a session that is still open never resolves at all. */
 async function endedByBridge(device: Session, ms: number): Promise<void> {
   const code = await Promise.race([
     device.closed,
@@ -1636,7 +1663,7 @@ describe("a session nobody is speaking into", () => {
       res.end();
     });
     const device = await spokenDevice(
-      configFor(platform.url, { sessionIdleMs: 400, musicDir: MUSIC, language: "vietnamese" })
+      configFor(platform.url, { sessionIdleMs: 400, musicDir: MUSIC, ...speech("vietnamese") })
     );
     try {
       device.send({ type: "hello", version: 3, transport: "websocket" });
@@ -1738,6 +1765,202 @@ describe("a session nobody is speaking into", () => {
   });
 });
 
+/** Two gadgets admitted to one bridge and listening, each having completed its handshake. */
+async function twoListeningGadgets(port: number): Promise<[Session, Session]> {
+  const first = await connect(port, BOARD);
+  const second = await connect(port, SECOND_BOARD);
+  for (const gadget of [first, second]) {
+    gadget.send({ type: "hello", version: 3, transport: "websocket" });
+    await gadget.until(() => gadget.messages.some((m) => m.includes('"hello"')), "a server hello");
+    gadget.send({ type: "listen", state: "start", mode: "manual" });
+  }
+  return [first, second];
+}
+
+/** What a bridge holds between sockets, for the tests that build one by hand. */
+const servicesFor = (config: BridgeConfig): BridgeServices => ({
+  catalog: createPersonaCatalog(config),
+  conversations: createConversations(config),
+});
+
+describe("two paired gadgets take turns", () => {
+  // The deployment this is for: two boards in one room, made to hold a conversation. What is
+  // asserted here is the shape of the exchange — whose words a turn is asked with, when it is
+  // spoken, and what the gadget listening does meanwhile — because those are the three things that
+  // go wrong in a room where each gadget can hear the other (proposal.md, design D1–D7).
+  const pair = (): Pick<BridgeConfig, "devicePartners"> => ({
+    devicePartners: new Map([
+      [DEVICE, SECOND_DEVICE],
+      [SECOND_DEVICE, DEVICE],
+    ]),
+  });
+
+  /** One call's reply: what the platform heard, and the sentence it says back. */
+  const says = (heard: string, spoken: string) => (res: ServerResponse): void => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(sse("user", { text: heard }));
+    res.write(sse("sentence", { index: 0, text: spoken, audioData: sentenceAudio(REPLY_SECONDS) }));
+    res.write(sse("done", { fullText: spoken }));
+    res.end();
+  };
+
+  it("asks the partner with the reply's own words, and speaks them once the other has finished", async () => {
+    const platform = await stubPlatform(
+      (res, call) => says(call === 0 ? "who are you" : "the first gadget's words", call === 0 ? "I am the interviewer." : "I am the candidate.")(res),
+      CATALOG_TWO
+    );
+    const config = configFor(platform.url, { ...pair(), handoverMs: 50 });
+    const server = await startedServer(config, servicesFor(config));
+    const [first, second] = await twoListeningGadgets(server.port);
+    try {
+      const bodyOf = (turn: number): string => platform.requests[turn - 1]!.body.toString("latin1");
+
+      first.speak();
+      await first.until(() => platform.requests.length === 2, "the partner's turn to be asked");
+
+      // D2 — the question is what was said and not what was heard: the partner's turn carries the
+      // first reply's own text, as text, so there is no audio part and no transcription of it.
+      assert.ok(
+        bodyOf(2).includes("I am the interviewer."),
+        "the partner is asked with the first gadget's own words"
+      );
+      assert.ok(!bodyOf(2).includes('filename="turn.wav"'), "and with no audio of its own");
+
+      // D3 — and nothing is spoken yet: the answer is in hand while the first turn's audio is still
+      // being paced out, which is exactly where the headroom this design rests on comes from.
+      await first.until(
+        () => first.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the first reply to finish being sent"
+      );
+      assert.equal(
+        second.messages.filter((m) => JSON.parse(m).type === "tts").length,
+        0,
+        "the partner says nothing until the floor is free"
+      );
+      assert.equal(second.binaries.length, 0, "not one frame of it either");
+
+      // D4 — and the gadget listening meanwhile judges nothing: its own window would have closed a
+      // turn on the first gadget's speech, which is the misfire this whole change exists for.
+      second.speak();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(platform.requests.length, 2, "the room is busy, so that utterance is not a turn");
+
+      // D1 — the floor passes on the first gadget's own report, which is what a board sends when its
+      // speaker stops (`listen start`, 0.04–0.26 s after the audio ends, measured 2026-10-17).
+      first.send({ type: "listen", state: "start", mode: "auto" });
+      await second.until(
+        () => second.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "sentence_start"),
+        "the partner's reply to be spoken"
+      );
+      await second.until(
+        () => second.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "and to finish"
+      );
+      assert.ok(second.binaries.length > 0, "the partner's own audio reached the partner");
+    } finally {
+      first.stop();
+      second.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("takes the floor for a gadget that never reports, and drops it when the turn is cancelled", async () => {
+    // D5 — a board that never reports leaves the floor free at the bridge's own estimate of its
+    // audio, so an exchange cannot stall on a gadget that has fallen silent.
+    const platform = await stubPlatform(
+      (res, call) => says(call === 0 ? "hello" : "the first gadget's words", "said once")(res),
+      CATALOG_TWO
+    );
+    const config = configFor(platform.url, { ...pair(), handoverMs: 50 });
+    const server = await startedServer(config, servicesFor(config));
+    const [first, second] = await twoListeningGadgets(server.port);
+    try {
+      first.speak();
+      await first.until(() => platform.requests.length === 2, "the partner's turn to be asked");
+      // No `listen start` from the first gadget at all: the floor is taken on the bridge's own
+      // estimate of that gadget's audio, plus the hand-over.
+      await second.until(
+        () => second.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "sentence_start"),
+        "the partner's reply to be spoken on the backstop"
+      );
+    } finally {
+      first.stop();
+      second.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("drops what is prepared when the wake word cancels the turn it answers", async () => {
+    // D6 — a person who stops a reply by saying the wake word has taken the floor, so the answer to
+    // the half-question that was already sent is not spoken: the exchange ends rather than
+    // continuing against them.
+    const platform = await stubPlatform(
+      (res, call) => says(call === 0 ? "hello" : "the first gadget's words", "said once")(res),
+      CATALOG_TWO
+    );
+    const config = configFor(platform.url, { ...pair(), handoverMs: 50 });
+    const server = await startedServer(config, servicesFor(config));
+    const [first, second] = await twoListeningGadgets(server.port);
+    try {
+      const { written } = await capturing(async () => {
+        first.speak();
+        await first.until(() => platform.requests.length === 2, "the partner's turn to be asked");
+        first.send({ type: "abort", reason: "wake_word_detected" });
+        // Long enough that the backstop would have spoken it had the drop not cancelled the release.
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      });
+
+      assert.equal(
+        second.messages.filter((m) => JSON.parse(m).type === "tts").length,
+        0,
+        "the prepared reply was never spoken"
+      );
+      assert.equal(second.binaries.length, 0, "and not one frame of it");
+      assert.match(written, /the prepared reply was dropped/, "and the log says why");
+    } finally {
+      first.stop();
+      second.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("takes the floor for a gadget that never reports, and reports a partner that is not there", async () => {
+    // D5's backstop: a board that falls silent leaves the floor free at the bridge's own estimate of
+    // its audio. And D8's absence: a pair whose other half is not connected is a line in the log
+    // rather than a failure — which is also what a reconnect inside an exchange means.
+    const platform = await stubPlatform(
+      (res, call) => says(call === 0 ? "hello" : "the first gadget's words", "said once")(res),
+      CATALOG_TWO
+    );
+    const config = configFor(platform.url, { ...pair(), handoverMs: 50 });
+    const server = await startedServer(config, servicesFor(config));
+    const first = await connect(server.port, BOARD);
+    try {
+      const { written } = await capturing(async () => {
+        first.send({ type: "hello", version: 3, transport: "websocket" });
+        await first.until(() => first.messages.some((m) => m.includes('"hello"')), "the server hello");
+        first.send({ type: "listen", state: "start", mode: "manual" });
+        first.speak();
+        await first.until(() => platform.requests.length === 1, "the first turn");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      });
+      assert.match(
+        written,
+        new RegExp(`${SECOND_DEVICE} is not connected`),
+        "the missing half of the pair is reported rather than assumed"
+      );
+      assert.equal(platform.requests.length, 1, "and nothing is asked of a partner that is not there");
+    } finally {
+      first.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+});
+
 describe("music the bridge plays itself", () => {
   /** A platform that transcribes whatever the test wants heard, and then has nothing more to say.
    *  A command is knowable only from the transcript (D12), so every one of these starts here. */
@@ -1756,7 +1979,7 @@ describe("music the bridge plays itself", () => {
    *  asserted in `commands.test.ts`; what is being pinned here is the path from an utterance to a
    *  track, and it is not improved by pinning it in a language nobody in the room is using. */
   async function ask(platform: Awaited<ReturnType<typeof stubPlatform>>, said: string, musicDir = MUSIC) {
-    const device = await spokenDevice(configFor(platform.url, { musicDir, language: "vietnamese" }));
+    const device = await spokenDevice(configFor(platform.url, { musicDir, ...speech("vietnamese") }));
     device.send({ type: "hello", version: 3, transport: "websocket" });
     await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
     device.send({ type: "listen", state: "start", mode: "manual" });
@@ -1950,7 +2173,7 @@ describe("music the bridge plays itself", () => {
       res.write(sse("done", { fullText: "Không có bài đó." }));
       res.end();
     });
-    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, ...speech("vietnamese") }));
     try {
       device.send({ type: "hello", version: 3, transport: "websocket" });
       await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
@@ -2004,7 +2227,7 @@ describe("music the bridge plays itself", () => {
       res.write(sse("done", { fullText: "" }));
       res.end();
     });
-    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, ...speech("vietnamese") }));
     try {
       device.send({ type: "hello", version: 3, transport: "websocket" });
       await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
@@ -2099,7 +2322,7 @@ describe("music the bridge plays itself", () => {
       res.write(sse("done", { fullText: "" }));
       res.end();
     });
-    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, language: "vietnamese" }));
+    const device = await spokenDevice(configFor(platform.url, { musicDir: MUSIC, ...speech("vietnamese") }));
     try {
       device.send({ type: "hello", version: 3, transport: "websocket" });
       await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
@@ -2287,6 +2510,15 @@ describe("lines a session writes name the gadget", () => {
       const named = (rest: string): RegExp => new RegExp(`\\[\\s*[\\d.]+ ${DEVICE}\\]${rest}`);
       assert.match(written, named(" == device connected =="), "the session's own lines carry it");
       assert.match(written, named(" turn from speech:"), "and so does a line written inside a turn");
+      // And the pair that turn is declared with, which is the one thing a live run cannot
+      // be read for any other way: the transcriber follows the audio it is given rather
+      // than the language the turn names, so two gadgets bound the other way round produce
+      // the same transcripts (design D7).
+      assert.match(
+        written,
+        named(" turn from speech: [\\d.]+s of the person's own voice \\(english/supertonic\\)"),
+        "and names the pair that turn is declared with"
+      );
 
       // The other half of the rule, read out of the same log: the bridge's own line — the
       // server coming up, which no session is behind — names no gadget, and its bracket holds
@@ -2320,23 +2552,6 @@ describe("two gadgets on one bridge", () => {
       res.write(sse("done", { fullText: `tra loi cho ${heard}` }));
       res.end();
     };
-
-  /** Two gadgets admitted to one bridge and listening, each having completed its handshake. */
-  async function twoListeningGadgets(port: number): Promise<[Session, Session]> {
-    const first = await connect(port, BOARD);
-    const second = await connect(port, SECOND_BOARD);
-    for (const gadget of [first, second]) {
-      gadget.send({ type: "hello", version: 3, transport: "websocket" });
-      await gadget.until(() => gadget.messages.some((m) => m.includes('"hello"')), "a server hello");
-      gadget.send({ type: "listen", state: "start", mode: "manual" });
-    }
-    return [first, second];
-  }
-
-  const servicesFor = (config: BridgeConfig): BridgeServices => ({
-    catalog: createPersonaCatalog(config),
-    conversations: createConversations(config),
-  });
 
   it("sends a reply to the gadget that spoke, and nothing to the other", async () => {
     const platform = await stubPlatform(answers(FIRST_SAID), CATALOG_TWO);
@@ -2380,12 +2595,20 @@ describe("two gadgets on one bridge", () => {
     }
   });
 
-  it("asks each gadget's turn with its own conversation and its own persona", async () => {
+  it("asks each gadget's turn with its own persona, conversation, language and engine", async () => {
     // The only state two gadgets can meet in is the conversation (`conversation.ts`), so this
     // is where a cross-contamination would show: the second gadget's first turn must be asked
     // as nobody's, and the first gadget's next turn must carry its own exchange and no other's.
+    // The language and the engine are the same assertion one field over — bound per gadget, so
+    // the two gadgets here are bound to different pairs and each turn must carry its own.
     const platform = await stubPlatform((res, call) => answers(call === 0 ? FIRST_SAID : SECOND_SAID)(res), CATALOG_TWO);
-    const config = configFor(platform.url);
+    const config = configFor(
+      platform.url,
+      bindSpeech(
+        { language: "vietnamese", engine: "piper" },
+        { language: "english", engine: "kokoro" }
+      )
+    );
     const server = await startedServer(config, servicesFor(config));
     const [first, second] = await twoListeningGadgets(server.port);
     try {
@@ -2401,6 +2624,13 @@ describe("two gadgets on one bridge", () => {
       await first.until(() => platform.requests.length === 3, "the first gadget's next turn");
 
       const bodyOf = (turn: number): string => platform.requests[turn - 1]!.body.toString("latin1");
+      /** One field of a turn's body, as the platform reads it: the name, then the value. */
+      const fieldOf = (turn: number, name: string): string => {
+        const body = bodyOf(turn);
+        const at = body.indexOf(`name="${name}"`);
+        assert.ok(at > 0, `turn ${turn} carries a ${name} field`);
+        return body.slice(body.indexOf("\r\n\r\n", at) + 4, body.indexOf("\r\n--", at));
+      };
 
       assert.ok(!bodyOf(2).includes(FIRST_SAID), "the second gadget is not asked with the first's turn");
       assert.ok(!bodyOf(2).includes(FIRST_PROMPT), "nor under the first gadget's persona");
@@ -2409,9 +2639,84 @@ describe("two gadgets on one bridge", () => {
       assert.ok(bodyOf(3).includes(FIRST_SAID), "the first gadget keeps the conversation it was having");
       assert.ok(!bodyOf(3).includes(SECOND_SAID), "and is not given the other's");
       assert.ok(bodyOf(3).includes(FIRST_PROMPT), "asked under its own persona");
+
+      // The pair each turn is declared with, which is what the platform resolves a voice from.
+      assert.equal(fieldOf(1, "language"), "vietnamese", "the first gadget's turn declares its own language");
+      assert.equal(fieldOf(1, "engine"), "piper", "and its own engine");
+      assert.equal(fieldOf(2, "language"), "english", "the second gadget's declares its own");
+      assert.equal(fieldOf(2, "engine"), "kokoro", "and its own engine");
+      assert.equal(fieldOf(3, "language"), "vietnamese", "and the first gadget's next turn is unchanged");
+      assert.equal(fieldOf(3, "engine"), "piper", "in both");
     } finally {
       first.stop();
       second.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("matches a command in the language of the gadget it was said to", async () => {
+    // The same words, said to two gadgets bound to different languages: a command for the one
+    // whose grammar holds them, and an ordinary utterance for the other. The command is the
+    // bridge's own — asking for the music to stop — so no gadget tool is involved and what is
+    // asserted is only which grammar the bridge matched against.
+    //
+    // The observable is the two sides of a turn: a command the bridge answers itself is
+    // aborted, so nothing of the platform's answer is played, while a turn that is not a
+    // command is spoken. The turns that follow cover the *other* place the match is made: the
+    // command leaves no exchange in that gadget's conversation, and the same words said to the
+    // other gadget do.
+    const platform = await stubPlatform(answers("turn off the music"), CATALOG_TWO);
+    const config = configFor(platform.url, {
+      musicDir: MUSIC,
+      ...bindSpeech({ language: "english", engine: "piper" }, { language: "vietnamese", engine: "piper" }),
+    });
+    const server = await startedServer(config, servicesFor(config));
+    const [english, vietnamese] = await twoListeningGadgets(server.port);
+    try {
+      english.speak();
+      await english.until(() => platform.requests.length === 1, "the English gadget's turn");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      assert.deepEqual(
+        english.messages.map((m) => JSON.parse(m) as { type?: string }).filter((m) => m.type === "tts"),
+        [],
+        "the words are a command in English, so nothing of the platform's answer was played"
+      );
+      assert.equal(english.binaries.length, 0, "not one frame of it");
+
+      vietnamese.speak();
+      await vietnamese.until(
+        () => vietnamese.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the Vietnamese gadget's reply to be spoken"
+      );
+      assert.ok(
+        vietnamese.binaries.length > 0,
+        "the same words are not a command in Vietnamese, so they were answered as the utterance they are"
+      );
+      await vietnamese.played(REPLY_SECONDS);
+
+      // The bridge reopens the window itself after a turn it spoke nothing for, so the English
+      // gadget takes its next turn with no `listen start` — which is what the board does.
+      english.speak();
+      await english.until(() => platform.requests.length === 3, "the English gadget's next turn");
+
+      vietnamese.send({ type: "listen", state: "start", mode: "manual" });
+      vietnamese.speak();
+      await vietnamese.until(() => platform.requests.length === 4, "the Vietnamese gadget's next turn");
+
+      const bodyOf = (turn: number): string => platform.requests[turn - 1]!.body.toString("latin1");
+      assert.ok(
+        !bodyOf(3).includes("turn off the music"),
+        "the command left nothing in the English gadget's conversation, because the bridge answered it"
+      );
+      assert.ok(
+        bodyOf(4).includes("turn off the music"),
+        "the same words are an ordinary turn for the Vietnamese gadget, and were recorded as one"
+      );
+    } finally {
+      english.stop();
+      vietnamese.stop();
       server.stop();
       platform.stop();
     }

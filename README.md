@@ -94,23 +94,40 @@ declined (3.3). It is the first platform call the bridge makes, and it goes
 through the one place the platform's credential becomes a request
 (`src/platform.ts`).
 
-### Which persona a device speaks as
+### What a device is bound to
 
-`BRIDGE_DEVICE_PERSONAS` binds each device to one persona, as `DEVICE=PERSONA` —
-for example `b8:1f:3f:4a:9b:01=interview-coach`. The device half is read exactly
-the way `BRIDGE_ALLOWED_DEVICES` reads its own, so the two lists can be pasted
-from the same place; the persona half is the catalog's own identifier and is
-carried exactly as written, because an identifier the catalog does not report is
-meant to be a miss rather than a near-miss this service guesses at.
+Four lists in `.env`, and the device half of each is read exactly the way
+`BRIDGE_ALLOWED_DEVICES` reads its own, so they can all be pasted from the same place:
 
-The two lists must describe the same devices, in both directions, and the bridge
-refuses to start otherwise. An allowed device with no persona could connect and
-never be answered; a binding for a device the allowlist does not name is
-configuration for something that can never connect, and is nearly always a typo
-in one of the two identifiers. One persona per device, because a gadget speaks as
-exactly one — and a device bound to an identifier the catalog does not report is
-never answered as a different persona (the bridge says so at start rather than
-quietly picking one).
+| List | What it binds | Values |
+| --- | --- | --- |
+| `BRIDGE_DEVICE_PERSONAS` | the persona that answers it | a catalog id (`GET /api/personas`) |
+| `BRIDGE_DEVICE_LANGUAGES` | the language it is heard and answered in | `english`, `vietnamese` |
+| `BRIDGE_DEVICE_ENGINES` | the engine it is spoken through | `kokoro`, `piper`, `supertonic` |
+
+The device half is normalized the way the allowlist normalizes its own —
+`b8:1f:3f:4a:9b:01`, `B8-1F-3F-4A-9B-01` and `b81f3f4a9b01` are one device — and the
+whole of a turn's `language` and `engine` comes from these two lists, one value per
+device (see [The turn](#the-turn) below).
+
+All of them must describe the same devices as the allowlist, in both directions, and
+the bridge refuses to start otherwise. An allowed device with no persona could connect
+and never be answered; one with no language or engine could never be heard or spoken to;
+and a binding for a device the allowlist does not name is configuration for something
+that can never connect, and is nearly always a typo in one of the identifiers. The
+refusal names the device *and* the kind of binding it is missing, because three lists
+are three things to get wrong. One value per device per list, because a gadget speaks as
+exactly one persona, is heard in one language and is spoken through one engine — and a
+device bound to an identifier the catalog does not report is never answered as a
+different persona (the bridge says so at start rather than quietly picking one).
+
+The persona half is the catalog's own identifier and is carried exactly as written,
+because an identifier the catalog does not report is meant to be a miss rather than a
+near-miss this service guesses at. The other two are the endpoint's own vocabularies, and
+a value outside them is refused at start rather than folded: `vi` is not a near-miss for
+`vietnamese` in a service whose failure mode is a transcript in the wrong script, and
+`Supertonic` is not one for `supertonic` in one that speaks through a different voice
+without saying so.
 
 A persona contributes three fields to a turn. They are the platform's own request
 fields, renamed in `src/personas.ts` and nowhere else:
@@ -128,8 +145,9 @@ a new binding raises:
 | A turn's field | Comes from | Named in |
 | --- | --- | --- |
 | `systemPrompt`, `enabledTopics`, `answerMode` | the persona | the platform's catalog, selected by `BRIDGE_DEVICE_PERSONAS` |
-| the device's identity (`Device-Id`) | the device | `BRIDGE_ALLOWED_DEVICES`, and the binding above |
-| `audio`, and the `language` the turn declares | the device, per turn | the device itself — the language at 4.1, the audio at 6.1 |
+| the device's identity (`Device-Id`) | the device | `BRIDGE_ALLOWED_DEVICES`, and the bindings above |
+| `language`, `engine` | the device's own bindings | `BRIDGE_DEVICE_LANGUAGES`, `BRIDGE_DEVICE_ENGINES` |
+| `audio` | the device, per turn | the device itself — 6.1 |
 | `history` | the conversation so far | the bridge, per device — 4.2 |
 
 A device contributes its identity and never its character: it selects which
@@ -137,6 +155,43 @@ persona answers, and nothing about what that persona says. The bridge holds no
 prompt, topic list or mode of its own. `label` and `emoji` are deliberately not
 carried — the bridge renders nothing (D8), and a label exists to be drawn on a
 screen this service does not paint.
+
+### Two gadgets that hold a conversation
+
+`BRIDGE_DEVICE_PARTNERS` records one pair, as `DEVICE=DEVICE` — for example
+`b8:1f:3f:4a:9b:01=3c:0f:02:d0:7e:fc`. **Off unless set**, and at most one pair, so a deployment
+that records none reaches none of this and behaves exactly as it did before the setting existed.
+
+With a pair recorded, the two gadgets take turns. When a turn on one has been answered, the bridge
+asks its partner for a turn whose input is **that reply's own words**, as text, and holds the answer
+until the gadget that was speaking reports that it has begun listening — its own `listen start`,
+0.04–0.26 s after its speaker stops (measured 2026-10-17). The answer is already produced by then: a
+reply's text is complete 12–44 s before its audio is, because the bridge paces the audio in real time
+and the platform has answered long before. So the silence between the two is `BRIDGE_HANDOVER_MS`
+(four tenths of a second when unset) and not the platform's latency.
+
+Three things about it are deliberate and worth knowing before turning it on:
+
+- **The question does not travel through the room.** Each gadget still speaks and still hears the
+  other, but the turn its partner is asked with is the text the first reply was made of, rather than
+  what the partner's microphone made of hearing it. Both reasons are measured: a turn built from the
+  other gadget's audio pays the transcription of the whole question before it can start — the largest
+  part of the wait — and the transcription loses words (`chào bạn` came back `ào bạn`).
+- **While a turn of the exchange is in flight, neither microphone is judged.** What a gadget hears then
+  is its partner, whose words are already arriving as a turn of their own, and a lull between that
+  partner's sentences is not a person stopping. That is what the endpointer's own
+  `BRIDGE_VAD_SILENCE_MS` and `BRIDGE_VAD_SPEECH_WINDOW_MS` cannot do for it: a window that has heard
+  half a second of anything is armed to close on three seconds of quiet for a whole minute. Between
+  two turns the room is free again, so a person who speaks then is heard as they always were.
+- **A person is heard through the wake word, and the wake word ends the exchange.** It cancels the
+  turn in flight and drops the reply that was prepared, because a person who stops a reply has taken
+  the floor and an answer to half a question is the exchange continuing against them.
+
+An exchange with nobody in the room ends on `BRIDGE_SESSION_IDLE_MS` — a prepared turn holds that
+window while it waits for the floor, so a long reply cannot close the session waiting for it. And a
+gadget that never reports having stopped (a board that crashed mid-reply) does not hold the floor
+forever: the bridge takes it as free once its own estimate of that gadget's audio has passed, which is
+the same deadline the drain guard already models.
 
 ### The turn
 
@@ -148,25 +203,32 @@ person's input as an audio file or as text. It is sent with `speak=1`; a turn se
 unspoken comes back with no audio on any sentence, and the gadget then sits silent
 with nothing in a log to say why.
 
-**`language` is required on every turn, and it is the full word, not a code.** The
-endpoint reads an absent or unrecognized value as `english` — not as "detect", as
-`english` — so a turn that drops the field does not lose a hint, it pins the
-transcriber, and it fails silently. A code (`vi`) is unrecognized in the same way.
-This is a correctness requirement rather than a preference: left to detect, the
+**`language` is required on every turn, and it is one of the device's own bindings.**
+It comes from `BRIDGE_DEVICE_LANGUAGES` for the gadget taking the turn, so two gadgets on
+one bridge are heard and answered in different languages. The endpoint reads an absent or
+unrecognized value as `english` — not as "detect", as `english` — so a turn that drops the
+field does not lose a hint, it pins the transcriber, and it fails silently. A code (`vi`)
+is unrecognized in the same way. This is a correctness requirement rather than a
+preference: left to detect, the
 transcriber decodes short Vietnamese as Chinese, and the persona then answers
 someone who never spoke it (D12). Measured on one utterance taken from the device
 by the rig, the same bytes came back as `"ao"` with `language=vietnamese`, as
 `"Oh."` with `language=english`, and as `"哦。"` with the language left to detection.
 
-`engine` is stated by the deployment, rather than derived from the language: it is
-this deployment's synthesis engine, one engine for either language, and it is read
-from `BRIDGE_TURN_ENGINE`. The bridge still names no voice — a persona carries no
-voice field (D3) — but it must name the engine, because leaving the field out would
-*not* express "no preference": the endpoint folds an absent engine to Kokoro before
-it consults its own default, so an omitted field asks for the engine this deployment
-has left. A value that is not one of the three the endpoint accepts is refused at
-start rather than folded, so a typo is an error rather than a quieter change of
-voice. Which voice that engine resolves to, per language, stays the platform's —
+The language a turn declares is also the language the gadget's own spoken commands are
+matched against (`src/commands.ts`), and the same value is read in the two places that
+decide what a turn was: the match that drops a recognised command before the platform
+answers it, and the match that keeps it out of the conversation. One lookup answers both,
+so they cannot disagree about a turn.
+
+`engine` is stated per device, rather than derived from the language: it comes from that
+device's own binding in `BRIDGE_DEVICE_ENGINES`. It is not a preference, and the
+difference matters: the endpoint folds an absent or unrecognized engine to Kokoro *before*
+it consults its own default, so an omitted field asks for the engine this deployment has
+left rather than for no preference. A value that is not one of the three the endpoint
+accepts is refused at start rather than folded, so a typo is an error rather than a
+quieter change of voice. The bridge still names no voice — a persona carries no voice
+field (D3) — and which voice an engine resolves to, per language, stays the platform's:
 "What a gadget sounds like" below is where the deployment's answer is recorded.
 
 The reply is a stream of server-sent events — `user`, `sentence`, `text`, `tool_call`,
@@ -235,8 +297,8 @@ A persona decides *what* is said, never *who* says it. It carries no voice field
 (D3), and the platform resolves one from the engine and the language alone —
 `resolveVoice(engine, language)` in `adaptive-interview-api`'s
 `src/lib/audio/text-processing.ts`, which reads a configured name and falls back
-to `DEFAULT_VOICE` only when that name is empty. The bridge supplies the engine and
-nothing else — `BRIDGE_TURN_ENGINE` — and names no voice.
+to `DEFAULT_VOICE` only when that name is empty. The bridge supplies the engine and the
+language, each from the gadget's own binding, and names no voice.
 
 So the voice is the **platform's** configuration, not this service's, and this
 deployment resolves to:
@@ -251,19 +313,19 @@ Read from `adaptive-interview-api`'s `.env` on 2026-10-09; the defaults in
 sounds like neither of the rows above. A gadget's **voice** is that file's to
 change, and this service has no voice setting by design — a voice it could name
 would be a second place for the same decision to live. Its **engine** is this
-service's to state, in `BRIDGE_TURN_ENGINE`, because the platform's own fallback is
-unreachable: a turn that omitted the field would ask for Kokoro. So how a deployment
-sounds is one decision spread over two repositories — the engine here, the voices
-there — and setting one without the other is a pairing that repository's voices have
-to answer for.
+service's to state, per gadget, in `BRIDGE_DEVICE_ENGINES`, because the platform's own
+fallback is unreachable: a turn that omitted the field would ask for Kokoro. So how a
+deployment sounds is one decision spread over two repositories — the engine here, the
+voices there — and binding a gadget to one without a voice configured there is a pairing
+that repository's voices have to answer for.
 
-**Two gadgets in one language sound identical.** The binding distinguishes who
-answers and in what character; it does not distinguish voices, and nothing in
-either service can make it. Two personas in one language are one voice reading two
-different prompts. That is the platform's shape rather than a choice made here, and
-it is the gap `design.md` raises as an open question rather than a defect: whether
-a persona should carry a voice, or a device be allowed to choose an engine, is a
-platform decision this change does not make.
+**Two gadgets bound to the same pair sound identical; two bound to different pairs do
+not.** That is what binding the pair per gadget is for: one gadget can be heard and spoken
+through a pair the other is not. What is still not possible is two *voices* out of one
+pair — `resolveVoice` is a function of the engine and the language alone, so two gadgets
+naming the same two values are one voice reading two different prompts. Whether a persona
+should carry a voice of its own is a platform decision this service does not make, and a
+voice setting here would be a second place for a decision the platform already owns.
 
 One hazard worth knowing, because it fails quietly rather than loudly. An empty
 voice name does not error — `resolveVoice` returns `DEFAULT_VOICE` instead — and
@@ -272,8 +334,8 @@ this deployment does not set `DEFAULT_VOICE`, so it falls to the code default
 clearing `SUPERTONIC_VOICE_VIETNAMESE` does not fail the turn; it answers in `F1`
 instead of the deployment's own voice, with nothing in the log to say so. While the
 bridge asked for Kokoro the same fallback was worse — a Supertonic name handed to
-another engine's catalogue — and that is what it would become again if
-`BRIDGE_TURN_ENGINE` were set back to Kokoro. Where the engine *is* another one,
+another engine's catalogue — and that is what it would become again if a gadget were
+bound back to Kokoro in `BRIDGE_DEVICE_ENGINES`. Where the engine *is* another one,
 the same empty name is a 400 naming the voices that exist rather than a quiet wrong
 voice: `F1` is a name of Supertonic's catalogue and of nobody else's.
 
@@ -321,7 +383,7 @@ stamp as every line in its log.
 | Network | device on Wi-Fi at `192.168.1.50` → the bridge at `192.168.1.100:8001`, one LAN; bridge → the platform at `127.0.0.1:4000`. This deployment's `.env` sets `WS_PORT`, and `8001` is what it chose — the banner above and the address section are the default `8000` |
 | Model | `deepseek-v4.1-flash:cloud` through Ollama — a cloud model, so the reply leg leaves this machine |
 | Speech in | `stt` on audiocpp |
-| Speech out | Supertonic, Vietnamese — `BRIDGE_TURN_ENGINE`, voice `example_m2` (`SUPERTONIC_VOICE_VIETNAMESE`); English resolves `M1` |
+| Speech out | Vietnamese, through the engine that board is bound to in `BRIDGE_DEVICE_ENGINES` — Supertonic at the time of this measurement — voice `example_m2` (`SUPERTONIC_VOICE_VIETNAMESE`); English resolves `M1` |
 
 Two anchors, because neither end of this is logged directly. The endpointer closes a
 turn 900 ms after the person's last word, so **the end of speech is the turn's close
@@ -409,7 +471,7 @@ and one the bridge cannot see. That is why these are send-side figures. What clo
 
 ### Adding a device
 
-Two lines in `.env`, and no code:
+Four lines in `.env`, and no code:
 
 1. **`BRIDGE_ALLOWED_DEVICES`** — add the device's Device-Id, which is the board's
    MAC in any spelling (`b8:1f:3f:4a:9b:01`, `B8-1F-3F-4A-9B-01` and
@@ -417,11 +479,19 @@ Two lines in `.env`, and no code:
 2. **`BRIDGE_DEVICE_PERSONAS`** — add `DEVICE=PERSONA`, the same identifier and a
    persona id the catalog reports. Read the ids from `GET /api/personas`, or the
    list the bridge prints at start.
+3. **`BRIDGE_DEVICE_LANGUAGES`** — add `DEVICE=english|vietnamese`: the language
+   this device is heard, answered and commanded in.
+4. **`BRIDGE_DEVICE_ENGINES`** — add `DEVICE=kokoro|piper|supertonic`: the engine
+   its replies are synthesized with. Check that the platform has a voice configured
+   for that engine *and* that language — see
+   [What a gadget sounds like](#what-a-gadget-sounds-like) — because the bridge
+   cannot know which models a deployment holds.
 
-The bridge refuses to start if the two lists do not name the same devices, so a
-half-finished pair is reported at start where you are, rather than at the device's
-first turn. Then restart it: the device is provisioned the next time it asks the
-OTA endpoint, needs no reflash, and can be revoked by removing either line.
+The bridge refuses to start unless the allowlist and all three lists name the same
+devices, and the refusal names the device and the kind of binding it is missing — so a
+half-finished set is reported at start where you are, rather than at the device's first
+turn. Then restart it: the device is provisioned the next time it asks the OTA endpoint,
+needs no reflash, and can be revoked by removing its entry from every list.
 
 ## Credentials
 
@@ -469,9 +539,9 @@ Separators and case do not distinguish devices, so `b8:1f:3f:4a:9b:01`,
 device is allowed because it is named, and a bridge with nothing named refuses
 every device, at the OTA endpoint and at the socket alike. The service says so at
 startup when the list is empty. Every device named here must also be bound to a
-persona in `BRIDGE_DEVICE_PERSONAS` — see
-[Which persona a device speaks as](#which-persona-a-device-speaks-as) — and the
-bridge refuses to start if the two lists do not name the same devices.
+persona, a language and an engine — see
+[What a device is bound to](#what-a-device-is-bound-to) — and the bridge refuses to
+start unless the allowlist and all three lists name the same devices.
 
 **For an operator: where each secret lives.** The device holds one opaque token,
 per device, written into its NVS by the OTA answer — and it is worthless to the

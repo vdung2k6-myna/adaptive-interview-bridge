@@ -48,8 +48,10 @@ const config: BridgeConfig = {
   musicGainDb: MUSIC_GAIN_DB_DEFAULT,
   historyTurns: 20,
   commandStep: 10,
-  language: "english",
-  turnEngine: "supertonic",
+  deviceLanguages: new Map([["b81f3f4a9b01", "english"]]),
+  deviceEngines: new Map([["b81f3f4a9b01", "supertonic"]]),
+  devicePartners: new Map(),
+  handoverMs: 400,
 };
 
 /** The device's own hello, as the board sends it: 16000 Hz up, 60 ms frames. */

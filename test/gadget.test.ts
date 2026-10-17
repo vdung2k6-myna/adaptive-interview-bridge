@@ -103,8 +103,10 @@ function configFor(options: { commandStep?: number } = {}): BridgeConfig {
     musicGainDb: MUSIC_GAIN_DB_DEFAULT,
     historyTurns: 20,
     commandStep: options.commandStep ?? 10,
-    language: "english",
-    turnEngine: "supertonic",
+    deviceLanguages: new Map(),
+    deviceEngines: new Map(),
+    devicePartners: new Map(),
+    handoverMs: 400,
   };
 }
 

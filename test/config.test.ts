@@ -1,6 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig, ENDPOINTER_DEFAULTS, MUSIC_GAIN_DB_DEFAULT } from "../src/config.js";
+import {
+  boundEngine,
+  boundLanguage,
+  loadConfig,
+  pairedGadgets,
+  partnerOf,
+  ENDPOINTER_DEFAULTS,
+  MUSIC_GAIN_DB_DEFAULT,
+} from "../src/config.js";
 
 /**
  * The configuration is where the rules that must not fail open live: an empty
@@ -32,6 +40,25 @@ const minimal = {
   API_AUTH_TOKEN: PLATFORM,
   BRIDGE_PLATFORM_URL: PLATFORM_URL,
 } as NodeJS.ProcessEnv;
+
+/**
+ * The other two lists every allowlisted device needs.
+ *
+ * The language and the engine are bound per gadget, so the cross-check that held the
+ * allowlist and the persona bindings together now holds three lists — and a config
+ * that names a device and binds only its persona is no longer one this bridge starts
+ * from. A test about the allowlist, or about one of the lists, says so with this.
+ */
+const speech = (devices: string): Record<string, string> => {
+  const named = devices
+    .split(",")
+    .map((device) => device.trim())
+    .filter((device) => device !== "");
+  return {
+    BRIDGE_DEVICE_LANGUAGES: named.map((device) => `${device}=english`).join(","),
+    BRIDGE_DEVICE_ENGINES: named.map((device) => `${device}=supertonic`).join(","),
+  };
+};
 
 describe("the device secret", () => {
   it("refuses to load without one, rather than falling back to a constant", () => {
@@ -134,6 +161,7 @@ describe("the allowlist", () => {
       ...minimal,
       BRIDGE_ALLOWED_DEVICES: " B8-1F-3F-4A-9B-01 , b8:1f:3f:4a:9b:02 ",
       BRIDGE_DEVICE_PERSONAS: "B8-1F-3F-4A-9B-01=friendly-tutor,b8:1f:3f:4a:9b:02=debate-partner",
+      ...speech("B8-1F-3F-4A-9B-01,b8:1f:3f:4a:9b:02"),
     } as NodeJS.ProcessEnv);
     assert.deepEqual(config.allowedDevices, ["b81f3f4a9b01", "b81f3f4a9b02"]);
   });
@@ -143,6 +171,7 @@ describe("the allowlist", () => {
       ...minimal,
       BRIDGE_ALLOWED_DEVICES: `${BOARD},b81f3f4a9b01,B8:1F:3F:4A:9B:01`,
       BRIDGE_DEVICE_PERSONAS: "b81f3f4a9b01=interview-coach",
+      ...speech(BOARD),
     } as NodeJS.ProcessEnv);
     assert.equal(config.allowedDevices.length, 1);
   });
@@ -158,15 +187,21 @@ describe("the allowlist", () => {
 });
 
 /**
- * The bindings, and the cross-check between them and the allowlist. The two
- * lists have to describe the same devices: a device that may connect and has no
- * persona could never be answered, and a binding for a device the allowlist does
- * not name is configuration for something that can never connect. Both are
- * refused at start, where the operator is.
+ * The bindings, and the cross-check between them and the allowlist. Every list has to
+ * describe the same devices: a device that may connect and has no persona could never
+ * be answered, one with no language or engine could never be heard or spoken to, and a
+ * binding for a device the allowlist does not name is configuration for something that
+ * can never connect. All of them are refused at start, where the operator is — and the
+ * error names the kind, because three lists are three things to get wrong.
  */
-describe("the persona bindings", () => {
+describe("the bindings each device has", () => {
   const board = (personas: string) =>
-    ({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD, BRIDGE_DEVICE_PERSONAS: personas }) as NodeJS.ProcessEnv;
+    ({
+      ...minimal,
+      BRIDGE_ALLOWED_DEVICES: BOARD,
+      BRIDGE_DEVICE_PERSONAS: personas,
+      ...speech(BOARD),
+    }) as NodeJS.ProcessEnv;
 
   it("reads DEVICE=PERSONA, normalizing the device as the allowlist does", () => {
     // Normalized the same way means the two lists can be pasted from the same
@@ -195,6 +230,7 @@ describe("the persona bindings", () => {
       ...minimal,
       BRIDGE_ALLOWED_DEVICES: `${BOARD},b81f3f4a9b02`,
       BRIDGE_DEVICE_PERSONAS: `${BOARD}=interview-coach;b81f3f4a9b02=debate-partner`,
+      ...speech(`${BOARD},b81f3f4a9b02`),
     } as NodeJS.ProcessEnv);
     assert.equal(config.devicePersonas.size, 2);
   });
@@ -203,6 +239,33 @@ describe("the persona bindings", () => {
     assert.throws(() => loadConfig({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD } as NodeJS.ProcessEnv), /no binding/);
     // And says which device, so the operator does not have to diff two lists.
     assert.throws(() => loadConfig({ ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD } as NodeJS.ProcessEnv), /b81f3f4a9b01/);
+  });
+
+  it("names the kind of binding a device is missing, since there are three to get wrong", () => {
+    // Each list left out in turn. The error is the one an operator will actually meet
+    // — a list forgotten while adding a gadget — so it says which list, not only which
+    // device.
+    const personaOnly = { ...minimal, BRIDGE_ALLOWED_DEVICES: BOARD, BRIDGE_DEVICE_PERSONAS: `${BOARD}=interview-coach` };
+    assert.throws(
+      () => loadConfig(personaOnly as NodeJS.ProcessEnv),
+      /b81f3f4a9b01 has no binding for language, engine/
+    );
+
+    const noEngine = { ...board(`${BOARD}=interview-coach`), BRIDGE_DEVICE_ENGINES: "" };
+    assert.throws(() => loadConfig(noEngine as NodeJS.ProcessEnv), /b81f3f4a9b01 has no binding for engine/);
+
+    const noLanguage = { ...board(`${BOARD}=interview-coach`), BRIDGE_DEVICE_LANGUAGES: "" };
+    assert.throws(() => loadConfig(noLanguage as NodeJS.ProcessEnv), /b81f3f4a9b01 has no binding for language/);
+  });
+
+  it("refuses a stranger in any of the three lists", () => {
+    // The same refusal the persona list already had, applied to the two that joined it:
+    // a gadget bound in a list the allowlist does not name is a typo, not a deployment.
+    const stranger = {
+      ...board(`${BOARD}=interview-coach`),
+      BRIDGE_DEVICE_ENGINES: `${BOARD}=supertonic,b81f3f4a9b02=piper`,
+    };
+    assert.throws(() => loadConfig(stranger as NodeJS.ProcessEnv), /b81f3f4a9b02/);
   });
 
   it("refuses a binding for a device the allowlist does not name", () => {
@@ -391,54 +454,167 @@ describe("the rest of the configuration", () => {
 });
 
 /**
- * The engine, which is the language's sibling: one field over, stated on every
- * turn for the same reason, and refused rather than folded for the same reason.
- * The two together are all that decides how a gadget sounds, since the voice is
- * resolved from them and named by nobody here.
+ * The language and the engine, which decide together how a gadget sounds: the voice is
+ * resolved from the pair and named by nobody here. Both are bound **per gadget** rather
+ * than recorded once for the deployment, so both are read the way the persona is — one
+ * `DEVICE=VALUE` per gadget — and a value that is not one the endpoint names is refused
+ * rather than folded, for the reason the old deployment-wide readers refused to fold.
  */
-describe("the engine the gadget speaks through", () => {
-  const at = (value: string) => () => loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: value } as NodeJS.ProcessEnv);
+describe("the language and engine bindings", () => {
+  /** A deployment with one gadget, bound however the test wants it bound. */
+  const bound = (language: string, engine: string) =>
+    ({
+      ...minimal,
+      BRIDGE_ALLOWED_DEVICES: BOARD,
+      BRIDGE_DEVICE_PERSONAS: `${BOARD}=interview-coach`,
+      BRIDGE_DEVICE_LANGUAGES: `${BOARD}=${language}`,
+      BRIDGE_DEVICE_ENGINES: `${BOARD}=${engine}`,
+    }) as NodeJS.ProcessEnv;
 
-  it("speaks through supertonic when the deployment names none", () => {
-    // The value this service named when it was a constant in `turn.ts`, so a
-    // deployment that sets nothing sounds exactly as it did before the setting
-    // existed — the change opens the choice without making one.
-    assert.equal(loadConfig(minimal).turnEngine, "supertonic");
-    assert.equal(loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: "" } as NodeJS.ProcessEnv).turnEngine, "supertonic");
+  it("binds one language and one engine to each gadget", () => {
+    const config = loadConfig(bound("vietnamese", "piper"));
+    assert.equal(boundLanguage(config, BOARD), "vietnamese");
+    assert.equal(boundEngine(config, BOARD), "piper");
   });
 
-  it("reads each of the three engines the endpoint accepts", () => {
+  it("reads the device half the way the allowlist reads its own", () => {
+    // Separators and case are presentation, so a binding pasted beside the allowlist is
+    // the same binding — which is what makes the cross-check exact rather than fuzzy.
+    const config = loadConfig(bound("vietnamese", "piper"));
+    assert.equal(boundLanguage(config, "b8:1f:3f:4a:9b:01"), "vietnamese");
+    assert.equal(boundEngine(config, "B81F3F4A9B01"), "piper");
+  });
+
+  it("answers nothing for a gadget the deployment does not bind", () => {
+    // Which a started bridge cannot have — the check below refuses to start without it
+    // — and which is answered rather than defaulted, because a default here would be a
+    // turn taken in a language nobody chose.
+    const config = loadConfig(bound("vietnamese", "piper"));
+    assert.equal(boundLanguage(config, "aa11bb22cc33"), undefined);
+    assert.equal(boundEngine(config, "aa11bb22cc33"), undefined);
+  });
+
+  it("reads each of the engines and languages the endpoint accepts", () => {
     for (const engine of ["kokoro", "piper", "supertonic"] as const) {
-      assert.equal(
-        loadConfig({ ...minimal, BRIDGE_TURN_ENGINE: engine } as NodeJS.ProcessEnv).turnEngine,
-        engine
-      );
+      assert.equal(boundEngine(loadConfig(bound("english", engine)), BOARD), engine);
+    }
+    for (const language of ["english", "vietnamese"] as const) {
+      assert.equal(boundLanguage(loadConfig(bound(language, "piper")), BOARD), language);
     }
   });
 
-  it("refuses a value that is not one of the three, rather than folding to another engine", () => {
-    // The endpoint folds an unrecognized engine to `"kokoro"`, which is why the
-    // field has to be stated at all. Folding here too would make an operator's
-    // typo a different voice with nothing said about it — the failure the language
-    // reader refuses to fold for, one field over.
-    assert.throws(at("Supertonic"), /BRIDGE_TURN_ENGINE must be kokoro, piper or supertonic/);
-    assert.throws(at("Kokoro"), /BRIDGE_TURN_ENGINE/);
-    assert.throws(at("xtts"), /BRIDGE_TURN_ENGINE/);
+  it("refuses a language the endpoint does not name, naming the gadget it was bound to", () => {
+    // The endpoint reads an absent or unknown language as English, so folding here too
+    // would turn an operator's `vi` into a bridge that transcribes Vietnamese as English
+    // and says nothing about it — the failure D12 describes.
+    assert.throws(() => loadConfig(bound("vi", "piper")), /BRIDGE_DEVICE_LANGUAGES binds b81f3f4a9b01 to "vi"/);
+    assert.throws(() => loadConfig(bound("Vietnamese", "piper")), /BRIDGE_DEVICE_LANGUAGES/);
   });
 
-  it("does not trim, so a stray space is a value nobody meant rather than the engine", () => {
-    // As the language reader does not trim: these are two-word and three-word
-    // vocabularies the endpoint matches exactly, and a value that is not one of
-    // them is reported rather than repaired.
-    assert.throws(at("kokoro "), /BRIDGE_TURN_ENGINE/);
+  it("refuses an engine the endpoint does not name, rather than folding to another", () => {
+    // The endpoint folds an unrecognized engine to `"kokoro"`, which is why the field has
+    // to be stated at all; folding here too would make a typo a different voice.
+    assert.throws(() => loadConfig(bound("english", "xtts")), /BRIDGE_DEVICE_ENGINES binds b81f3f4a9b01 to "xtts"/);
+    assert.throws(() => loadConfig(bound("english", "Supertonic")), /BRIDGE_DEVICE_ENGINES/);
   });
 
-  it("is independent of the language, which still selects nothing", () => {
-    // One engine is what a deployment speaks through. The language is what the
-    // *voice* still varies with, and the voice is the platform's to resolve from
-    // the two of these together.
-    const config = loadConfig({ ...minimal, BRIDGE_LANGUAGE: "vietnamese", BRIDGE_TURN_ENGINE: "piper" });
-    assert.equal(config.turnEngine, "piper");
-    assert.equal(config.language, "vietnamese");
+  it("refuses an entry with a side missing, as the persona list does", () => {
+    const at = (name: string, value: string) => () =>
+      loadConfig({ ...bound("english", "piper"), [name]: value } as NodeJS.ProcessEnv);
+    assert.throws(at("BRIDGE_DEVICE_LANGUAGES", BOARD), /DEVICE=LANGUAGE/);
+    assert.throws(at("BRIDGE_DEVICE_LANGUAGES", `${BOARD}=`), /names no language/);
+    assert.throws(at("BRIDGE_DEVICE_ENGINES", `${BOARD}=`), /names no engine/);
+    assert.throws(at("BRIDGE_DEVICE_ENGINES", `${BOARD}=piper,${BOARD}=kokoro`), /binds b81f3f4a9b01 twice/);
+  });
+});
+
+/**
+ * The pair, and the hand-over. A pair is the one thing in this file that is *not* a binding
+ * every gadget needs: an unpaired deployment is every deployment but one, so what is checked
+ * is that the two devices exist and that a deployment records one conversation rather than
+ * two it has no shape for.
+ */
+describe("the pair two gadgets converse as", () => {
+  const paired = (partners: string) =>
+    ({
+      ...minimal,
+      BRIDGE_ALLOWED_DEVICES: `${BOARD},b81f3f4a9b02`,
+      BRIDGE_DEVICE_PERSONAS: `${BOARD}=interview-coach,b81f3f4a9b02=custom-5`,
+      ...speech(`${BOARD},b81f3f4a9b02`),
+      BRIDGE_DEVICE_PARTNERS: partners,
+    }) as NodeJS.ProcessEnv;
+
+  it("pairs nothing when the deployment records none, which is every deployment but one", () => {
+    const config = loadConfig(paired(""));
+    assert.deepEqual(pairedGadgets(config), []);
+    assert.equal(partnerOf(config, BOARD), undefined);
+  });
+
+  it("reads DEVICE=DEVICE, normalizing both halves as the allowlist does", () => {
+    // Both halves are device ids, so both are normalized — and the relation is held both
+    // ways round, because a reader asks who *this* gadget's partner is.
+    const config = loadConfig(paired(`${BOARD}=B8-1F-3F-4A-9B-02`));
+    assert.equal(partnerOf(config, BOARD), "b81f3f4a9b02");
+    assert.equal(partnerOf(config, "b8:1f:3f:4a:9b:02"), "b81f3f4a9b01");
+    assert.deepEqual(pairedGadgets(config), ["b81f3f4a9b01", "b81f3f4a9b02"]);
+  });
+
+  it("refuses a second pair, because a conversation is between two", () => {
+    assert.throws(
+      () => loadConfig(paired(`${BOARD}=b81f3f4a9b02,b81f3f4a9b02=${BOARD}`)),
+      /records one pair/
+    );
+  });
+
+  it("refuses a gadget paired with itself, which is one gadget and not two", () => {
+    assert.throws(() => loadConfig(paired(`${BOARD}=${BOARD}`)), /with itself/);
+  });
+
+  it("refuses a partner the allowlist does not name", () => {
+    // A gadget that may not connect cannot take part in a conversation, so a pair naming
+    // one is configuration for something that could never happen.
+    assert.throws(() => loadConfig(paired(`${BOARD}=aa11bb22cc33`)), /aa11bb22cc33 is not in/);
+  });
+
+  it("refuses an entry that is not DEVICE=DEVICE", () => {
+    assert.throws(() => loadConfig(paired(BOARD)), /DEVICE=PARTNER/);
+    assert.throws(() => loadConfig(paired(`${BOARD}=,b81f3f4a9b02`)), /names no partner/);
+  });
+
+  it("records the hand-over, and defaults it to four tenths of a second", () => {
+    assert.equal(loadConfig(minimal).handoverMs, 400);
+    assert.equal(loadConfig({ ...minimal, BRIDGE_HANDOVER_MS: "1200" }).handoverMs, 1200);
+    assert.throws(() => loadConfig({ ...minimal, BRIDGE_HANDOVER_MS: "0" }), /BRIDGE_HANDOVER_MS/);
+    assert.throws(() => loadConfig({ ...minimal, BRIDGE_HANDOVER_MS: "soon" }), /BRIDGE_HANDOVER_MS/);
+  });
+});
+
+/**
+ * The two settings this change retired. A setting that is no longer read is the one
+ * configuration mistake that is invisible — the bridge starts, reports itself healthy,
+ * and answers a Vietnamese gadget in English — so a leftover `.env` line is an error
+ * rather than a harmless one, and the error names what replaced it.
+ */
+describe("the settings this change retired", () => {
+  it("refuses a bridge that still records the deployment-wide language", () => {
+    const stale = { ...minimal, BRIDGE_LANGUAGE: "vietnamese" } as NodeJS.ProcessEnv;
+    assert.throws(() => loadConfig(stale), /BRIDGE_LANGUAGE is no longer read/);
+    assert.throws(() => loadConfig(stale), /BRIDGE_DEVICE_LANGUAGES/);
+  });
+
+  it("refuses a bridge that still records the deployment-wide engine", () => {
+    const stale = { ...minimal, BRIDGE_TURN_ENGINE: "piper" } as NodeJS.ProcessEnv;
+    assert.throws(() => loadConfig(stale), /BRIDGE_TURN_ENGINE is no longer read/);
+    assert.throws(() => loadConfig(stale), /BRIDGE_DEVICE_ENGINES/);
+  });
+
+  it("refuses an empty one too, because the line is what says the operator meant it", () => {
+    assert.throws(() => loadConfig({ ...minimal, BRIDGE_LANGUAGE: "" } as NodeJS.ProcessEnv), /BRIDGE_LANGUAGE/);
+  });
+
+  it("starts without either, which is every deployment after the rebinding", () => {
+    // An empty allowlist needs no bindings at all, so this is the smallest deployment
+    // that loads: the three values with no default and nothing else.
+    assert.doesNotThrow(() => loadConfig(minimal));
   });
 });
