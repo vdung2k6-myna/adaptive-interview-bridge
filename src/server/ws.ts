@@ -1,5 +1,5 @@
 import type { IncomingMessage } from "node:http";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import type { BridgeConfig } from "../config.js";
 import { basename } from "node:path";
 import { describeCommand, matchCommand, type BridgeCommand, type GadgetCommand } from "../commands.js";
@@ -9,7 +9,7 @@ import { takeTurn, type Conversations } from "../conversation.js";
 import { authorizeDevice, describeDenial } from "../credentials.js";
 import { createGadget, type CommandOutcome } from "../gadget.js";
 import { createListening } from "../listening.js";
-import { err, info, log, section, warn } from "../log.js";
+import { err, info, log, runWithDevice, section, warn } from "../log.js";
 import type { PersonaCatalog } from "../personas.js";
 import { advertisesTools } from "../protocol/mcp.js";
 import { isAbort, isHello, isListen, isMcp, parseClientMessage, serverHello } from "../protocol/messages.js";
@@ -110,6 +110,18 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
 
   wss.on("connection", (ws: WebSocket, req: DeviceRequest) => {
     const deviceId = req.bridgeDeviceId ?? "unknown";
+    /**
+     * A listener that writes on this session's behalf, under the scope that names it.
+     *
+     * The scope is re-established when the callback runs rather than inherited from the place
+     * it was registered — a listener does not follow `run` — so what this exists to stop is a
+     * session's lines arriving with no gadget on them, which reads exactly like a line about no
+     * gadget at all (`log.ts`).
+     */
+    const underDevice =
+      <A extends unknown[]>(fn: (...args: A) => void): ((...args: A) => void) =>
+      (...args: A) =>
+        runWithDevice(deviceId, () => fn(...args));
     const session = {
       id: `s${Date.now().toString(36)}`,
       frames: 0,
@@ -177,7 +189,12 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
     function armIdleWindow(remainingMs: number): void {
       if (config.sessionIdleMs === 0) return;
       if (idleTimer !== null) clearTimeout(idleTimer);
-      idleTimer = setTimeout(fireIdleWindow, Math.max(remainingMs, 1));
+      // The scope is re-established at the firing rather than inherited from the arming: the
+      // first arming is the connect itself, which happens outside any listener (D2).
+      idleTimer = setTimeout(
+        () => runWithDevice(deviceId, fireIdleWindow),
+        Math.max(remainingMs, 1)
+      );
       // A session's window is not a reason for the process to stay up: the servers are.
       // Without this a bridge asked to shut down waits out the longest window it armed.
       idleTimer.unref();
@@ -241,16 +258,20 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
 
     armIdleWindow(config.sessionIdleMs);
 
-    section("device connected");
-    log(`session ${session.id} device ${deviceId} path ${req.url}`);
-    // The device's own identification travels on the connect headers. Logged in
-    // full because they are cheap and their absence is the kind of thing that is
-    // only noticed a week later — the credential itself is not, since it is
-    // derived from the secret and the identifier logged above.
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (k === "authorization") continue;
-      info(`  ${k}: ${v}`);
-    }
+    // The session's opening lines, and the one scope on this side of a listener: everything
+    // after this is written from a listener or a timer, each of which re-establishes it.
+    runWithDevice(deviceId, () => {
+      section("device connected");
+      log(`session ${session.id} device ${deviceId} path ${req.url}`);
+      // The device's own identification travels on the connect headers. Logged in
+      // full because they are cheap and their absence is the kind of thing that is
+      // only noticed a week later — the credential itself is not, since it is
+      // derived from the secret and the identifier logged above.
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (k === "authorization") continue;
+        info(`  ${k}: ${v}`);
+      }
+    });
 
     /**
      * Take the person's utterance to the platform, and speak the reply back (6.1).
@@ -674,7 +695,9 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       return true;
     }
 
-    ws.on("message", (data, isBinary) => {
+    ws.on(
+      "message",
+      underDevice((data: RawData, isBinary: boolean) => {
       if (isBinary) {
         const wire = Buffer.from(data as ArrayBuffer);
         session.frames += 1;
@@ -864,20 +887,27 @@ export function createWsServer(config: BridgeConfig, services: WsServices): WebS
       }
 
       info(`${msg.type} message ignored — not modelled in the skeleton (D8)`);
-    });
+      })
+    );
 
-    ws.on("close", (code) => {
-      section("device disconnected");
-      log(
-        `session ${session.id} device ${deviceId} code ${code}; ${session.frames} frame(s), ` +
-          `${session.bytes} B, ${session.drained} dropped as our own audio`
-      );
-      // The window goes with the socket, WASM memory and all (6.7).
-      listening.close();
-      if (idleTimer !== null) clearTimeout(idleTimer);
-      if (closeGraceTimer !== null) clearTimeout(closeGraceTimer);
-    });
-    ws.on("error", (e) => err(`socket: ${e.message}`));
+    ws.on(
+      "close",
+      underDevice((code: number) => {
+        section("device disconnected");
+        log(
+          `session ${session.id} device ${deviceId} code ${code}; ${session.frames} frame(s), ` +
+            `${session.bytes} B, ${session.drained} dropped as our own audio`
+        );
+        // The window goes with the socket, WASM memory and all (6.7).
+        listening.close();
+        if (idleTimer !== null) clearTimeout(idleTimer);
+        if (closeGraceTimer !== null) clearTimeout(closeGraceTimer);
+      })
+    );
+    ws.on(
+      "error",
+      underDevice((e: Error) => err(`socket: ${e.message}`))
+    );
   });
 
   return wss;

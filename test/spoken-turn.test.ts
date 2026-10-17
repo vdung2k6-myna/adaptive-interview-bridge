@@ -34,6 +34,11 @@ import { buildWav } from "../src/protocol/wav.js";
 
 const BOARD = "b8:1f:3f:4a:9b:01";
 const DEVICE = "b81f3f4a9b01";
+/** The second gadget on the bridge, as it declares itself and as the allowlist carries it.
+ *  Two gadgets on one bridge is the whole subject of the two-gadget tests, and the second
+ *  differs from the first in these two strings and in the persona it is bound to. */
+const SECOND_BOARD = "b8:1f:3f:4a:9b:02";
+const SECOND_DEVICE = "b81f3f4a9b02";
 const SECRET = "s".repeat(43);
 const PLATFORM = "platform-token-abcdefgh";
 
@@ -44,6 +49,20 @@ const CATALOG = [
     emoji: "\u{1f5e3}",
     defaultPrompt: "You are a patient language partner.",
     knowledgeTopics: ["Truyện cười"],
+    answerMode: "generate",
+  },
+];
+
+/** The catalog the two-gadget tests answer with: the persona above, and one more for the second
+ *  gadget. `CATALOG` is left as it is, because it is the answer every other test here was
+ *  written against — a test that added a persona to it would be changing them, not itself. */
+const CATALOG_TWO = [
+  CATALOG[0]!,
+  {
+    id: "debate-partner",
+    label: "Debate Partner",
+    defaultPrompt: "You argue the other side of whatever you are told.",
+    knowledgeTopics: [],
     answerMode: "generate",
   },
 ];
@@ -89,7 +108,8 @@ interface PlatformRequest {
 
 /** A platform that answers the catalog and, per call, a scripted reply stream. */
 async function stubPlatform(
-  reply: (res: ServerResponse, call: number) => void | Promise<void>
+  reply: (res: ServerResponse, call: number) => void | Promise<void>,
+  catalog: unknown[] = CATALOG
 ): Promise<{
   url: string;
   requests: PlatformRequest[];
@@ -107,7 +127,7 @@ async function stubPlatform(
       const body = Buffer.concat(chunks);
       if ((req.url ?? "").startsWith("/api/personas")) {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(CATALOG));
+        res.end(JSON.stringify(catalog));
         return;
       }
       // The turn holding its stream open for a gadget call answers here, and is not one of the
@@ -141,8 +161,11 @@ function configFor(platformUrl: string, overrides: Partial<BridgeConfig> = {}): 
     wsPort: 0,
     publicHost: "127.0.0.1",
     deviceSecret: SECRET,
-    allowedDevices: [DEVICE],
-    devicePersonas: new Map([[DEVICE, "language-partner"]]),
+    allowedDevices: [DEVICE, SECOND_DEVICE],
+    devicePersonas: new Map([
+      [DEVICE, "language-partner"],
+      [SECOND_DEVICE, "debate-partner"],
+    ]),
     platformUrl,
     apiAuthToken: PLATFORM,
     framing: 3,
@@ -187,16 +210,33 @@ interface Session {
  *  observed rather than assumed. */
 type BridgeServices = Parameters<typeof createWsServer>[1];
 
-async function spokenDevice(
+/** The bridge, listening on a port nobody chose.
+ *
+ *  Separate from the socket below because two sockets on one bridge is the subject of the
+ *  two-gadget tests: a bridge built inside a connect is one bridge per gadget, and would
+ *  observe nothing about either. `stop()` closes the bridge and every socket it still holds. */
+async function startedServer(
   config: BridgeConfig,
-  services: BridgeServices = { catalog: createPersonaCatalog(config), conversations: createConversations(config) }
-): Promise<Session> {
+  services: BridgeServices
+): Promise<{ port: number; stop(): void }> {
   const wss = createWsServer(config, services);
   if (!wss.address()) await once(wss, "listening");
-  const port = (wss.address() as AddressInfo).port;
+  return {
+    port: (wss.address() as AddressInfo).port,
+    stop() {
+      wss.clients.forEach((client) => client.terminate());
+      wss.close();
+    },
+  };
+}
 
+/** One gadget's socket, on a bridge already listening, as the gadget at `deviceId`.
+ *
+ *  `stop()` ends this socket alone — the bridge it is on is the caller's to close — because a
+ *  test holding two sockets has to be able to end one of them and watch the other. */
+async function connect(port: number, deviceId: string): Promise<Session> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/xiaozhi/v1/`, {
-    headers: { authorization: `Bearer ${deriveToken(SECRET, BOARD)}`, "device-id": BOARD },
+    headers: { authorization: `Bearer ${deriveToken(SECRET, deviceId)}`, "device-id": deviceId },
   });
   await once(ws, "open");
 
@@ -273,8 +313,23 @@ async function spokenDevice(
     closed,
     stop() {
       ws.terminate();
-      wss.clients.forEach((client) => client.terminate());
-      wss.close();
+    },
+  };
+}
+
+/** One gadget on a bridge of its own, which is what every test here but the two-gadget ones
+ *  wants: the pair above, composed, so that one `stop()` in a `finally` takes down both. */
+async function spokenDevice(
+  config: BridgeConfig,
+  services: BridgeServices = { catalog: createPersonaCatalog(config), conversations: createConversations(config) }
+): Promise<Session> {
+  const server = await startedServer(config, services);
+  const device = await connect(server.port, BOARD);
+  return {
+    ...device,
+    stop() {
+      device.stop();
+      server.stop();
     },
   };
 }
@@ -1419,9 +1474,8 @@ async function silentDevice(
   config: BridgeConfig,
   services: BridgeServices
 ): Promise<{ gone: Promise<void>; stop(): void }> {
-  const wss = createWsServer(config, services);
-  if (!wss.address()) await once(wss, "listening");
-  const port = (wss.address() as AddressInfo).port;
+  const server = await startedServer(config, services);
+  const port = server.port;
 
   const socket = createConnection(port, "127.0.0.1");
   await once(socket, "connect");
@@ -1444,8 +1498,7 @@ async function silentDevice(
     gone: new Promise<void>((resolve) => socket.once("close", () => resolve())),
     stop() {
       socket.destroy();
-      wss.clients.forEach((client) => client.terminate());
-      wss.close();
+      server.stop();
     },
   };
 }
@@ -2177,6 +2230,219 @@ describe("music the bridge plays itself", () => {
       assert.equal(served, 3, "three turns, the last of them heard into a window the bridge reopened");
     } finally {
       device.stop();
+      platform.stop();
+    }
+  });
+});
+
+/** Everything the bridge logged while `run` ran, and whatever `run` answered with.
+ *
+ *  What an operator reads *is* the requirement here — a log with two gadgets in it has to be
+ *  readable line by line — so it is asserted as output rather than inferred from the scope being
+ *  set. The same shape as `listening.test.ts`'s own capture, for the same reason. The value comes
+ *  back with it because a session's first lines are the connect's own, so a test that wants them
+ *  has to connect inside the window. */
+async function capturing<T>(run: () => Promise<T>): Promise<{ written: string; value: T }> {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...a: unknown[]): void => void lines.push(a.map(String).join(" "));
+  try {
+    const value = await run();
+    return { written: lines.join("\n"), value };
+  } finally {
+    console.log = original;
+  }
+}
+
+describe("lines a session writes name the gadget", () => {
+  it("names the gadget on a session's lines, and names none where there is no session", async () => {
+    // A deployment with two gadgets on it is read by scrolling one log, and the question every
+    // line has to answer is which gadget it is about. The name is the one the allowlist carries,
+    // so a line and the entry it belongs to are the same string.
+    const platform = await stubPlatform((res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: "toi muon hoc tieng anh" }));
+      res.write(sse("sentence", { index: 0, text: "Chao ban.", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: "Chao ban." }));
+      res.end();
+    });
+    const config = configFor(platform.url);
+    let session: Session | undefined;
+    const { written } = await capturing(async () => {
+      // Connected inside the capture, because a session's first lines are the connect's own.
+      const device = await spokenDevice(config);
+      session = device;
+      device.send({ type: "hello", version: 3, transport: "websocket" });
+      await device.until(() => device.messages.some((m) => m.includes('"hello"')), "the server hello");
+      device.send({ type: "listen", state: "start", mode: "manual" });
+      device.speak();
+      await device.until(
+        () => device.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+        "the reply's bracket to close"
+      );
+    });
+
+    try {
+      /** A line of this session's, whose bracket names this gadget. */
+      const named = (rest: string): RegExp => new RegExp(`\\[\\s*[\\d.]+ ${DEVICE}\\]${rest}`);
+      assert.match(written, named(" == device connected =="), "the session's own lines carry it");
+      assert.match(written, named(" turn from speech:"), "and so does a line written inside a turn");
+
+      // The other half of the rule, read out of the same log: the bridge's own line — the
+      // server coming up, which no session is behind — names no gadget, and its bracket holds
+      // the stamp alone. One capture holding both is what the requirement is about.
+      assert.match(written, /\[\s*[\d.]+\] WS   listening on/, "a line with no session names no gadget");
+    } finally {
+      session?.stop();
+      platform.stop();
+    }
+  });
+});
+
+describe("two gadgets on one bridge", () => {
+  // The deployment this exists for: two boards, two identities, one bridge, two personas —
+  // and the question each of these asks is whether anything crosses between them. Every
+  // assertion is on what a gadget can see: what arrived on its own socket, what its turn was
+  // asked with, when its session ended. A test that read the bridge's own state instead would
+  // pass with that state still shared, which is the defect it exists to catch.
+  const FIRST_SAID = "cau hoi cua may thu nhat";
+  const SECOND_SAID = "cau hoi cua may thu hai";
+  const FIRST_PROMPT = CATALOG[0]!.defaultPrompt;
+  const SECOND_PROMPT = CATALOG_TWO[1]!.defaultPrompt;
+
+  /** One call's reply: what the platform heard, and the one sentence it says back. */
+  const answers =
+    (heard: string) =>
+    (res: ServerResponse): void => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("user", { text: heard }));
+      res.write(sse("sentence", { index: 0, text: "vang", audioData: sentenceAudio(REPLY_SECONDS) }));
+      res.write(sse("done", { fullText: `tra loi cho ${heard}` }));
+      res.end();
+    };
+
+  /** Two gadgets admitted to one bridge and listening, each having completed its handshake. */
+  async function twoListeningGadgets(port: number): Promise<[Session, Session]> {
+    const first = await connect(port, BOARD);
+    const second = await connect(port, SECOND_BOARD);
+    for (const gadget of [first, second]) {
+      gadget.send({ type: "hello", version: 3, transport: "websocket" });
+      await gadget.until(() => gadget.messages.some((m) => m.includes('"hello"')), "a server hello");
+      gadget.send({ type: "listen", state: "start", mode: "manual" });
+    }
+    return [first, second];
+  }
+
+  const servicesFor = (config: BridgeConfig): BridgeServices => ({
+    catalog: createPersonaCatalog(config),
+    conversations: createConversations(config),
+  });
+
+  it("sends a reply to the gadget that spoke, and nothing to the other", async () => {
+    const platform = await stubPlatform(answers(FIRST_SAID), CATALOG_TWO);
+    const config = configFor(platform.url);
+    const server = await startedServer(config, servicesFor(config));
+    try {
+      // Connected inside the capture: a gadget's connect line is the only line the quiet one
+      // writes at all, and it is half of what "each is named on its own lines" means here.
+      const { written, value: [first, second] } = await capturing(async () => {
+        const gadgets = await twoListeningGadgets(server.port);
+        const [speaking] = gadgets;
+        speaking.speak();
+        await speaking.until(
+          () => speaking.messages.some((m) => JSON.parse(m).type === "tts" && JSON.parse(m).state === "stop"),
+          "the reply's bracket to close"
+        );
+        return gadgets;
+      });
+
+      const typed = first.messages.map((m) => JSON.parse(m) as Record<string, unknown>);
+      assert.equal(typed.filter((m) => m.type === "stt").length, 1, "the gadget that spoke is told what was heard");
+      assert.equal(typed.filter((m) => m.state === "start").length, 1, "and gets one bracket for the reply");
+      assert.equal(typed.filter((m) => m.state === "sentence_start").length, 1, "with its sentence named");
+      assert.ok(first.binaries.length > 0, "and the reply's audio, inside it");
+
+      assert.equal(second.messages.length, 1, "the other gadget received nothing but its own handshake");
+      assert.equal(second.binaries.length, 0, "and none of the reply's audio");
+      assert.equal(platform.requests.length, 1, "one turn was taken, by the gadget that spoke");
+
+      // Both gadgets are named, each on its own lines, in the one log an operator reads.
+      for (const id of [DEVICE, SECOND_DEVICE]) {
+        assert.match(
+          written,
+          new RegExp(`\\[\\s*[\\d.]+ ${id}\\] == device connected ==`),
+          `the lines about ${id} say so`
+        );
+      }
+    } finally {
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("asks each gadget's turn with its own conversation and its own persona", async () => {
+    // The only state two gadgets can meet in is the conversation (`conversation.ts`), so this
+    // is where a cross-contamination would show: the second gadget's first turn must be asked
+    // as nobody's, and the first gadget's next turn must carry its own exchange and no other's.
+    const platform = await stubPlatform((res, call) => answers(call === 0 ? FIRST_SAID : SECOND_SAID)(res), CATALOG_TWO);
+    const config = configFor(platform.url);
+    const server = await startedServer(config, servicesFor(config));
+    const [first, second] = await twoListeningGadgets(server.port);
+    try {
+      first.speak();
+      await first.until(() => platform.requests.length === 1, "the first gadget's turn");
+      await first.played(REPLY_SECONDS);
+
+      second.speak();
+      await second.until(() => platform.requests.length === 2, "the second gadget's turn");
+
+      first.send({ type: "listen", state: "start", mode: "manual" });
+      first.speak();
+      await first.until(() => platform.requests.length === 3, "the first gadget's next turn");
+
+      const bodyOf = (turn: number): string => platform.requests[turn - 1]!.body.toString("latin1");
+
+      assert.ok(!bodyOf(2).includes(FIRST_SAID), "the second gadget is not asked with the first's turn");
+      assert.ok(!bodyOf(2).includes(FIRST_PROMPT), "nor under the first gadget's persona");
+      assert.ok(bodyOf(2).includes(SECOND_PROMPT), "it is asked under its own");
+
+      assert.ok(bodyOf(3).includes(FIRST_SAID), "the first gadget keeps the conversation it was having");
+      assert.ok(!bodyOf(3).includes(SECOND_SAID), "and is not given the other's");
+      assert.ok(bodyOf(3).includes(FIRST_PROMPT), "asked under its own persona");
+    } finally {
+      first.stop();
+      second.stop();
+      server.stop();
+      platform.stop();
+    }
+  });
+
+  it("ends one gadget's session on its own window, and leaves the other's open", async () => {
+    // A session's window is measured from what a person was behind, and a person behind one
+    // gadget's session says nothing about the other's. The wake word is the act that reaches
+    // here with no turn attached (`abort`), so it is what resets one window while the other
+    // gadget's runs out — and the silent one is then ended by the bridge rather than by ws's
+    // own teardown, which is what the close code distinguishes.
+    const platform = await stubPlatform(() => {}, CATALOG_TWO);
+    const config = configFor(platform.url, { sessionIdleMs: 1_000 });
+    const server = await startedServer(config, servicesFor(config));
+    const [first, second] = await twoListeningGadgets(server.port);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      first.send({ type: "abort", reason: "wake_word_detected" });
+
+      // `endedByBridge` is what tells the two apart: it fails on a socket torn down without a
+      // close frame (1006, which is a test's own `stop()`) and on one still open after the
+      // wait, so reaching the line below means the bridge ended this session itself.
+      await endedByBridge(second, 4_000);
+      assert.equal(first.closeCode(), null, "and the gadget whose window was reset still has its session");
+
+      // Not exempt, either: its own window runs from where the wake word left it.
+      await endedByBridge(first, 4_000);
+    } finally {
+      first.stop();
+      second.stop();
+      server.stop();
       platform.stop();
     }
   });
